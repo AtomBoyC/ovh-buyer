@@ -1,0 +1,52 @@
+{
+  "settings": {
+    "global_qps": 4.0,
+    "default_poll_interval": 5,
+    "radar_poll_interval": 30,
+    "sniper_enabled": true,
+    "radar_enabled": true
+  },
+  "accounts": [
+    {
+      "name": "IE主号",
+      "endpoint": "ovh-eu",
+      "subsidiary": "IE",
+      "app_key": "REPLACE_APP_KEY",
+      "app_secret": "REPLACE_APP_SECRET",
+      "consumer_key": "REPLACE_CONSUMER_KEY",
+      "is_default": true
+    }
+  ],
+  "tasks": [
+    {
+      "name": "黑五 KS-LE-B 演练示例",
+      "account_name": "IE主号",
+      "product_line": "eco",
+      "plan_code": "25skleb01",
+      "datacenters": ["gra", "rbx", "sbg", "fra"],
+      "memory_filter": ">=32g",
+      "storage_filter": "nvme",
+      "max_price": 25.0,
+      "duration": "auto",
+      "pricing_mode": "auto",
+      "max_orders": 1,
+      "auto_pay": false,
+      "dry_run": true,
+      "poll_interval": 5
+    }
+  ],
+  "radar_rules": [
+    {
+      "name": "黑五 Eco 新品上线雷达",
+      "rule_type": "new_sku",
+      "endpoint": "ovh-eu",
+      "subsidiary": "IE",
+      "keyword_pattern": "26skle|25skle|bf|sysle",
+      "datacenters": ["gra", "rbx", "fra"],
+      "max_price": 30.0,
+      "auto_snipe": true,
+      "dry_run": true,
+      "enabled": true
+    }
+  ]
+}

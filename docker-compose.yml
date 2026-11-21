@@ -1,0 +1,25 @@
+services:
+  ovh-sniper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ovh-sniper:latest
+    container_name: ovh-sniper
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8888}:8888"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - HOST=0.0.0.0
+      - PORT=8888
+      - OVH_DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
