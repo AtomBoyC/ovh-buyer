@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
+BUILD_LOCAL=0
+if [ "${1:-}" = "--build" ]; then
+  BUILD_LOCAL=1
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "❌ 未检测到 Docker。Linux 服务器可先执行:"
   echo "   curl -fsSL https://get.docker.com | sh"
@@ -35,8 +40,18 @@ fi
 mkdir -p data
 chmod 755 data
 
-echo "🐳 正在构建并启动 OVH Sniper 容器..."
-$COMPOSE_CMD up -d --build
+if [ "$BUILD_LOCAL" -eq 1 ]; then
+  echo "🐳 正在从本地源码构建并启动 OVH Sniper 容器..."
+  $COMPOSE_CMD -f docker-compose.yml -f docker-compose.build.yml up -d --build
+else
+  echo "🐳 正在拉取预构建镜像 ghcr.io/atomboyc/ovh-buyer:latest 并启动..."
+  if ! $COMPOSE_CMD pull; then
+    echo "⚠️ 拉取远程镜像失败，自动回退为本地构建..."
+    $COMPOSE_CMD -f docker-compose.yml -f docker-compose.build.yml up -d --build
+  else
+    $COMPOSE_CMD up -d
+  fi
+fi
 
 PORT_VAL="$(grep -E '^PORT=' .env | tail -n 1 | cut -d '=' -f 2- || true)"
 PORT_VAL="${PORT_VAL:-8888}"

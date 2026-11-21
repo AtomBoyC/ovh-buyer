@@ -1,5 +1,11 @@
 FROM python:3.12-alpine
 
+LABEL org.opencontainers.image.title="OVH Buyer (OVH Sniper)" \
+      org.opencontainers.image.description="OVHcloud Black Friday Eco/Dedicated/VPS auto-buyer, stock radar & zero-dependency web console" \
+      org.opencontainers.image.source="https://github.com/AtomBoyC/ovh-buyer" \
+      org.opencontainers.image.url="https://github.com/AtomBoyC/ovh-buyer" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \

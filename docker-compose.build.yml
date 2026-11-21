@@ -1,0 +1,8 @@
+# 如需从本地源码构建镜像，请执行：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  ovh-sniper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ovh-sniper:local

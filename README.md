@@ -1,9 +1,10 @@
 # 🎯 OVH Buyer (OVH Sniper) — 黑五 OVH 独服 / Eco / VPS 自动抢购与监控面板
 
 [![CI](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/ci.yml/badge.svg)](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/ci.yml)
+[![Docker Publish](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/docker-publish.yml)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20Stdlib-10B981)](#核心特性)
-[![Docker](https://img.shields.io/badge/Docker-Alpine%20~55MB-2496ED?logo=docker&logoColor=white)](#二远程-linux-服务器-docker-部署)
+[![GHCR](https://img.shields.io/badge/GHCR-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)](https://github.com/AtomBoyC/ovh-buyer/pkgs/container/ovh-buyer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F59E0B.svg)](LICENSE)
 
 一款专为 **OVHcloud 黑五（Black Friday）/ 闪购 / 日常补货** 打造的高速、轻量、全功能自动抢购与监控系统，覆盖 **Eco（Kimsufi / SoYouStart / Rise / LE）**、**Baremetal（Advance / Game / Storage）** 与 **VPS** 全系列。
@@ -88,30 +89,53 @@ python3 run.py --headless
 
 ## 🐳 二、远程 Linux 服务器 Docker 部署
 
-### 方式 A：一键部署脚本（最省心）
+每次推送到 `main` 分支都会由 GitHub Actions 自动构建并发布 **多架构镜像（`linux/amd64` + `linux/arm64`）**：
+- **GHCR 镜像地址**：`ghcr.io/atomboyc/ovh-buyer:latest`
+- **Docker Hub 镜像（可选同步）**：在仓库 Secrets 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 后，自动同步推送至 `<你的用户名>/ovh-buyer:latest`
+
+### 方式 A：免 `git clone`，一条 `docker run` 秒级启动（最快捷）
+
+```bash
+mkdir -p ~/ovh-buyer/data && cd ~/ovh-buyer
+
+docker run -d \
+  --name ovh-sniper \
+  --restart unless-stopped \
+  -p 8888:8888 \
+  -e TZ=Asia/Shanghai \
+  -e PANEL_PASSWORD="请改成你的强密码" \
+  -v $(pwd)/data:/app/data \
+  ghcr.io/atomboyc/ovh-buyer:latest
+```
+
+### 方式 B：免 `git clone`，仅下载 `docker-compose.yml` 部署（推荐）
+
+```bash
+mkdir -p ~/ovh-buyer && cd ~/ovh-buyer
+curl -fsSLO https://raw.githubusercontent.com/AtomBoyC/ovh-buyer/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/AtomBoyC/ovh-buyer/main/.env.example
+cp .env.example .env
+nano .env   # 修改 PANEL_PASSWORD（强烈建议），可按需填写 OVH 凭据或 Telegram Token
+
+docker compose pull && docker compose up -d
+docker compose logs -f
+```
+
+访问控制台：**`http://<你的服务器IP>:8888`**
+
+### 方式 C：克隆仓库一键脚本部署（支持自动拉取或 `--build` 本地构建）
 
 ```bash
 git clone https://github.com/AtomBoyC/ovh-buyer.git
 cd ovh-buyer
 chmod +x scripts/deploy-docker.sh
+
+# 默认直接拉取 ghcr.io 预构建镜像启动（自动生成随机强密码）
 ./scripts/deploy-docker.sh
+
+# 如修改了源码想本地构建：
+./scripts/deploy-docker.sh --build
 ```
-
-脚本会自动检测 Docker Compose、复制 `.env` 并生成 16 位强随机 `PANEL_PASSWORD`、构建轻量 Alpine 镜像并后台启动服务。
-
-### 方式 B：标准 Docker Compose 部署
-
-```bash
-git clone https://github.com/AtomBoyC/ovh-buyer.git
-cd ovh-buyer
-cp .env.example .env
-nano .env   # 强烈建议设置 PANEL_PASSWORD；可按需填写 OVH 密钥或 Telegram Token
-
-docker compose up -d --build
-docker compose logs -f
-```
-
-访问控制台：**`http://<你的服务器IP>:8888`**
 
 ### 常用维护命令
 
@@ -119,18 +143,34 @@ docker compose logs -f
 # 查看实时日志
 docker compose logs -f ovh-sniper
 
-# 更新到最新版本并重启（数据持久化在 ./data 目录，不会丢失）
-git pull && docker compose up -d --build
+# 更新到最新镜像并重启（数据持久化在 ./data 目录，不会丢失）
+docker compose pull && docker compose up -d
 
 # 停止并移除容器
 docker compose down
 ```
 
-### 方式 C：无头纯配置文件部署（适合极简 VPS）
+### 同步发布到 Docker Hub（可选）
+
+[docker-publish.yml](.github/workflows/docker-publish.yml) 已内置双仓库同步推送。只需在你的 GitHub 仓库中添加 2 个 Actions Secrets，下一次 push 或手动点 **Run workflow** 就会同时推送到 GHCR 与 Docker Hub：
+
+- `DOCKERHUB_USERNAME`：你的 Docker Hub 用户名
+- `DOCKERHUB_TOKEN`：Docker Hub Access Token（在 https://hub.docker.com/settings/security 创建，权限选 Read & Write）
+
+```bash
+# 也可直接用 gh CLI 一行写入（在本地执行）：
+gh secret set DOCKERHUB_USERNAME --repo AtomBoyC/ovh-buyer
+gh secret set DOCKERHUB_TOKEN --repo AtomBoyC/ovh-buyer
+gh workflow run docker-publish.yml --repo AtomBoyC/ovh-buyer
+```
+
+配置完成后，服务器即可使用 `OVH_IMAGE=<你的用户名>/ovh-buyer:latest` 从 Docker Hub 拉取镜像。
+
+### 方式 D：无头纯配置文件部署（适合极简 VPS）
 
 1. 复制 `config.example.json` 到 `./data/config.json`，填入 OVH 凭据、抢购任务与黑五雷达规则
 2. 在 `.env` 中设置 `HEADLESS=true`、`TELEGRAM_BOT_TOKEN` 与 `TELEGRAM_CHAT_ID`
-3. 执行 `docker compose up -d --build`，全程通过 Telegram Bot 交互控制
+3. 执行 `docker compose up -d`，全程通过 Telegram Bot 交互控制
 
 ### 公网安全建议（Caddy / Nginx 反代 HTTPS）
 

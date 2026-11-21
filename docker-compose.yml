@@ -1,9 +1,8 @@
 services:
   ovh-sniper:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ovh-sniper:latest
+    # 预构建多架构镜像 (linux/amd64 + linux/arm64)，免 git clone 直接拉取
+    # 若已开启 Docker Hub 同步，也可改为 <你的DockerHub用户名>/ovh-buyer:latest
+    image: ${OVH_IMAGE:-ghcr.io/atomboyc/ovh-buyer:latest}
     container_name: ovh-sniper
     restart: unless-stopped
     ports:
