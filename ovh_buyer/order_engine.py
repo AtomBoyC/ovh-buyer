@@ -1,8 +1,22 @@
-"""Fast, safe OVH Cart & Checkout Engine with Price-Ceiling Guard & Dry-Run support."""
+"""Fast, safe OVH Cart & Checkout Engine v2.0:
+- Parallel configuration + addon attachment on slow path
+- Prebuilt Cart Fast Lane (CartSlotPool): 1 single POST /checkout on stock hit
+- Single-cart live price-ceiling guard & Dry-Run simulation
+- Uncertain checkout protection (pending_confirm on timeout/5xx; never double-orders)
+"""
 
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .catalog import CatalogManager, is_hardware_option, standardize_config
+from .catalog import (
+    CatalogManager,
+    intersect_common_terms,
+    is_hardware_option,
+    standardize_config,
+)
 from .config import infer_region_for_datacenter, normalize_datacenter
 from .ovh_client import OVHAPIError, OVHClient
 
@@ -13,6 +27,22 @@ PRODUCT_CART_PATH = {
     "baremetalservers": "baremetalServers",
     "vps": "vps",
 }
+
+SLOT_REVALIDATE_INTERVAL = 1800  # 30 min
+SLOT_REBUILD_BEFORE_EXPIRY = 1200  # 20 min
+SLOT_MIN_TTL_AT_HIT = 120  # 2 min
+
+
+def _parse_expire_ts(expire_raw: Any) -> float:
+    if not expire_raw:
+        return time.time() + 3600
+    try:
+        dt = datetime.fromisoformat(str(expire_raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return time.time() + 3600
 
 
 def _extract_prices_from_summary(summary: Any) -> Dict[str, Any]:
@@ -72,7 +102,6 @@ def _pick_cart_plan_pricing(
     if not isinstance(prices, list) or not prices:
         return dur, mode
 
-    # Filter entries that allow ordering/renewing
     candidates = []
     for p in prices:
         if not isinstance(p, dict):
@@ -85,11 +114,9 @@ def _pick_cart_plan_pricing(
     if not candidates:
         return dur, mode
 
-    # Exact match if user explicitly requested both
     if requested_duration not in ("", "auto") and requested_mode not in ("", "auto"):
         return requested_duration, requested_mode
 
-    # Prefer matching explicit constraints, otherwise prefer ('P1M', 'default'), else cheapest
     filtered = candidates
     if requested_duration not in ("", "auto"):
         sub = [c for c in filtered if c[0] == requested_duration]
@@ -124,12 +151,310 @@ def _pick_option_pricing(avail_opt: Dict[str, Any], preferred_duration: str, pre
     return preferred_duration, preferred_mode
 
 
-class OrderEngine:
-    """Executes OVH cart creation, configuration, options, price guard, and checkout."""
+def safe_delete_cart(client: OVHClient, cart_id: Optional[str]) -> None:
+    if not cart_id:
+        return
+    try:
+        client.delete(f"/order/cart/{cart_id}", need_auth=True)
+    except Exception:
+        pass
 
-    def __init__(self, catalog_manager: CatalogManager, log_fn=None):
+
+class OrderEngine:
+    """Executes OVH cart creation, parallel configuration, Fast Lane slots, price guard, and safe checkout."""
+
+    def __init__(self, catalog_manager: CatalogManager, log_fn=None, uncertain_wait_seconds: float = 4.0):
         self.catalog_manager = catalog_manager
         self._log = log_fn or (lambda level, msg, source="order": None)
+        self.uncertain_wait_seconds = float(uncertain_wait_seconds)
+
+    def _resolve_term(
+        self,
+        client: OVHClient,
+        cart_id: str,
+        subsidiary: str,
+        plan_code: str,
+        product_line: str,
+        cart_product: str,
+        options: List[str],
+        duration: str,
+        pricing_mode: str,
+    ) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+        """Resolve (duration, pricingMode, plan_summary) preferring common plan∩addons terms."""
+        plan_summary = None
+        raw_catalog: Dict[str, Any] = {}
+        try:
+            raw_catalog = self.catalog_manager.get_raw_catalog(
+                client, subsidiary=subsidiary, product_line=product_line
+            )
+            plan_summary = self.catalog_manager.find_plan(
+                client, plan_code, subsidiary=subsidiary, product_line=product_line
+            )
+        except Exception:
+            plan_summary = None
+
+        resolved_dur = duration
+        resolved_mode = pricing_mode
+
+        if resolved_dur in ("", "auto") or resolved_mode in ("", "auto"):
+            # Try exact common term intersection across plan + addons first
+            common = intersect_common_terms(raw_catalog, plan_code, options) if raw_catalog else []
+            if common:
+                pick = common[0]
+                if resolved_dur not in ("", "auto"):
+                    pick = next((t for t in common if t["duration"] == resolved_dur), pick)
+                if resolved_mode not in ("", "auto"):
+                    pick = next((t for t in common if t["pricingMode"] == resolved_mode), pick)
+                if resolved_dur in ("", "auto"):
+                    resolved_dur = pick["duration"]
+                if resolved_mode in ("", "auto"):
+                    resolved_mode = pick["pricingMode"]
+            elif plan_summary:
+                if resolved_dur in ("", "auto"):
+                    resolved_dur = plan_summary.get("defaultDuration") or "P1M"
+                if resolved_mode in ("", "auto"):
+                    resolved_mode = plan_summary.get("defaultPricingMode") or "default"
+            else:
+                try:
+                    offers = client.get(
+                        f"/order/cart/{cart_id}/{cart_product}",
+                        params={"planCode": plan_code},
+                        need_auth=True,
+                    )
+                    resolved_dur, resolved_mode = _pick_cart_plan_pricing(offers, plan_code, resolved_dur, resolved_mode)
+                except Exception:
+                    resolved_dur = "P1M" if resolved_dur in ("", "auto") else resolved_dur
+                    resolved_mode = "default" if resolved_mode in ("", "auto") else resolved_mode
+
+        return resolved_dur, resolved_mode, plan_summary
+
+    def build_cart(
+        self,
+        client: OVHClient,
+        subsidiary: str,
+        plan_code: str,
+        datacenter: str,
+        product_line: str = "eco",
+        options: Optional[List[str]] = None,
+        duration: str = "auto",
+        pricing_mode: str = "auto",
+        os_code: str = "none_64.en",
+        coupons: Optional[List[str]] = None,
+        quantity: int = 1,
+        parallel: bool = True,
+    ) -> Dict[str, Any]:
+        """Build & configure a cart up to live pricing without executing checkout.
+
+        Caller owns the returned `cart_id` and must checkout or delete it.
+        """
+        cart_product = PRODUCT_CART_PATH.get((product_line or "eco").lower(), "eco")
+        api_dc = normalize_datacenter(datacenter)
+        wanted_options = [o for o in (options or []) if isinstance(o, str) and o.strip()]
+        cart_id: Optional[str] = None
+
+        try:
+            cart = client.post("/order/cart", body={"ovhSubsidiary": subsidiary.upper()}, need_auth=True)
+            cart_id = str(cart["cartId"])
+            expire_ts = _parse_expire_ts(cart.get("expire"))
+
+            client.post(f"/order/cart/{cart_id}/assign", need_auth=True)
+
+            resolved_dur, resolved_mode, plan_summary = self._resolve_term(
+                client=client,
+                cart_id=cart_id,
+                subsidiary=subsidiary,
+                plan_code=plan_code,
+                product_line=product_line,
+                cart_product=cart_product,
+                options=wanted_options,
+                duration=duration,
+                pricing_mode=pricing_mode,
+            )
+
+            allowed_regions = (plan_summary or {}).get("allowedRegions") or None
+            region = infer_region_for_datacenter(api_dc, allowed=allowed_regions)
+
+            item = client.post(
+                f"/order/cart/{cart_id}/{cart_product}",
+                body={
+                    "planCode": plan_code,
+                    "pricingMode": resolved_mode,
+                    "duration": resolved_dur,
+                    "quantity": max(1, int(quantity or 1)),
+                },
+                need_auth=True,
+            )
+            item_id = item["itemId"]
+
+            applied_options: List[str] = []
+            if cart_product == "vps":
+                self._configure_vps_item(client, cart_id, item_id, api_dc, os_code)
+            else:
+                applied_options = self._configure_and_attach_parallel(
+                    client=client,
+                    cart_id=cart_id,
+                    item_id=item_id,
+                    cart_product=cart_product,
+                    plan_code=plan_code,
+                    api_dc=api_dc,
+                    region=region,
+                    os_code=os_code,
+                    wanted_options=wanted_options,
+                    preferred_duration=resolved_dur,
+                    preferred_mode=resolved_mode,
+                    quantity=max(1, int(quantity or 1)),
+                    parallel=parallel,
+                )
+
+            for code in coupons or []:
+                clean_code = str(code).strip()
+                if not clean_code:
+                    continue
+                try:
+                    client.post(f"/order/cart/{cart_id}/coupon", body={"coupon": clean_code}, need_auth=True)
+                    self._log("INFO", f"已应用优惠码: {clean_code}", "order")
+                except OVHAPIError as c_err:
+                    self._log("WARNING", f"优惠码 {clean_code} 无效或不可用: {c_err}", "order")
+
+            summary = None
+            try:
+                summary = client.get(f"/order/cart/{cart_id}/summary", need_auth=True)
+            except Exception:
+                try:
+                    summary = client.get(f"/order/cart/{cart_id}/checkout", need_auth=True)
+                except Exception:
+                    summary = None
+
+            prices_info = _extract_prices_from_summary(summary)
+            return {
+                "cart_id": cart_id,
+                "item_id": item_id,
+                "expire_ts": expire_ts,
+                "duration": resolved_dur,
+                "pricing_mode": resolved_mode,
+                "applied_options": applied_options,
+                "prices": prices_info,
+            }
+        except Exception:
+            safe_delete_cart(client, cart_id)
+            raise
+
+    def checkout_cart(
+        self,
+        client: OVHClient,
+        cart_id: str,
+        plan_code: str,
+        datacenter: str,
+        prices_info: Dict[str, Any],
+        applied_options: List[str],
+        auto_pay: bool = False,
+        waive_retractation: bool = True,
+        fast_lane: bool = False,
+    ) -> Dict[str, Any]:
+        """Fire POST /order/cart/{cartId}/checkout with definite-rejection vs uncertain-timeout safety."""
+        api_dc = normalize_datacenter(datacenter)
+        since_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        t0 = time.perf_counter()
+        try:
+            checkout = client.post(
+                f"/order/cart/{cart_id}/checkout",
+                body={
+                    "autoPayWithPreferredPaymentMethod": bool(auto_pay),
+                    "waiveRetractationPeriod": bool(waive_retractation),
+                },
+                need_auth=True,
+            )
+            checkout_ms = int((time.perf_counter() - t0) * 1000)
+            order_id = str((checkout or {}).get("orderId") or "")
+            order_url = str((checkout or {}).get("url") or "")
+            if prices_info.get("withTax") is None and isinstance(checkout, dict):
+                cp = _extract_prices_from_summary(checkout)
+                if cp["withTax"] is not None or cp["withoutTax"] is not None:
+                    prices_info = cp
+
+            lane_tag = "⚡快速通道" if fast_lane else "直通下单"
+            self._log(
+                "SUCCESS",
+                f"🎉 [{lane_tag} {checkout_ms}ms] 抢购成功! {plan_code}@{api_dc} 订单号={order_id} "
+                f"价格={prices_info['withoutTax']}/{prices_info['withTax']} {prices_info['currencyCode']}",
+                "order",
+            )
+            return {
+                "success": True,
+                "status": "success",
+                "order_id": order_id,
+                "order_url": order_url,
+                "price_without_tax": prices_info["withoutTax"],
+                "price_with_tax": prices_info["withTax"],
+                "currency": prices_info["currencyCode"],
+                "applied_options": applied_options,
+                "checkout_ms": checkout_ms,
+                "fast_lane": fast_lane,
+                "error": "",
+            }
+        except OVHAPIError as exc:
+            if exc.is_definite_rejection:
+                safe_delete_cart(client, cart_id)
+                self._log("ERROR", f"下单被 OVH 明确拒绝 {plan_code}@{api_dc}: {exc}", "order")
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "order_id": "",
+                    "order_url": "",
+                    "price_without_tax": prices_info["withoutTax"],
+                    "price_with_tax": prices_info["withTax"],
+                    "currency": prices_info["currencyCode"],
+                    "applied_options": applied_options,
+                    "error": str(exc),
+                }
+            # Uncertain outcome (5xx / 429 / network timeout): NEVER retry and NEVER delete cart!
+            return self._handle_uncertain_checkout(
+                client, cart_id, plan_code, api_dc, prices_info, applied_options, since_iso, str(exc)
+            )
+        except Exception as exc:
+            return self._handle_uncertain_checkout(
+                client, cart_id, plan_code, api_dc, prices_info, applied_options, since_iso, str(exc)
+            )
+
+    def _handle_uncertain_checkout(
+        self,
+        client: OVHClient,
+        cart_id: str,
+        plan_code: str,
+        api_dc: str,
+        prices_info: Dict[str, Any],
+        applied_options: List[str],
+        since_iso: str,
+        err_msg: str,
+    ) -> Dict[str, Any]:
+        self._log(
+            "WARNING",
+            f"⚠️ 结账请求结果不确定 ({plan_code}@{api_dc}: {err_msg})！为防重复扣单，已禁止自动重试并正在核对 /me/order...",
+            "order",
+        )
+        if self.uncertain_wait_seconds > 0:
+            time.sleep(self.uncertain_wait_seconds)
+        recent = []
+        try:
+            recent = client.get_recent_orders(limit=5, since_iso=since_iso)
+        except Exception:
+            pass
+        hint = ""
+        if recent:
+            ids = ", ".join(f"#{r.get('orderId')}({r.get('status')})" for r in recent)
+            hint = f" | 近期账号订单: {ids}"
+        return {
+            "success": False,
+            "status": "pending_confirm",
+            "order_id": str(recent[0].get("orderId") or "") if recent else "",
+            "order_url": str(recent[0].get("url") or "") if recent else "",
+            "price_without_tax": prices_info["withoutTax"],
+            "price_with_tax": prices_info["withTax"],
+            "currency": prices_info["currencyCode"],
+            "applied_options": applied_options,
+            "recent_orders": recent,
+            "error": f"结账超时/异常状态待人工核对 ({err_msg}){hint}",
+        }
 
     def place_order(
         self,
@@ -150,140 +475,43 @@ class OrderEngine:
         waive_retractation: bool = True,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
-        """Execute end-to-end OVH cart & checkout flow on a SINGLE cart.
-
-        Returns a structured result dict:
-            {
-                "success": bool,
-                "status": "success" | "dry_run" | "budget_exceeded" | "failed",
-                "order_id": str,
-                "order_url": str,
-                "price_without_tax": float | None,
-                "price_with_tax": float | None,
-                "currency": str,
-                "applied_options": list[str],
-                "error": str,
-            }
-        """
-        cart_product = PRODUCT_CART_PATH.get((product_line or "eco").lower(), "eco")
+        """Execute end-to-end OVH cart & checkout flow on a SINGLE cart."""
         api_dc = normalize_datacenter(datacenter)
-        region = infer_region_for_datacenter(api_dc)
-        wanted_options = [o for o in (options or []) if isinstance(o, str) and o.strip()]
         cart_id: Optional[str] = None
-        applied_options: List[str] = []
         prices_info: Dict[str, Any] = {"withTax": None, "withoutTax": None, "tax": None, "currencyCode": "EUR"}
-
-        def _cleanup_cart() -> None:
-            if cart_id:
-                try:
-                    client.delete(f"/order/cart/{cart_id}", need_auth=True)
-                except Exception:
-                    pass
+        applied_options: List[str] = []
 
         try:
             self._log(
                 "INFO",
-                f"[{'演练' if dry_run else '下单'}] 开始创建购物车: {plan_code}@{api_dc} ({cart_product}, {subsidiary})",
+                f"[{'演练' if dry_run else '下单'}] 开始建车: {plan_code}@{api_dc} ({product_line}, {subsidiary})",
                 "order",
             )
-            # 1. Create cart
-            cart = client.post("/order/cart", body={"ovhSubsidiary": subsidiary.upper()}, need_auth=True)
-            cart_id = str(cart["cartId"])
-
-            # 2. Assign cart to authenticated account
-            client.post(f"/order/cart/{cart_id}/assign", need_auth=True)
-
-            # 3. Resolve duration & pricingMode (from catalog cache first for speed, else cart offers)
-            resolved_duration, resolved_mode = duration, pricing_mode
-            if resolved_duration in ("", "auto") or resolved_mode in ("", "auto"):
-                plan_summary = None
-                try:
-                    plan_summary = self.catalog_manager.find_plan(
-                        client, plan_code, subsidiary=subsidiary, product_line=product_line
-                    )
-                except Exception:
-                    plan_summary = None
-                if plan_summary:
-                    if resolved_duration in ("", "auto"):
-                        resolved_duration = plan_summary.get("defaultDuration") or "P1M"
-                    if resolved_mode in ("", "auto"):
-                        resolved_mode = plan_summary.get("defaultPricingMode") or "default"
-                else:
-                    try:
-                        offers = client.get(
-                            f"/order/cart/{cart_id}/{cart_product}",
-                            params={"planCode": plan_code},
-                            need_auth=True,
-                        )
-                        resolved_duration, resolved_mode = _pick_cart_plan_pricing(
-                            offers, plan_code, resolved_duration, resolved_mode
-                        )
-                    except Exception:
-                        resolved_duration = "P1M" if resolved_duration in ("", "auto") else resolved_duration
-                        resolved_mode = "default" if resolved_mode in ("", "auto") else resolved_mode
-
-            # 4. Add base item to cart
-            item_payload = {
-                "planCode": plan_code,
-                "pricingMode": resolved_mode,
-                "duration": resolved_duration,
-                "quantity": max(1, int(quantity or 1)),
-            }
-            item = client.post(f"/order/cart/{cart_id}/{cart_product}", body=item_payload, need_auth=True)
-            item_id = item["itemId"]
-
-            # 5. Apply item configurations (datacenter, region, OS)
-            self._configure_item(
+            built = self.build_cart(
                 client=client,
-                cart_id=cart_id,
-                item_id=item_id,
-                cart_product=cart_product,
-                api_dc=api_dc,
-                region=region,
+                subsidiary=subsidiary,
+                plan_code=plan_code,
+                datacenter=api_dc,
+                product_line=product_line,
+                options=options,
+                duration=duration,
+                pricing_mode=pricing_mode,
                 os_code=os_code,
+                coupons=coupons,
+                quantity=quantity,
+                parallel=True,
             )
+            cart_id = built["cart_id"]
+            prices_info = built["prices"]
+            applied_options = built["applied_options"]
 
-            # 6. Attach hardware options / addons (Eco & Baremetal)
-            if cart_product in ("eco", "baremetalServers") and wanted_options:
-                applied_options = self._attach_options(
-                    client=client,
-                    cart_id=cart_id,
-                    item_id=item_id,
-                    cart_product=cart_product,
-                    plan_code=plan_code,
-                    wanted_options=wanted_options,
-                    preferred_duration=resolved_duration,
-                    preferred_mode=resolved_mode,
-                )
-
-            # 7. Apply coupons / vouchers if configured
-            for code in coupons or []:
-                clean_code = str(code).strip()
-                if not clean_code:
-                    continue
-                try:
-                    client.post(f"/order/cart/{cart_id}/coupon", body={"coupon": clean_code}, need_auth=True)
-                    self._log("INFO", f"已应用优惠码: {clean_code}", "order")
-                except OVHAPIError as c_err:
-                    self._log("WARNING", f"优惠码 {clean_code} 无效或不可用: {c_err}", "order")
-
-            # 8. Live price inspection & Price Ceiling Guard (on the SAME cart!)
-            summary = None
-            try:
-                summary = client.get(f"/order/cart/{cart_id}/summary", need_auth=True)
-            except Exception:
-                try:
-                    summary = client.get(f"/order/cart/{cart_id}/checkout", need_auth=True)
-                except Exception:
-                    summary = None
-
-            prices_info = _extract_prices_from_summary(summary)
+            # Price Ceiling Guard (on the SAME cart!)
             check_price = prices_info["withTax"] if price_includes_tax else prices_info["withoutTax"]
             if check_price is None:
                 check_price = prices_info["withTax"] if prices_info["withTax"] is not None else prices_info["withoutTax"]
 
             if max_price and max_price > 0 and check_price is not None and check_price > max_price:
-                _cleanup_cart()
+                safe_delete_cart(client, cart_id)
                 tax_label = "含税" if price_includes_tax else "不含税"
                 msg = (
                     f"触发价格封顶保护: 实际{tax_label}价 {check_price} {prices_info['currencyCode']} "
@@ -302,9 +530,8 @@ class OrderEngine:
                     "error": msg,
                 }
 
-            # 9. Dry-run exits cleanly after verifying everything up to live checkout preview
             if dry_run:
-                _cleanup_cart()
+                safe_delete_cart(client, cart_id)
                 self._log(
                     "SUCCESS",
                     f"[演练通过] {plan_code}@{api_dc} 可下单! 不含税={prices_info['withoutTax']} / 含税={prices_info['withTax']} {prices_info['currencyCode']}",
@@ -322,38 +549,20 @@ class OrderEngine:
                     "error": "",
                 }
 
-            # 10. Real Checkout!
-            checkout_payload = {
-                "autoPayWithPreferredPaymentMethod": bool(auto_pay),
-                "waiveRetractationPeriod": bool(waive_retractation),
-            }
-            checkout = client.post(f"/order/cart/{cart_id}/checkout", body=checkout_payload, need_auth=True)
-            order_id = str(checkout.get("orderId") or "")
-            order_url = str(checkout.get("url") or "")
-            if not prices_info["withTax"] and isinstance(checkout, dict):
-                checkout_prices = _extract_prices_from_summary(checkout)
-                if checkout_prices["withTax"] is not None or checkout_prices["withoutTax"] is not None:
-                    prices_info = checkout_prices
-
-            self._log(
-                "SUCCESS",
-                f"🎉 抢购成功! {plan_code}@{api_dc} 订单号={order_id} 价格={prices_info['withoutTax']}/{prices_info['withTax']} {prices_info['currencyCode']}",
-                "order",
+            return self.checkout_cart(
+                client=client,
+                cart_id=cart_id,
+                plan_code=plan_code,
+                datacenter=api_dc,
+                prices_info=prices_info,
+                applied_options=applied_options,
+                auto_pay=auto_pay,
+                waive_retractation=waive_retractation,
+                fast_lane=False,
             )
-            return {
-                "success": True,
-                "status": "success",
-                "order_id": order_id,
-                "order_url": order_url,
-                "price_without_tax": prices_info["withoutTax"],
-                "price_with_tax": prices_info["withTax"],
-                "currency": prices_info["currencyCode"],
-                "applied_options": applied_options,
-                "error": "",
-            }
 
         except Exception as exc:
-            _cleanup_cart()
+            safe_delete_cart(client, cart_id)
             err_msg = str(exc)
             self._log("ERROR", f"下单失败 {plan_code}@{api_dc}: {err_msg}", "order")
             return {
@@ -368,125 +577,55 @@ class OrderEngine:
                 "error": err_msg,
             }
 
-    def _configure_item(
+    def _configure_vps_item(
         self,
         client: OVHClient,
         cart_id: str,
         item_id: Any,
-        cart_product: str,
         api_dc: str,
-        region: Optional[str],
         os_code: str,
     ) -> None:
-        """Apply required item configurations with dynamic fallback via /requiredConfiguration."""
-        if cart_product == "vps":
-            required = client.get(f"/order/cart/{cart_id}/item/{item_id}/requiredConfiguration", need_auth=True)
-            for cfg in required or []:
-                label = cfg.get("label")
-                allowed = cfg.get("allowedValues") or []
-                value = None
-                if label == "vps_datacenter":
-                    for av in allowed:
-                        if str(av).lower().startswith(api_dc.lower()):
-                            value = str(av)
-                            break
-                    value = value or api_dc.upper()
-                elif label == "vps_os":
-                    if os_code in allowed:
-                        value = os_code
-                    else:
-                        ubuntu = next((str(a) for a in allowed if "ubuntu" in str(a).lower()), None)
-                        debian = next((str(a) for a in allowed if "debian" in str(a).lower()), None)
-                        value = ubuntu or debian or (str(allowed[0]) if allowed else os_code)
-                elif allowed:
-                    value = str(allowed[0])
-                if label and value is not None:
-                    client.post(
-                        f"/order/cart/{cart_id}/item/{item_id}/configuration",
-                        body={"label": label, "value": value},
-                        need_auth=True,
-                    )
-            return
-
-        # Fast path for Eco / Baremetal
-        configs: List[Tuple[str, str]] = [("dedicated_datacenter", api_dc)]
-        if region:
-            configs.append(("region", region))
-        configs.append(("dedicated_os", os_code or "none_64.en"))
-
-        need_dynamic_fallback = False
-        for label, value in configs:
-            try:
+        required = client.get(f"/order/cart/{cart_id}/item/{item_id}/requiredConfiguration", need_auth=True)
+        for cfg in required or []:
+            label = cfg.get("label")
+            allowed = cfg.get("allowedValues") or []
+            value = None
+            if label == "vps_datacenter":
+                for av in allowed:
+                    if str(av).lower().startswith(api_dc.lower()):
+                        value = str(av)
+                        break
+                value = value or api_dc.upper()
+            elif label == "vps_os":
+                if os_code in allowed:
+                    value = os_code
+                else:
+                    ubuntu = next((str(a) for a in allowed if "ubuntu" in str(a).lower()), None)
+                    debian = next((str(a) for a in allowed if "debian" in str(a).lower()), None)
+                    value = ubuntu or debian or (str(allowed[0]) if allowed else os_code)
+            elif allowed:
+                value = str(allowed[0])
+            if label and value is not None:
                 client.post(
                     f"/order/cart/{cart_id}/item/{item_id}/configuration",
                     body={"label": label, "value": value},
                     need_auth=True,
                 )
-            except OVHAPIError as exc:
-                if label == "dedicated_os":
-                    need_dynamic_fallback = True
-                elif label == "region":
-                    # Some plans don't accept 'region' or expect a different string
-                    need_dynamic_fallback = True
-                else:
-                    raise exc
 
-        if need_dynamic_fallback:
-            try:
-                required = client.get(f"/order/cart/{cart_id}/item/{item_id}/requiredConfiguration", need_auth=True)
-                existing = client.get(f"/order/cart/{cart_id}/item/{item_id}/configuration", need_auth=True) or []
-                existing_labels = set()
-                if isinstance(existing, list):
-                    for cid in existing:
-                        if isinstance(cid, dict) and cid.get("label"):
-                            existing_labels.add(cid["label"])
-                for cfg in required or []:
-                    label = cfg.get("label")
-                    if not label or label in existing_labels or label == "dedicated_datacenter":
-                        continue
-                    allowed = [str(v) for v in (cfg.get("allowedValues") or [])]
-                    val: Optional[str] = None
-                    if label == "dedicated_os":
-                        for cand in (os_code, "none_64.en", "none_64", "none_32"):
-                            if cand in allowed:
-                                val = cand
-                                break
-                        val = val or (allowed[0] if allowed else "none_64.en")
-                    elif label == "region":
-                        if region and region in allowed:
-                            val = region
-                        elif allowed:
-                            val = allowed[0]
-                    elif cfg.get("required") and allowed:
-                        val = allowed[0]
-                    if val is not None:
-                        try:
-                            client.post(
-                                f"/order/cart/{cart_id}/item/{item_id}/configuration",
-                                body={"label": label, "value": val},
-                                need_auth=True,
-                            )
-                        except OVHAPIError:
-                            pass
-            except Exception:
-                pass
-
-    def _attach_options(
+    def _resolve_options_to_post(
         self,
         client: OVHClient,
         cart_id: str,
-        item_id: Any,
         cart_product: str,
         plan_code: str,
         wanted_options: List[str],
         preferred_duration: str,
         preferred_mode: str,
-    ) -> List[str]:
-        """Resolve and add hardware options/addons to the cart item."""
+    ) -> List[Tuple[str, str, str]]:
+        """Match wanted options against cart's available options list -> [(planCode, duration, pricingMode)]."""
         filtered = [opt for opt in wanted_options if is_hardware_option(opt)]
         if not filtered:
             return []
-
         avail_opts = client.get(
             f"/order/cart/{cart_id}/{cart_product}/options",
             params={"planCode": plan_code},
@@ -495,38 +634,344 @@ class OrderEngine:
         if not isinstance(avail_opts, list):
             return []
 
-        added: List[str] = []
+        to_post: List[Tuple[str, str, str]] = []
+        seen = set()
         for wanted in filtered:
-            match = None
-            for opt in avail_opts:
-                if opt.get("planCode") == wanted:
-                    match = opt
-                    break
+            match = next((o for o in avail_opts if o.get("planCode") == wanted), None)
             if match is None:
                 wanted_std = standardize_config(wanted)
                 if wanted_std:
-                    for opt in avail_opts:
-                        if standardize_config(str(opt.get("planCode") or "")) == wanted_std:
-                            match = opt
-                            break
+                    match = next(
+                        (o for o in avail_opts if standardize_config(str(o.get("planCode") or "")) == wanted_std),
+                        None,
+                    )
             if not match:
                 self._log("WARNING", f"硬件选项 {wanted} 未在 {plan_code} 可选列表中匹配到", "order")
                 continue
             opt_code = str(match["planCode"])
+            if opt_code in seen:
+                continue
+            seen.add(opt_code)
             opt_dur, opt_mode = _pick_option_pricing(match, preferred_duration, preferred_mode)
-            try:
+            to_post.append((opt_code, opt_dur, opt_mode))
+        return to_post
+
+    def _configure_and_attach_parallel(
+        self,
+        client: OVHClient,
+        cart_id: str,
+        item_id: Any,
+        cart_product: str,
+        plan_code: str,
+        api_dc: str,
+        region: Optional[str],
+        os_code: str,
+        wanted_options: List[str],
+        preferred_duration: str,
+        preferred_mode: str,
+        quantity: int,
+        parallel: bool = True,
+    ) -> List[str]:
+        """Fire item configurations + hardware options concurrently (with sequential retry & dynamic fallback)."""
+        configs: List[Tuple[str, str]] = [("dedicated_datacenter", api_dc)]
+        if region:
+            configs.append(("region", region))
+        configs.append(("dedicated_os", os_code or "none_64.en"))
+
+        options_plan = (
+            self._resolve_options_to_post(
+                client, cart_id, cart_product, plan_code, wanted_options, preferred_duration, preferred_mode
+            )
+            if wanted_options
+            else []
+        )
+
+        calls: List[Tuple[str, Any]] = [("cfg", pair) for pair in configs] + [("opt", triple) for triple in options_plan]
+
+        def _exec(call_item: Tuple[str, Any]) -> Optional[str]:
+            kind, data = call_item
+            if kind == "cfg":
+                label, value = data
                 client.post(
-                    f"/order/cart/{cart_id}/{cart_product}/options",
-                    body={
-                        "itemId": item_id,
-                        "planCode": opt_code,
-                        "duration": opt_dur,
-                        "pricingMode": opt_mode,
-                        "quantity": 1,
-                    },
+                    f"/order/cart/{cart_id}/item/{item_id}/configuration",
+                    body={"label": label, "value": value},
                     need_auth=True,
                 )
-                added.append(opt_code)
+                return None
+            opt_code, opt_dur, opt_mode = data
+            client.post(
+                f"/order/cart/{cart_id}/{cart_product}/options",
+                body={
+                    "itemId": item_id,
+                    "planCode": opt_code,
+                    "duration": opt_dur,
+                    "pricingMode": opt_mode,
+                    "quantity": quantity,
+                },
+                need_auth=True,
+            )
+            return opt_code
+
+        failed_calls: List[Tuple[str, Any, Exception]] = []
+        added_options: List[str] = []
+
+        if parallel and len(calls) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(calls))) as pool:
+                futs = [(c, pool.submit(_exec, c)) for c in calls]
+                for c, f in futs:
+                    try:
+                        res = f.result()
+                        if res:
+                            added_options.append(res)
+                    except Exception as exc:
+                        failed_calls.append((c[0], c[1], exc))
+        else:
+            for c in calls:
+                try:
+                    res = _exec(c)
+                    if res:
+                        added_options.append(res)
+                except Exception as exc:
+                    failed_calls.append((c[0], c[1], exc))
+
+        # Sequential retry / fallback for failed calls
+        need_dynamic_fallback = False
+        for kind, data, _orig_exc in failed_calls:
+            try:
+                res = _exec((kind, data))
+                if res:
+                    added_options.append(res)
             except OVHAPIError as exc:
-                self._log("WARNING", f"添加选项 {opt_code} 失败: {exc}", "order")
-        return added
+                if kind == "cfg":
+                    label, _ = data
+                    if label in ("dedicated_os", "region"):
+                        need_dynamic_fallback = True
+                    else:
+                        raise exc
+                else:
+                    self._log("WARNING", f"添加选项 {data[0]} 失败: {exc}", "order")
+
+        if need_dynamic_fallback:
+            self._dynamic_configuration_fallback(client, cart_id, item_id, region, os_code)
+
+        return added_options
+
+    def _dynamic_configuration_fallback(
+        self,
+        client: OVHClient,
+        cart_id: str,
+        item_id: Any,
+        region: Optional[str],
+        os_code: str,
+    ) -> None:
+        try:
+            required = client.get(f"/order/cart/{cart_id}/item/{item_id}/requiredConfiguration", need_auth=True)
+            existing = client.get(f"/order/cart/{cart_id}/item/{item_id}/configuration", need_auth=True) or []
+            existing_labels = set()
+            if isinstance(existing, list):
+                for cid in existing:
+                    if isinstance(cid, dict) and cid.get("label"):
+                        existing_labels.add(cid["label"])
+            for cfg in required or []:
+                label = cfg.get("label")
+                if not label or label in existing_labels or label == "dedicated_datacenter":
+                    continue
+                allowed = [str(v) for v in (cfg.get("allowedValues") or [])]
+                val: Optional[str] = None
+                if label == "dedicated_os":
+                    for cand in (os_code, "none_64.en", "none_64", "none_32"):
+                        if cand in allowed:
+                            val = cand
+                            break
+                    val = val or (allowed[0] if allowed else "none_64.en")
+                elif label == "region":
+                    if region and region in allowed:
+                        val = region
+                    elif allowed:
+                        val = allowed[0]
+                elif cfg.get("required") and allowed:
+                    val = allowed[0]
+                if val is not None:
+                    try:
+                        client.post(
+                            f"/order/cart/{cart_id}/item/{item_id}/configuration",
+                            body={"label": label, "value": val},
+                            need_auth=True,
+                        )
+                    except OVHAPIError:
+                        pass
+        except Exception:
+            pass
+
+
+class CartSlotPool:
+    """Fast Lane prebuilt cart pool: maintains 1 verified, budget-checked cart per (task_id, datacenter)."""
+
+    def __init__(self, order_engine: OrderEngine, log_fn=None):
+        self.order_engine = order_engine
+        self._log = log_fn or (lambda level, msg, source="fastlane": None)
+        self._lock = threading.RLock()
+        # task_id -> {dc: {cart_id, client, expire_ts, checked_ts, prices, options, options_fp, ok, plan_code}}
+        self._slots: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    @staticmethod
+    def _options_fp(options: List[str]) -> str:
+        return "|".join(sorted({str(o).strip().lower() for o in options if o}))
+
+    def maintain_task(
+        self,
+        task: Dict[str, Any],
+        client: OVHClient,
+        subsidiary: str,
+        target_dcs: List[str],
+        resolved_options: List[str],
+        stop_event: Optional[threading.Event] = None,
+    ) -> int:
+        """Build or refresh prebuilt carts for up to 6 target datacenters of a Fast Lane task."""
+        task_id = task["id"]
+        dcs = [normalize_datacenter(d) for d in target_dcs if d][:6]
+        if not dcs:
+            return 0
+        opts_fp = self._options_fp(resolved_options)
+        now = time.time()
+        built_count = 0
+
+        # Evict slots for removed DCs or changed options/plan
+        with self._lock:
+            task_map = self._slots.setdefault(task_id, {})
+            for old_dc in list(task_map.keys()):
+                sl = task_map[old_dc]
+                if old_dc not in dcs or sl["plan_code"] != task["plan_code"] or sl["options_fp"] != opts_fp:
+                    removed = task_map.pop(old_dc)
+                    safe_delete_cart(removed["client"], removed["cart_id"])
+
+        for dc in dcs:
+            if stop_event and stop_event.is_set():
+                break
+            with self._lock:
+                slot = self._slots.get(task_id, {}).get(dc)
+            need_build = slot is None or (slot["expire_ts"] - now < SLOT_REBUILD_BEFORE_EXPIRY)
+            need_revalidate = slot is not None and not need_build and (now - slot["checked_ts"] > SLOT_REVALIDATE_INTERVAL)
+
+            if need_build:
+                try:
+                    built = self.order_engine.build_cart(
+                        client=client,
+                        subsidiary=subsidiary,
+                        plan_code=task["plan_code"],
+                        datacenter=dc,
+                        product_line=task["product_line"],
+                        options=resolved_options,
+                        duration=task["duration"],
+                        pricing_mode=task["pricing_mode"],
+                        os_code=task["os_code"],
+                        coupons=task.get("coupons") or [],
+                        quantity=int(task.get("quantity") or 1),
+                        parallel=True,
+                    )
+                    prices = built["prices"]
+                    max_price = float(task.get("max_price") or 0)
+                    check_p = prices["withTax"] if task.get("price_includes_tax") else prices["withoutTax"]
+                    if check_p is None:
+                        check_p = prices["withTax"] if prices["withTax"] is not None else prices["withoutTax"]
+                    ok = not (max_price > 0 and check_p is not None and check_p > max_price)
+                    if not ok:
+                        safe_delete_cart(client, built["cart_id"])
+                        self._log(
+                            "WARNING",
+                            f"⚡ [快速通道] {task['plan_code']}@{dc.upper()} 预建车价格 {check_p} 超过上限 {max_price}，跳过预建",
+                            "fastlane",
+                        )
+                        continue
+                    new_slot = {
+                        "cart_id": built["cart_id"],
+                        "client": client,
+                        "plan_code": task["plan_code"],
+                        "datacenter": dc,
+                        "expire_ts": built["expire_ts"],
+                        "checked_ts": time.time(),
+                        "prices": prices,
+                        "options": built["applied_options"],
+                        "options_fp": opts_fp,
+                        "ok": True,
+                    }
+                    with self._lock:
+                        old = self._slots.setdefault(task_id, {}).get(dc)
+                        self._slots[task_id][dc] = new_slot
+                    if old and old["cart_id"] != built["cart_id"]:
+                        safe_delete_cart(old["client"], old["cart_id"])
+                    built_count += 1
+                    self._log(
+                        "INFO",
+                        f"⚡ [快速通道] 预建购物车就绪: {task['plan_code']}@{dc.upper()} (含税={prices['withTax']} {prices['currencyCode']})",
+                        "fastlane",
+                    )
+                except Exception as exc:
+                    self._log("WARNING", f"⚡ [快速通道] 预建 {task['plan_code']}@{dc.upper()} 失败: {exc}", "fastlane")
+            elif need_revalidate and slot:
+                try:
+                    info = client.get(f"/order/cart/{slot['cart_id']}", need_auth=True)
+                    summary = client.get(f"/order/cart/{slot['cart_id']}/summary", need_auth=True)
+                    prices = _extract_prices_from_summary(summary)
+                    exp_ts = _parse_expire_ts((info or {}).get("expire"))
+                    with self._lock:
+                        cur = self._slots.get(task_id, {}).get(dc)
+                        if cur and cur["cart_id"] == slot["cart_id"]:
+                            cur["expire_ts"] = exp_ts
+                            cur["prices"] = prices
+                            cur["checked_ts"] = time.time()
+                except Exception:
+                    with self._lock:
+                        cur = self._slots.get(task_id, {}).get(dc)
+                        if cur and cur["cart_id"] == slot["cart_id"]:
+                            self._slots[task_id].pop(dc, None)
+                    safe_delete_cart(client, slot["cart_id"])
+
+        return built_count
+
+    def take_ready_slot(self, task_id: str, datacenter: str, options: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """Atomically pop a ready, non-expired prebuilt cart slot for immediate 1-call checkout."""
+        dc = normalize_datacenter(datacenter)
+        want_fp = self._options_fp(options or []) if options else ""
+        now = time.time()
+        with self._lock:
+            task_map = self._slots.get(task_id)
+            if not task_map or dc not in task_map:
+                return None
+            slot = task_map[dc]
+            if not slot.get("ok") or (slot["expire_ts"] - now < SLOT_MIN_TTL_AT_HIT):
+                return None
+            if want_fp and slot["options_fp"] and slot["options_fp"] != want_fp:
+                return None
+            return task_map.pop(dc)
+
+    def get_task_slots_summary(self, task_id: str) -> List[Dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            task_map = self._slots.get(task_id) or {}
+            out = []
+            for dc, sl in task_map.items():
+                ttl = max(0, int(sl["expire_ts"] - now))
+                if ttl > 0:
+                    out.append(
+                        {
+                            "dc": dc,
+                            "ttl_minutes": ttl // 60,
+                            "price_without_tax": sl["prices"].get("withoutTax"),
+                            "price_with_tax": sl["prices"].get("withTax"),
+                            "currency": sl["prices"].get("currencyCode", "EUR"),
+                        }
+                    )
+            return out
+
+    def cleanup_task(self, task_id: str) -> None:
+        with self._lock:
+            removed = self._slots.pop(task_id, {})
+        for sl in removed.values():
+            safe_delete_cart(sl["client"], sl["cart_id"])
+
+    def cleanup_all(self) -> None:
+        with self._lock:
+            all_tasks = list(self._slots.keys())
+        for tid in all_tasks:
+            self.cleanup_task(tid)

@@ -289,11 +289,28 @@ def parse_catalog_plans(raw_catalog: Dict[str, Any], product_line: str = "eco") 
         pricing_mode, duration, base_price, setup_fee = pick_best_pricing(plan.get("pricings") or [])
         pricing_modes = sorted({str(p.get("mode")) for p in (plan.get("pricings") or []) if p.get("mode")})
 
-        # Available datacenters listed in configurations (if present)
+        # Available datacenters & regions listed in configurations (if present)
         config_dcs: List[str] = []
+        allowed_regions: List[str] = []
         for cfg in plan.get("configurations") or []:
-            if isinstance(cfg, dict) and cfg.get("name") in ("dedicated_datacenter", "vps_datacenter"):
+            if not isinstance(cfg, dict):
+                continue
+            cname = cfg.get("name")
+            if cname in ("dedicated_datacenter", "vps_datacenter"):
                 config_dcs = [str(v).lower() for v in (cfg.get("values") or []) if v]
+            elif cname == "region":
+                allowed_regions = [str(v).lower() for v in (cfg.get("values") or []) if v]
+
+        compact_families = [
+            {
+                "name": str(f.get("name") or ""),
+                "mandatory": bool(f.get("mandatory")),
+                "default": str(f.get("default") or ""),
+                "addons": [c for c in (f.get("addons") or []) if isinstance(c, str) and is_hardware_option(c)],
+            }
+            for f in addon_families
+            if isinstance(f, dict) and f.get("name")
+        ]
 
         parsed.append(
             {
@@ -313,6 +330,8 @@ def parse_catalog_plans(raw_catalog: Dict[str, Any], product_line: str = "eco") 
                 "defaultDuration": duration,
                 "pricingModes": pricing_modes,
                 "datacenters": config_dcs,
+                "allowedRegions": allowed_regions,
+                "addonFamilies": compact_families,
                 "defaultAddons": default_addons,
                 "memoryAddons": memory_addons,
                 "storageAddons": storage_addons,
@@ -325,25 +344,255 @@ def parse_catalog_plans(raw_catalog: Dict[str, Any], product_line: str = "eco") 
     return parsed
 
 
+def _strip_plan_suffix(code: str, plan_code: str) -> str:
+    low = (code or "").lower()
+    p_low = (plan_code or "").lower()
+    for suf in (p_low, p_low.split("-v")[0]):
+        if suf and low.endswith("-" + suf):
+            return low[: -len(suf) - 1]
+    return low
+
+
+def _addon_norm_tokens(code: str, plan_code: str) -> frozenset:
+    stripped = _strip_plan_suffix(code, plan_code)
+    return frozenset(t for t in stripped.split("-") if t and not re.match(r"^ddr\d+[a-z]*$", t))
+
+
+def match_family_addon(plan_summary: Optional[Dict[str, Any]], family_name: str, want: str) -> Optional[str]:
+    """Match an availability FQN fragment or user addon code to a real catalog addon planCode.
+
+    Never invents nonexistent codes and never silently falls back to default.
+    """
+    if not plan_summary or not want:
+        return None
+    want_l = want.strip().lower()
+    plan_code = str(plan_summary.get("planCode") or "")
+    candidates: List[str] = []
+    for fam in plan_summary.get("addonFamilies") or []:
+        fname = str(fam.get("name") or "").lower()
+        if fname == family_name or (family_name == "memory" and "ram" in fname) or (
+            family_name == "storage" and "disk" in fname
+        ):
+            candidates.extend(fam.get("addons") or [])
+    if not candidates:
+        if family_name == "memory":
+            candidates = list(plan_summary.get("memoryAddons") or [])
+        elif family_name == "storage":
+            candidates = list(plan_summary.get("storageAddons") or [])
+        elif family_name == "bandwidth":
+            candidates = list(plan_summary.get("bandwidthAddons") or [])
+
+    # 1. Exact or prefix match
+    for code in candidates:
+        cl = code.lower()
+        if cl == want_l or cl.startswith(want_l + "-"):
+            return code
+    # 2. Substring match
+    for code in candidates:
+        if want_l in code.lower():
+            return code
+    # 3. Token match ignoring plan suffix & DDR generation (e.g. ram-64g-ecc-2666 <-> ram-64g-ddr4-ecc-2666-27skle03-v1)
+    wt = _addon_norm_tokens(want_l, plan_code)
+    same_tok = [c for c in candidates if _addon_norm_tokens(c, plan_code) == wt]
+    if len(same_tok) == 1:
+        return same_tok[0]
+    # 4. Standardized fingerprint match (e.g. ram-32g)
+    want_std = standardize_config(want_l)
+    if want_std:
+        same_std = [c for c in candidates if standardize_config(c) == want_std]
+        if len(same_std) == 1:
+            return same_std[0]
+    return None
+
+
+def is_config_orderable(
+    plan_summary: Optional[Dict[str, Any]],
+    fqn_memory: str,
+    fqn_storage: str,
+) -> Tuple[bool, str]:
+    """Detect OVH phantom stock (availability lists hardware variants absent from official catalog).
+
+    Example: KS-LE-3 (27skle03-v1) lists ram-64g-ddr4-ecc-2666 in /availabilities while the catalog
+    only sells ram-32g-ddr4-ecc-2666-27skle03-v1. Returns (orderable, reason).
+    """
+    if not plan_summary:
+        return True, ""
+    checks = [
+        ("memory", fqn_memory, plan_summary.get("memoryAddons") or [], "内存"),
+        ("storage", fqn_storage, plan_summary.get("storageAddons") or [], "硬盘"),
+    ]
+    for fam, want, avail_list, cn in checks:
+        if not want or not avail_list:
+            continue
+        if not match_family_addon(plan_summary, fam, want):
+            readable = " / ".join(
+                (format_memory_display if fam == "memory" else format_storage_display)(c) for c in avail_list[:4]
+            )
+            return False, f"幽灵库存: 目录无此{cn}配件 {want}（可选: {readable}）"
+    return True, ""
+
+
+def is_default_fqn_config(
+    plan_summary: Optional[Dict[str, Any]],
+    fqn_memory: str,
+    fqn_storage: str,
+) -> bool:
+    """Return True if (fqn_memory, fqn_storage) matches the catalog's default configuration."""
+    if not plan_summary:
+        return True
+    def_mem = str(plan_summary.get("memoryCode") or "")
+    def_stor = str(plan_summary.get("storageCode") or "")
+    mem_ok = True
+    if fqn_memory and def_mem:
+        mem_ok = (
+            def_mem.lower().startswith(fqn_memory.lower())
+            or fqn_memory.lower() in def_mem.lower()
+            or standardize_config(def_mem) == standardize_config(fqn_memory)
+        )
+    stor_ok = True
+    if fqn_storage and def_stor:
+        stor_ok = (
+            def_stor.lower().startswith(fqn_storage.lower())
+            or fqn_storage.lower() in def_stor.lower()
+            or standardize_config(def_stor) == standardize_config(fqn_storage)
+        )
+    return mem_ok and stor_ok
+
+
 def resolve_addons_for_fqn(plan_summary: Optional[Dict[str, Any]], fqn_memory: str, fqn_storage: str) -> List[str]:
     """Match availability FQN memory/storage codes to catalog addon planCodes."""
     if not plan_summary:
         return []
     resolved: List[str] = []
-    mem_std = standardize_config(fqn_memory)
-    stor_std = standardize_config(fqn_storage)
-
-    if mem_std:
-        for addon in plan_summary.get("memoryAddons") or []:
-            if standardize_config(addon) == mem_std:
-                resolved.append(addon)
-                break
-    if stor_std:
-        for addon in plan_summary.get("storageAddons") or []:
-            if standardize_config(addon) == stor_std:
-                resolved.append(addon)
-                break
+    if fqn_memory:
+        m = match_family_addon(plan_summary, "memory", fqn_memory)
+        if m:
+            resolved.append(m)
+    if fqn_storage:
+        s = match_family_addon(plan_summary, "storage", fqn_storage)
+        if s:
+            resolved.append(s)
     return resolved
+
+
+def resolve_cart_addons(
+    plan_summary: Optional[Dict[str, Any]],
+    fqn_memory: str = "",
+    fqn_storage: str = "",
+    explicit_options: Optional[List[str]] = None,
+) -> List[str]:
+    """Resolve complete cart addon list including mandatory families (bandwidth, system-storage, etc.).
+
+    Raises ValueError if a pinned memory/storage variant does not exist in the catalog (refuses silent downgrade).
+    """
+    extras = [o.strip() for o in (explicit_options or []) if isinstance(o, str) and o.strip() and is_hardware_option(o)]
+    if not plan_summary:
+        return extras
+
+    families = plan_summary.get("addonFamilies") or []
+    if not families:
+        return extras or resolve_addons_for_fqn(plan_summary, fqn_memory, fqn_storage)
+
+    # Index user-supplied explicit options by family if they belong to a family
+    explicit_by_family: Dict[str, str] = {}
+    remaining_extras: List[str] = []
+    for opt in extras:
+        placed = False
+        for fam in families:
+            fname = str(fam.get("name") or "").lower()
+            if opt in (fam.get("addons") or []):
+                explicit_by_family[fname] = opt
+                placed = True
+                break
+        if not placed:
+            remaining_extras.append(opt)
+
+    chosen: List[str] = []
+    for fam in families:
+        fname = str(fam.get("name") or "").lower()
+        mandatory = bool(fam.get("mandatory"))
+        if fname in explicit_by_family:
+            chosen.append(explicit_by_family[fname])
+            continue
+        want = ""
+        if fname == "memory":
+            want = fqn_memory
+        elif fname == "storage":
+            want = fqn_storage
+
+        if want:
+            matched = match_family_addon(plan_summary, fname, want)
+            if not matched:
+                raise ValueError(f"官方目录缺少 {fname} 配件 {want}，拒绝降级为默认配置")
+            chosen.append(matched)
+        elif mandatory and fam.get("default") and is_hardware_option(fam["default"]):
+            chosen.append(str(fam["default"]))
+
+    for extra in remaining_extras:
+        if extra not in chosen:
+            chosen.append(extra)
+    return chosen
+
+
+def intersect_common_terms(
+    raw_catalog: Dict[str, Any],
+    plan_code: str,
+    addon_codes: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Compute common supported (pricingMode, duration) terms across base plan AND all addons."""
+    items: Dict[str, Dict[str, Any]] = {}
+    for sec in ("plans", "addons"):
+        for entry in raw_catalog.get(sec) or []:
+            if isinstance(entry, dict) and entry.get("planCode"):
+                items[entry["planCode"]] = entry
+    plan = items.get(plan_code)
+    if not plan:
+        return []
+
+    def _renew_map(item_obj: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for p in item_obj.get("pricings") or []:
+            if "renew" in (p.get("capacities") or []) and p.get("mode"):
+                out[str(p["mode"])] = p
+        return out
+
+    plan_renew = _renew_map(plan)
+    supported_modes = set(plan_renew.keys())
+    for code in addon_codes or []:
+        if code in items:
+            addon_modes = set(_renew_map(items[code]).keys())
+            if addon_modes:
+                supported_modes &= addon_modes
+
+    currency = ((raw_catalog.get("locale") or {}).get("currencyCode")) or "EUR"
+    terms: List[Dict[str, Any]] = []
+    for mode in sorted(supported_modes, key=lambda m: (m != "default", m)):
+        p = plan_renew[mode]
+        eng = p.get("engagementConfiguration") or {}
+        duration = eng.get("duration")
+        if not duration:
+            interval = int(p.get("interval") or 1)
+            unit = str(p.get("intervalUnit") or "month").lower()
+            suffix = {"day": "D", "month": "M", "year": "Y"}.get(unit, "M")
+            duration = f"P{interval}{suffix}"
+        setup = None
+        for sp in plan.get("pricings") or []:
+            if sp.get("mode") == mode and "installation" in (sp.get("capacities") or []):
+                setup = _price_micro_to_float(sp.get("price"))
+                break
+        commitment = int(p.get("commitment") or 0)
+        label = "月付" if mode == "default" and duration == "P1M" else f"{commitment or p.get('interval') or 1}个月 ({mode})"
+        terms.append(
+            {
+                "pricingMode": mode,
+                "duration": str(duration),
+                "label": label,
+                "price": _price_micro_to_float(p.get("price")),
+                "setupFee": setup,
+                "currency": currency,
+            }
+        )
+    return terms
 
 
 class CatalogManager:
@@ -397,6 +646,20 @@ class CatalogManager:
         except OSError:
             pass
         return plans
+
+    def get_raw_catalog(
+        self,
+        client: OVHClient,
+        subsidiary: str = "IE",
+        product_line: str = "eco",
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Return cached raw OVH catalog JSON dict (fetching if expired or missing)."""
+        self.get_catalog_plans(client, subsidiary=subsidiary, product_line=product_line, force_refresh=force_refresh)
+        key = (client.endpoint, subsidiary.upper(), product_line.lower())
+        with self._lock:
+            cached = self._memory_cache.get(key)
+            return cached[1] if cached else {}
 
     def find_plan(
         self,

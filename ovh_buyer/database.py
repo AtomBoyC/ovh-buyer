@@ -91,8 +91,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "custom_webhook_url": "",
     "notify_on_stock": True,
     "notify_on_order": True,
+    "notify_on_paid": True,
+    "notify_on_delivered": True,
     "notify_on_error": False,
+    "edit_sold_out_telegram": True,
     "sniper_enabled": True,
+    "fast_lane_enabled": True,
+    "tracker_enabled": True,
     "radar_enabled": False,
     "vps_monitor_enabled": False,
     "panel_password_hash": "",
@@ -269,7 +274,31 @@ class Database:
                 """
             )
             self._conn.commit()
+            self._run_migrations()
             self._seed_default_settings()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        cur = self._conn.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cur.fetchall()}
+        if column not in existing:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _run_migrations(self) -> None:
+        """Idempotent v2.0 schema migrations preserving existing v1.0 user data."""
+        self._ensure_column("accounts", "default_payment_type", "TEXT DEFAULT ''")
+        self._ensure_column("sniper_tasks", "fast_lane", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("sniper_tasks", "allow_non_default", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("orders", "memory", "TEXT DEFAULT ''")
+        self._ensure_column("orders", "storage", "TEXT DEFAULT ''")
+        self._ensure_column("orders", "track_state", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("orders", "ovh_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("orders", "server_name", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("orders", "server_ip", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("orders", "spec_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("orders", "notified_events", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("orders", "next_check_at", "REAL NOT NULL DEFAULT 0")
+        self._conn.commit()
 
     def _seed_default_settings(self) -> None:
         env_overrides = {
@@ -483,6 +512,7 @@ class Database:
         nichandle = patch.get("nichandle", existing["nichandle"])
         currency = patch.get("currency", existing["currency"])
         last_verified_at = patch.get("last_verified_at", existing["last_verified_at"])
+        default_payment_type = patch.get("default_payment_type", existing.get("default_payment_type", ""))
 
         with self._lock:
             cur = self._conn.cursor()
@@ -493,7 +523,8 @@ class Database:
                 UPDATE accounts SET
                     name = ?, endpoint = ?, subsidiary = ?, app_key = ?,
                     app_secret = ?, consumer_key = ?, is_default = ?,
-                    nichandle = ?, currency = ?, last_verified_at = ?, updated_at = ?
+                    nichandle = ?, currency = ?, default_payment_type = ?,
+                    last_verified_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -506,6 +537,7 @@ class Database:
                     is_default,
                     nichandle,
                     currency,
+                    default_payment_type or "",
                     last_verified_at,
                     now,
                     account_id,
@@ -542,8 +574,16 @@ class Database:
             d["last_availability"] = json.loads(d["last_availability"]) if d["last_availability"] else {}
         except json.JSONDecodeError:
             d["last_availability"] = {}
-        for bf in ("price_includes_tax", "auto_pay", "waive_retractation", "dry_run", "only_instant"):
-            d[bf] = bool(d[bf])
+        for bf in (
+            "price_includes_tax",
+            "auto_pay",
+            "waive_retractation",
+            "dry_run",
+            "only_instant",
+            "fast_lane",
+            "allow_non_default",
+        ):
+            d[bf] = bool(d.get(bf, 0))
         return d
 
     def list_tasks(self) -> List[Dict[str, Any]]:
@@ -589,11 +629,12 @@ class Database:
                     memory_filter, storage_filter, options, duration, pricing_mode,
                     os_code, coupons, max_price, price_includes_tax, quantity,
                     max_orders, ordered_count, auto_pay, waive_retractation,
-                    dry_run, mode, only_instant, poll_interval, priority, status,
+                    dry_run, mode, only_instant, fast_lane, allow_non_default,
+                    poll_interval, priority, status,
                     attempts, last_check_at, last_status_msg, last_availability,
                     source, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '{}', ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '{}', ?, ?, ?
                 )
                 """,
                 (
@@ -619,6 +660,8 @@ class Database:
                     1 if data.get("dry_run") else 0,
                     str(data.get("mode", "buy")).strip().lower() or "buy",
                     1 if data.get("only_instant") else 0,
+                    1 if data.get("fast_lane") else 0,
+                    1 if data.get("allow_non_default", True) else 0,
                     max(2, int(data.get("poll_interval") or self.get_setting("default_poll_interval", 5))),
                     int(data.get("priority") or 10),
                     str(data.get("status", "running")).strip().lower() or "running",
@@ -662,6 +705,7 @@ class Database:
                     max_price = ?, price_includes_tax = ?, quantity = ?,
                     max_orders = ?, ordered_count = ?, auto_pay = ?,
                     waive_retractation = ?, dry_run = ?, mode = ?, only_instant = ?,
+                    fast_lane = ?, allow_non_default = ?,
                     poll_interval = ?, priority = ?, status = ?, attempts = ?,
                     last_check_at = ?, last_status_msg = ?, last_availability = ?,
                     updated_at = ?
@@ -690,6 +734,8 @@ class Database:
                     1 if merged.get("dry_run") else 0,
                     str(merged.get("mode", "buy")).strip().lower(),
                     1 if merged.get("only_instant") else 0,
+                    1 if merged.get("fast_lane") else 0,
+                    1 if merged.get("allow_non_default", True) else 0,
                     max(2, int(merged.get("poll_interval") or 5)),
                     int(merged.get("priority") or 10),
                     str(merged.get("status", "running")).strip().lower(),
@@ -964,18 +1010,40 @@ class Database:
 
     # ---------- Orders ----------
 
+    def _row_to_order(self, row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        try:
+            d["options"] = json.loads(d["options"]) if d.get("options") else []
+        except json.JSONDecodeError:
+            d["options"] = []
+        try:
+            d["spec"] = json.loads(d["spec_json"]) if d.get("spec_json") else {}
+        except json.JSONDecodeError:
+            d["spec"] = {}
+        d["dry_run"] = bool(d.get("dry_run"))
+        return d
+
     def add_order(self, data: Dict[str, Any]) -> Dict[str, Any]:
         oid = data.get("id") or str(uuid.uuid4())[:12]
         now = now_iso()
         options = data.get("options") or []
+        is_real_success = data.get("status") == "success" and not data.get("dry_run") and bool(data.get("order_id"))
+        track_state = data.get("track_state")
+        if track_state is None:
+            track_state = "tracking" if is_real_success else ""
+        spec_json = data.get("spec_json")
+        if not isinstance(spec_json, str):
+            spec_json = json.dumps(data.get("spec") or {}, ensure_ascii=False)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO orders (
                     id, task_id, account_id, account_name, product_line, plan_code,
-                    datacenter, options, status, dry_run, order_id, order_url,
-                    price_without_tax, price_with_tax, currency, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    datacenter, options, memory, storage, status, dry_run, order_id, order_url,
+                    price_without_tax, price_with_tax, currency, error_message,
+                    track_state, ovh_status, server_name, server_ip, spec_json,
+                    notified_events, next_check_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     oid,
@@ -986,6 +1054,8 @@ class Database:
                     str(data.get("plan_code", "")),
                     str(data.get("datacenter", "")),
                     json.dumps(options, ensure_ascii=False),
+                    str(data.get("memory", "")),
+                    str(data.get("storage", "")),
                     str(data.get("status", "failed")),
                     1 if data.get("dry_run") else 0,
                     str(data.get("order_id", "")),
@@ -994,41 +1064,89 @@ class Database:
                     data.get("price_with_tax"),
                     str(data.get("currency", "")),
                     str(data.get("error_message", "")),
+                    str(track_state),
+                    str(data.get("ovh_status", "")),
+                    str(data.get("server_name", "")),
+                    str(data.get("server_ip", "")),
+                    spec_json,
+                    str(data.get("notified_events", "")),
+                    float(data.get("next_check_at") or 0),
                     now,
                 ),
             )
             self._conn.commit()
         return self.get_order(oid)  # type: ignore[return-value]
 
+    def update_order(self, oid: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        existing = self.get_order(oid)
+        if not existing:
+            return None
+        merged = dict(existing)
+        merged.update(patch)
+        spec_json = merged.get("spec_json")
+        if "spec" in patch and "spec_json" not in patch:
+            spec_json = json.dumps(patch.get("spec") or {}, ensure_ascii=False)
+        elif not isinstance(spec_json, str):
+            spec_json = json.dumps(spec_json or {}, ensure_ascii=False)
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE orders SET
+                    status = ?, order_id = ?, order_url = ?, error_message = ?,
+                    track_state = ?, ovh_status = ?, server_name = ?, server_ip = ?,
+                    spec_json = ?, notified_events = ?, next_check_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(merged.get("status", "")),
+                    str(merged.get("order_id", "")),
+                    str(merged.get("order_url", "")),
+                    str(merged.get("error_message", "")),
+                    str(merged.get("track_state", "")),
+                    str(merged.get("ovh_status", "")),
+                    str(merged.get("server_name", "")),
+                    str(merged.get("server_ip", "")),
+                    spec_json,
+                    str(merged.get("notified_events", "")),
+                    float(merged.get("next_check_at") or 0),
+                    oid,
+                ),
+            )
+            self._conn.commit()
+        return self.get_order(oid)
+
     def get_order(self, oid: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM orders WHERE id = ?", (oid,))
             row = cur.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            try:
-                d["options"] = json.loads(d["options"]) if d["options"] else []
-            except json.JSONDecodeError:
-                d["options"] = []
-            d["dry_run"] = bool(d["dry_run"])
-            return d
+            return self._row_to_order(row) if row else None
 
     def list_orders(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),))
-            out = []
-            for row in cur.fetchall():
-                d = dict(row)
-                try:
-                    d["options"] = json.loads(d["options"]) if d["options"] else []
-                except json.JSONDecodeError:
-                    d["options"] = []
-                d["dry_run"] = bool(d["dry_run"])
-                out.append(d)
-            return out
+            return [self._row_to_order(row) for row in cur.fetchall()]
+
+    def list_due_tracking_orders(self, limit: int = 6) -> List[Dict[str, Any]]:
+        now_ts = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT * FROM orders WHERE track_state = 'tracking' AND order_id != '' AND next_check_at <= ? "
+                "ORDER BY next_check_at ASC LIMIT ?",
+                (now_ts, limit),
+            )
+            return [self._row_to_order(row) for row in cur.fetchall()]
+
+    def list_linked_server_names(self, account_id: str, exclude_order_id: str = "") -> set:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT server_name FROM orders WHERE account_id = ? AND server_name != '' AND id != ?",
+                (account_id, exclude_order_id),
+            )
+            return {row["server_name"] for row in cur.fetchall()}
 
     def clear_orders(self) -> None:
         with self._lock:

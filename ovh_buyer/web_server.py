@@ -13,11 +13,12 @@ from typing import Any, Dict, Optional, Tuple
 from . import __app_name__, __version__
 from .auth import SESSION_COOKIE_NAME, SESSION_TTL_SECONDS, PanelAuth
 from .catalog import CatalogManager
-from .config import DATACENTERS, DEFAULT_VPS_MODELS, ENDPOINTS
+from .config import DATACENTERS, DEFAULT_VPS_MODELS, ENDPOINTS, OVH_ORDER_STATUS_LABELS
 from .database import Database, mask_secret, now_iso
 from .notifier import Notifier
 from .order_engine import OrderEngine
 from .sniper import SniperEngine
+from .specs import GLOBAL_FX
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -215,8 +216,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     "endpoints": ENDPOINTS,
                     "datacenters": DATACENTERS,
                     "default_vps_models": DEFAULT_VPS_MODELS,
+                    "order_status_labels": OVH_ORDER_STATUS_LABELS,
                 }
             )
+            return
+
+        if path == "/api/fx":
+            self._send_json({"rates": GLOBAL_FX.get_rates()})
             return
 
         if path == "/api/status":
@@ -236,6 +242,16 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             client = self.ctx.engine.build_client(account=acc)
             orders = client.get_recent_orders(limit=15)
             self._send_json({"items": orders})
+            return
+
+        if path.startswith("/api/accounts/") and path.endswith("/servers"):
+            acc_id = path.split("/")[3]
+            acc = self.ctx.db.get_account(acc_id, mask=False)
+            if not acc:
+                self._send_json({"error": "账号不存在"}, status=404)
+                return
+            servers = self.ctx.engine.list_account_servers(acc_id)
+            self._send_json({"items": servers})
             return
 
         if path == "/api/catalog":
@@ -264,12 +280,16 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/availability/"):
             plan_code = urllib.parse.unquote(path[len("/api/availability/") :]).strip()
             endpoint = q1("endpoint", "ovh-eu")
-            items = self.ctx.engine.check_plan_live(plan_code, endpoint=endpoint)
-            self._send_json({"planCode": plan_code, "endpoint": endpoint, "items": items})
+            subsidiary = q1("subsidiary", "IE").upper()
+            items = self.ctx.engine.check_plan_live(plan_code, endpoint=endpoint, subsidiary=subsidiary)
+            self._send_json({"planCode": plan_code, "endpoint": endpoint, "subsidiary": subsidiary, "items": items})
             return
 
         if path == "/api/tasks":
-            self._send_json({"items": self.ctx.db.list_tasks()})
+            tasks = self.ctx.db.list_tasks()
+            for t in tasks:
+                t["fast_lane_slots"] = self.ctx.engine.slot_pool.get_task_slots_summary(t["id"])
+            self._send_json({"items": tasks})
             return
 
         if path == "/api/radar":
@@ -379,11 +399,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/engine/toggle":
             patch = {}
-            for k in ("sniper_enabled", "radar_enabled", "vps_monitor_enabled"):
+            for k in ("sniper_enabled", "fast_lane_enabled", "tracker_enabled", "radar_enabled", "vps_monitor_enabled"):
                 if k in body:
                     patch[k] = bool(body[k])
             if patch:
                 self.ctx.db.update_settings(patch)
+                if patch.get("fast_lane_enabled") is False:
+                    self.ctx.engine.slot_pool.cleanup_all()
                 self.ctx.db.add_log("INFO", f"引擎开关更新: {patch}", "engine")
             self._send_json(self.ctx.engine.get_status())
             return
@@ -411,11 +433,46 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 {
                     "nichandle": info.get("nichandle", ""),
                     "currency": info.get("currency", "EUR"),
+                    "default_payment_type": info.get("default_payment_type") or "",
                     "last_verified_at": now_iso(),
                 },
             )
-            self.ctx.db.add_log("SUCCESS", f"账号 {acc['name']} 验证成功: {info.get('nichandle')}", "account")
+            self.ctx.db.add_log(
+                "SUCCESS",
+                f"账号 {acc['name']} 验证成功: {info.get('nichandle')} (默认支付: {info.get('default_payment_type') or '未绑定'})",
+                "account",
+            )
             self._send_json({"ok": True, "info": info})
+            return
+
+        if path.startswith("/api/orders/") and path.endswith("/track"):
+            oid = path.split("/")[3]
+            res = self.ctx.engine.tracker.check_order(oid)
+            self._send_json({"ok": "error" not in res, "result": res})
+            return
+
+        if path == "/api/short-link/preview":
+            url = str(body.get("url") or "").strip()
+            if not url:
+                self._send_json({"error": "请粘贴 /o/<region>/<token> 短链"}, status=400)
+                return
+            res = self.ctx.engine.preview_short_order_link(url, account_id=str(body.get("account_id") or ""))
+            self._send_json({"ok": True, "preview": res})
+            return
+
+        if path == "/api/short-link/confirm":
+            tok = str(body.get("token") or "").strip()
+            if not tok:
+                self._send_json({"error": "缺少预览 token"}, status=400)
+                return
+            res = self.ctx.engine.confirm_short_order_link(tok, auto_pay=bool(body.get("auto_pay", False)))
+            self._send_json(res, status=200 if res.get("success") or res.get("status") == "pending_confirm" else 400)
+            return
+
+        if path == "/api/short-link/cancel":
+            tok = str(body.get("token") or "").strip()
+            ok = self.ctx.engine.cancel_short_order_link(tok)
+            self._send_json({"ok": ok})
             return
 
         if path == "/api/price-check":
@@ -523,6 +580,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if not updated:
                 self._send_json({"error": "任务不存在"}, status=404)
                 return
+            if updated["status"] != "running" or not updated.get("fast_lane"):
+                self.ctx.engine.slot_pool.cleanup_task(task_id)
             self._send_json(updated)
             return
 
@@ -570,6 +629,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
         if path.startswith("/api/tasks/"):
             task_id = path.split("/")[3]
+            self.ctx.engine.slot_pool.cleanup_task(task_id)
             ok = self.ctx.db.delete_task(task_id)
             self._send_json({"ok": ok}, status=200 if ok else 404)
             return

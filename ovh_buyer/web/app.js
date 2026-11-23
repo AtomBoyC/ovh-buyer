@@ -3,6 +3,7 @@
 const state = {
   meta: null,
   status: null,
+  fxRates: { EUR: 7.85, USD: 7.25, CAD: 5.20, GBP: 9.20, PLN: 1.85, AUD: 4.75, SGD: 5.40, CNY: 1.0 },
   accounts: [],
   tasks: [],
   radar: [],
@@ -13,7 +14,18 @@ const state = {
   logSource: null,
   activeTab: "dashboard",
   selectedDcs: [],
+  shortLinkPreview: null,
 };
+
+function fmtCny(amount, currency = "EUR") {
+  if (amount === null || amount === undefined || isNaN(Number(amount))) return "";
+  const cur = String(currency || "EUR").toUpperCase();
+  if (cur === "CNY") return "";
+  const rate = state.fxRates && state.fxRates[cur];
+  if (!rate) return "";
+  const cny = Math.round(Number(amount) * Number(rate));
+  return `≈ ¥${cny}`;
+}
 
 const TAB_TITLES = {
   dashboard: "总览仪表盘",
@@ -142,6 +154,7 @@ function renderStatus() {
   document.getElementById("nav-tasks-badge").textContent = s.tasks_running || 0;
 
   document.getElementById("toggle-sniper").checked = !!st.sniper_enabled;
+  document.getElementById("toggle-fastlane").checked = !!st.fast_lane_enabled;
   document.getElementById("toggle-radar").checked = !!st.radar_enabled;
   document.getElementById("toggle-vps").checked = !!st.vps_monitor_enabled;
 
@@ -149,7 +162,7 @@ function renderStatus() {
   const txt = document.getElementById("sidebar-engine-text");
   if (st.running && st.sniper_enabled) {
     pill.classList.add("ok");
-    txt.textContent = "引擎在线 · 抢购待命";
+    txt.textContent = st.fast_lane_enabled ? "引擎在线 · ⚡快速通道就绪" : "引擎在线 · 抢购待命";
   } else if (st.running) {
     pill.classList.remove("ok");
     txt.textContent = "引擎在线 · 抢购已暂停";
@@ -204,6 +217,7 @@ function renderDashboard() {
 function statusPillForOrder(st) {
   if (st === "success") return `<span class="pill pill-green">抢购成功</span>`;
   if (st === "dry_run") return `<span class="pill pill-blue">演练通过</span>`;
+  if (st === "pending_confirm") return `<span class="pill pill-red">⚠️ 待核对(防重单)</span>`;
   if (st === "budget_exceeded") return `<span class="pill pill-amber">超预算取消</span>`;
   return `<span class="pill pill-red">失败</span>`;
 }
@@ -236,12 +250,14 @@ function renderCatalog() {
     return;
   }
   const ep = document.getElementById("cat-endpoint").value;
+  const sub = document.getElementById("cat-subsidiary").value;
   tbody.innerHTML = state.catalog
     .slice(0, 120)
     .map((p) => {
+      const cny = p.price !== null && p.price !== undefined ? fmtCny(p.price, p.currency) : "";
       const priceStr =
         p.price !== null && p.price !== undefined
-          ? `<b>${p.price} ${esc(p.currency)}</b> / ${esc(p.defaultDuration)}`
+          ? `<b>${p.price} ${esc(p.currency)}</b> / ${esc(p.defaultDuration)}${cny ? ` <span class="muted">(${esc(cny)})</span>` : ""}`
           : `<span class="muted">查询确认</span>`;
       const setup = p.setupFee ? `<div class="muted">安装费 ${p.setupFee} ${esc(p.currency)}</div>` : "";
       return `<tr>
@@ -257,7 +273,7 @@ function renderCatalog() {
         <td>${priceStr}${setup}</td>
         <td>
           <div class="toolbar">
-            <button class="btn btn-ghost btn-sm" onclick="inspectAvailability('${esc(p.planCode)}','${esc(ep)}')">查库存</button>
+            <button class="btn btn-ghost btn-sm" onclick="inspectAvailability('${esc(p.planCode)}','${esc(ep)}','${esc(sub)}')">查库存</button>
             <button class="btn btn-primary btn-sm" onclick="openTaskFromCatalog('${esc(p.planCode)}')">+ 抢购</button>
           </div>
         </td>
@@ -266,13 +282,14 @@ function renderCatalog() {
     .join("");
 }
 
-async function inspectAvailability(planCode, endpoint = "ovh-eu") {
-  document.getElementById("avail-modal-title").textContent = `实时库存: ${planCode} (${endpoint})`;
+async function inspectAvailability(planCode, endpoint = "ovh-eu", subsidiary = "IE") {
+  document.getElementById("avail-modal-title").textContent = `实时库存: ${planCode} (${endpoint}/${subsidiary})`;
   const body = document.getElementById("avail-modal-body");
-  body.innerHTML = `<div class="muted">正在向 OVH API 查询实时库存...</div>`;
+  body.innerHTML = `<div class="muted">正在向 OVH API 查询实时库存与目录可订性校验...</div>`;
   openModal("avail-modal");
   try {
-    const res = await api(`/api/availability/${encodeURIComponent(planCode)}?endpoint=${encodeURIComponent(endpoint)}`);
+    const q = new URLSearchParams({ endpoint, subsidiary });
+    const res = await api(`/api/availability/${encodeURIComponent(planCode)}?${q.toString()}`);
     body.innerHTML = renderAvailabilityCards(planCode, res.items || []);
   } catch (err) {
     body.innerHTML = `<div class="error-text">查询失败: ${esc(err.message)}</div>`;
@@ -285,20 +302,32 @@ function renderAvailabilityCards(planCode, items) {
   }
   return items
     .map((entry) => {
+      const cfgOk = entry.configOrderable !== false;
+      const phantomBadge = !cfgOk
+        ? `<span class="pill pill-red" title="${esc(entry.unorderableReason || "目录无此配件")}">⚠️ 幽灵库存(不可订)</span>`
+        : entry.isDefault
+        ? `<span class="pill pill-blue">默认标配</span>`
+        : "";
       const chips = (entry.datacenters || [])
         .map((dc) => {
           const cls = dc.orderable ? "pill-green" : "pill-gray";
           const btn = dc.orderable
             ? ` onclick="openTaskFromQuick('${esc(planCode)}','${esc(dc.datacenter)}','${esc(entry.memory)}','${esc(entry.storage)}')" style="cursor:pointer" title="点击添加该机房抢购任务"`
             : "";
-          return `<span class="pill ${cls}"${btn}>${esc(dc.datacenter.toUpperCase())}: ${esc(dc.availability)}</span>`;
+          const expressBtn =
+            dc.orderable && dc.express_url
+              ? `<a class="dc-express-link" href="${esc(dc.express_url)}" target="_blank" rel="noreferrer" title="直接打开 OVH 官网 Express 结账页">直达↗</a>`
+              : "";
+          return `<span class="dc-action-group"><span class="pill ${cls}"${btn}>${esc(dc.datacenter.toUpperCase())}: ${esc(dc.availability)}</span>${expressBtn}</span>`;
         })
         .join(" ");
+      const reasonLine = !cfgOk && entry.unorderableReason ? `<div class="error-text mt-6" style="margin-bottom:0">⚠️ ${esc(entry.unorderableReason)}</div>` : "";
       return `<div class="list-row" style="flex-direction:column;align-items:stretch;margin-bottom:10px">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-          <div><code class="mono">${esc(entry.fqn)}</code></div>
+          <div><code class="mono">${esc(entry.fqn)}</code> ${phantomBadge}</div>
           <div class="muted">${esc(entry.memory || "默认内存")} · ${esc(entry.storage || "默认存储")}</div>
         </div>
+        ${reasonLine}
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${chips || '<span class="muted">无机房数据</span>'}</div>
       </div>`;
     })
@@ -347,18 +376,26 @@ function renderTasks() {
         .filter(Boolean)
         .join(" · ");
       const flags = [
+        t.fast_lane ? `<span class="pill pill-purple" title="预建购物车快速通道">⚡快速</span>` : "",
         t.dry_run ? `<span class="pill pill-blue">演练</span>` : `<span class="pill pill-amber">实单</span>`,
         t.auto_pay ? `<span class="pill pill-green">自动付</span>` : "",
+        t.allow_non_default === false ? `<span class="pill pill-gray">仅标配</span>` : "",
         t.mode === "notify_only" ? `<span class="pill pill-gray">仅通知</span>` : "",
         t.max_price > 0 ? `<span class="pill pill-gray">≤${t.max_price}</span>` : "",
       ].join(" ");
       const stPill =
         t.status === "running"
           ? `<span class="pill pill-green">运行中</span>`
+          : t.status === "pending_confirm"
+          ? `<span class="pill pill-red">⚠️ 待核对(防重单)</span>`
           : t.status === "completed"
           ? `<span class="pill pill-blue">已完成</span>`
           : `<span class="pill pill-gray">已暂停</span>`;
-      const toggleLabel = t.status === "running" ? "暂停" : "启动";
+      const slots = (t.fast_lane_slots || [])
+        .map((sl) => `${sl.dc.toUpperCase()}(${sl.ttl_minutes}m)`)
+        .join(", ");
+      const slotLine = slots ? `<div class="muted mt-6" style="color:#d8b4fe">⚡ 预建就绪: ${esc(slots)}</div>` : "";
+      const toggleLabel = t.status === "running" ? "暂停" : t.status === "pending_confirm" ? "核对后恢复" : "启动";
       const nextStatus = t.status === "running" ? "paused" : "running";
       return `<tr>
         <td>
@@ -372,6 +409,7 @@ function renderTasks() {
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap">${flags}</div>
           <div class="muted mt-6">每 ${t.poll_interval}s · ${esc(t.duration)} / ${esc(t.pricing_mode)}</div>
+          ${slotLine}
         </td>
         <td>
           ${stPill}
@@ -434,6 +472,8 @@ function openTaskModal(prefill = {}) {
   form.elements.poll_interval.value = prefill.poll_interval || 5;
   form.elements.os_code.value = prefill.os_code || "none_64.en";
   form.elements.coupons.value = (prefill.coupons || []).join(",");
+  form.elements.fast_lane.checked = !!prefill.fast_lane;
+  form.elements.allow_non_default.checked = prefill.allow_non_default !== false;
   form.elements.dry_run.checked = !!prefill.dry_run;
   form.elements.auto_pay.checked = !!prefill.auto_pay;
   form.elements.only_instant.checked = !!prefill.only_instant;
@@ -586,25 +626,139 @@ function renderOrders() {
     tbody.innerHTML = `<tr><td colspan="6" class="muted text-center">暂无订单历史</td></tr>`;
     return;
   }
+  const labels = (state.meta && state.meta.order_status_labels) || {};
   tbody.innerHTML = state.orders
     .map((o) => {
+      const cny = o.price_with_tax != null ? fmtCny(o.price_with_tax, o.currency) : "";
       const price =
         o.price_without_tax != null || o.price_with_tax != null
-          ? `${o.price_without_tax ?? "-"} / ${o.price_with_tax ?? "-"} ${esc(o.currency)}`
+          ? `<div>${o.price_without_tax ?? "-"} / <b>${o.price_with_tax ?? "-"}</b> ${esc(o.currency)}</div>${cny ? `<div class="muted">${esc(cny)}</div>` : ""}`
           : "-";
-      const link = o.order_url
-        ? `<a class="btn btn-primary btn-sm" href="${esc(o.order_url)}" target="_blank" rel="noreferrer">前往付款 #${esc(o.order_id)} ↗</a>`
+
+      // Delivery / Lottery badges
+      const ovhSt = o.ovh_status ? `<span class="pill pill-gray" title="OVH 官方订单状态">${esc(labels[o.ovh_status] || o.ovh_status)}</span>` : "";
+      const spec = o.spec || null;
+      const actualText = spec && spec.actual ? spec.actual.text : "";
+      let lotteryHtml = "";
+      if (spec && spec.lottery) {
+        lotteryHtml = `<div class="mt-6"><span class="pill pill-purple">🎰 中奖! ${esc((spec.upgrades || []).join(" · "))}</span></div>`;
+        if (actualText) {
+          lotteryHtml += `<div class="muted">实机: ${esc(actualText)}</div>`;
+        }
+      } else if (actualText) {
+        lotteryHtml = `<div class="muted mt-6">实机(标准): ${esc(actualText)}</div>`;
+      }
+      const srvLine = o.server_name
+        ? `<div class="muted mt-6">🖥️ <code class="mono">${esc(o.server_name)}</code>${o.server_ip ? ` (${esc(o.server_ip)})` : ""}</div>`
+        : "";
+
+      const payBtn = o.order_url
+        ? `<a class="btn btn-primary btn-sm" href="${esc(o.order_url)}" target="_blank" rel="noreferrer">付款 #${esc(o.order_id)} ↗</a>`
         : `<span class="muted">${esc(o.order_id || o.error_message || "-")}</span>`;
+      const trackBtn =
+        o.order_id && !o.dry_run
+          ? `<button class="btn btn-ghost btn-sm" onclick="trackOrder('${esc(o.id)}')" title="立即查询 OVH 订单状态、交付主机并比对硬件中奖">查交付</button>`
+          : "";
+
       return `<tr>
         <td class="muted">${esc(o.created_at)}</td>
-        <td><code class="mono">${esc(o.plan_code)}</code> @ <b>${esc(o.datacenter.toUpperCase())}</b><div class="muted">${esc((o.options || []).join(", "))}</div></td>
+        <td>
+          <code class="mono">${esc(o.plan_code)}</code> @ <b>${esc(o.datacenter.toUpperCase())}</b>
+          <div class="muted">${esc((o.options || []).join(", "))}</div>
+        </td>
         <td>${esc(o.account_name || "-")}</td>
-        <td>${statusPillForOrder(o.status)}</td>
+        <td>
+          <div style="display:flex;gap:4px;flex-wrap:wrap">${statusPillForOrder(o.status)} ${ovhSt}</div>
+          ${srvLine}
+          ${lotteryHtml}
+        </td>
         <td class="mono">${price}</td>
-        <td>${link}</td>
+        <td><div class="toolbar">${payBtn} ${trackBtn}</div></td>
       </tr>`;
     })
     .join("");
+}
+
+async function trackOrder(id) {
+  toast("正在查询 OVH 订单状态与硬件交付信息...", "info");
+  try {
+    const res = await api(`/api/orders/${id}/track`, { method: "POST", body: {} });
+    const r = res.result || {};
+    if (r.error) {
+      toast(`跟踪失败: ${r.error}`, "err");
+    } else if (r.lottery) {
+      toast(`🎰 恭喜中奖! 主机 ${r.server_name} 硬件升级!`, "ok");
+    } else if (r.server_name) {
+      toast(`📦 订单已交付: ${r.server_name} (状态: ${r.status || "delivered"})`, "ok");
+    } else {
+      toast(`当前 OVH 订单状态: ${r.status || r.track_state || "tracking"}`, "ok");
+    }
+    refreshAll();
+  } catch (err) {
+    toast(err.message, "err");
+  }
+}
+
+function renderShortLinkPreview(p) {
+  const box = document.getElementById("short-link-preview");
+  if (!p) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    state.shortLinkPreview = null;
+    return;
+  }
+  state.shortLinkPreview = p;
+  const pr = p.prices || {};
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+      <div>
+        <div><b>🎯 ${esc(p.plan_code)}</b> @ <b>${esc(String(p.datacenter || "").toUpperCase())}</b> <span class="pill pill-blue">${esc(p.account_name)} (${esc(p.subsidiary)})</span></div>
+        <div class="muted mt-6">配件: ${esc((p.options || []).join(", ") || "默认")} · 周期: ${esc(p.duration)} / ${esc(p.pricing_mode)}</div>
+        <div class="mt-6">不含税: <b>${pr.withoutTax ?? "-"} ${esc(pr.currencyCode || "")}</b> · 含税总计: <b style="color:#fcd34d">${esc(p.price_with_tax_cny || `${pr.withTax ?? "-"} ${pr.currencyCode || ""}`)}</b></div>
+        <div class="muted mt-6">⚠️ 确认后将生成 OVH 官方未付款订单（不自动扣款），点击一次后自动锁定防止重单。</div>
+      </div>
+      <div class="toolbar">
+        <button type="button" class="btn btn-primary btn-sm" id="btn-short-confirm" onclick="confirmShortLink('${esc(p.token)}')">✅ 确认生成未付款订单</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="cancelShortLink('${esc(p.token)}')">❌ 取消并删车</button>
+      </div>
+    </div>
+  `;
+  box.classList.remove("hidden");
+}
+
+async function confirmShortLink(token) {
+  const btn = document.getElementById("btn-short-confirm");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ 正在提交订单...";
+  }
+  try {
+    const res = await api("/api/short-link/confirm", { method: "POST", body: { token, auto_pay: false } });
+    if (res.success) {
+      toast(`✅ 短链下单成功! 订单 #${res.order_id}`, "ok");
+      renderShortLinkPreview(null);
+      document.getElementById("short-link-url").value = "";
+      refreshAll();
+    } else if (res.status === "pending_confirm") {
+      toast(`⚠️ ${res.error}`, "err");
+      renderShortLinkPreview(null);
+      refreshAll();
+    } else {
+      toast(`下单失败: ${res.error || "未知错误"}`, "err");
+      renderShortLinkPreview(null);
+    }
+  } catch (err) {
+    toast(`提交失败: ${err.message}`, "err");
+    renderShortLinkPreview(null);
+  }
+}
+
+async function cancelShortLink(token) {
+  try {
+    await api("/api/short-link/cancel", { method: "POST", body: { token } });
+  } catch (_) {}
+  renderShortLinkPreview(null);
+  toast("已取消预览并释放购物车", "info");
 }
 
 // ---------- Accounts ----------
@@ -618,8 +772,13 @@ function renderAccounts() {
   tbody.innerHTML = state.accounts
     .map((a) => {
       const def = a.is_default ? `<span class="pill pill-amber">默认</span>` : "";
+      const payBadge = a.nichandle
+        ? a.default_payment_type
+          ? ` <span class="pill pill-blue" title="已绑定 OVH 默认支付方式">💳 ${esc(a.default_payment_type)}</span>`
+          : ` <span class="pill pill-amber" title="未检测到默认支付方式，auto_pay 可能失败">⚠️ 无默认支付</span>`
+        : "";
       const ver = a.nichandle
-        ? `<span class="pill pill-green">${esc(a.nichandle)} (${esc(a.currency)})</span><div class="muted">${esc(a.last_verified_at)}</div>`
+        ? `<div><span class="pill pill-green">${esc(a.nichandle)} (${esc(a.currency)})</span>${payBadge}</div><div class="muted mt-6">${esc(a.last_verified_at)}</div>`
         : `<span class="muted">未验证</span>`;
       return `<tr>
         <td><b>${esc(a.name)}</b> ${def}</td>
@@ -642,9 +801,13 @@ function populateAccountSelects() {
   const opts = state.accounts.length
     ? state.accounts.map((a) => `<option value="${esc(a.id)}">${esc(a.name)} (${esc(a.endpoint)}/${esc(a.subsidiary)})</option>`).join("")
     : `<option value="">（尚未配置 OVH 账号）</option>`;
-  ["task-account-select", "radar-account-select", "vps-account-select"].forEach((id) => {
+  ["task-account-select", "radar-account-select", "vps-account-select", "short-link-account"].forEach((id) => {
     const el = document.getElementById(id);
-    if (el) el.innerHTML = opts;
+    if (el) {
+      const prev = el.value;
+      el.innerHTML = opts;
+      if (prev && state.accounts.some((a) => a.id === prev)) el.value = prev;
+    }
   });
 }
 
@@ -671,7 +834,8 @@ async function testAccount(id) {
     const res = await api(`/api/accounts/${id}/test`, { method: "POST", body: {} });
     const info = res.info || {};
     const bal = info.credit_balance != null ? ` | 余额: ${info.credit_balance} ${info.currency}` : "";
-    toast(`验证成功! 账号 ${info.nichandle} (${info.subsidiary})${bal}`, "ok");
+    const pay = info.default_payment_type ? ` | 默认支付: ${info.default_payment_type}` : " | ⚠️ 未绑定默认支付";
+    toast(`验证成功! 账号 ${info.nichandle} (${info.subsidiary})${bal}${pay}`, "ok");
     refreshAll();
   } catch (err) {
     toast(`验证失败: ${err.message}`, "err");
@@ -781,6 +945,7 @@ function bindEvents() {
   // Engine toggles
   [
     ["toggle-sniper", "sniper_enabled"],
+    ["toggle-fastlane", "fast_lane_enabled"],
     ["toggle-radar", "radar_enabled"],
     ["toggle-vps", "vps_monitor_enabled"],
   ].forEach(([elId, key]) => {
@@ -840,6 +1005,8 @@ function bindEvents() {
       poll_interval: parseInt(f.elements.poll_interval.value || "5", 10) || 5,
       os_code: f.elements.os_code.value.trim() || "none_64.en",
       coupons: f.elements.coupons.value,
+      fast_lane: f.elements.fast_lane.checked,
+      allow_non_default: f.elements.allow_non_default.checked,
       dry_run: f.elements.dry_run.checked,
       auto_pay: f.elements.auto_pay.checked,
       only_instant: f.elements.only_instant.checked,
@@ -975,7 +1142,59 @@ function bindEvents() {
     }
   });
 
-  // Orders actions
+  // Orders & Short-Link & My Servers actions
+  document.getElementById("short-link-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const url = document.getElementById("short-link-url").value.trim();
+    const accId = document.getElementById("short-link-account").value;
+    const btn = document.getElementById("btn-short-link-preview");
+    btn.disabled = true;
+    btn.textContent = "解析报价中...";
+    try {
+      const res = await api("/api/short-link/preview", { method: "POST", body: { url, account_id: accId } });
+      renderShortLinkPreview(res.preview);
+      toast("短链解析成功，已获取实时含税报价，请确认后下单", "ok");
+    } catch (err) {
+      toast(`短链解析失败: ${err.message}`, "err");
+      renderShortLinkPreview(null);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "解析并报价";
+    }
+  });
+
+  document.getElementById("btn-fetch-my-servers").addEventListener("click", async () => {
+    if (!state.accounts.length) {
+      toast("请先配置 OVH 账号", "err");
+      return;
+    }
+    const acc = state.accounts[0];
+    toast(`正在从 ${acc.name} 拉取我的独立服务器列表...`, "info");
+    try {
+      const res = await api(`/api/accounts/${acc.id}/servers`);
+      const card = document.getElementById("my-servers-card");
+      const list = document.getElementById("my-servers-list");
+      const items = res.items || [];
+      list.innerHTML = items.length
+        ? items
+            .map((s) => {
+              const memVal = s.memory && typeof s.memory === "object" ? `${s.memory.value || ""}${s.memory.unit || ""}` : s.memory || "-";
+              return `<div class="list-row">
+                <div>
+                  <div><code class="mono">${esc(s.name)}</code> <span class="pill pill-green">${esc(s.state || "ok")}</span> <span class="pill pill-gray">${esc(String(s.datacenter || "").toUpperCase())}</span></div>
+                  <div class="muted mt-6">IP: ${esc(s.ip || "-")} · CPU: ${esc(s.cpu || "-")} · 内存: ${esc(memVal)}</div>
+                  <div class="muted">型号线: ${esc(s.commercialRange || "-")} · 到期: ${esc(s.expiration || "-")}</div>
+                </div>
+              </div>`;
+            })
+            .join("")
+        : `<div class="muted">该账号下暂无独立服务器</div>`;
+      card.classList.remove("hidden");
+    } catch (err) {
+      toast(`拉取独服列表失败: ${err.message}`, "err");
+    }
+  });
+
   document.getElementById("btn-clear-orders").addEventListener("click", async () => {
     if (!confirm("确定清空本地订单历史记录？")) return;
     await api("/api/orders", { method: "DELETE" });
@@ -1082,6 +1301,15 @@ function bindEvents() {
 
 async function bootAfterAuth() {
   state.meta = await api("/api/meta");
+  const eps = (state.meta && state.meta.endpoints) || {};
+  if (eps["ovh-eu"] && eps["ovh-eu"].token_url) document.getElementById("token-link-eu").href = eps["ovh-eu"].token_url;
+  if (eps["ovh-ca"] && eps["ovh-ca"].token_url) document.getElementById("token-link-ca").href = eps["ovh-ca"].token_url;
+  if (eps["ovh-us"] && eps["ovh-us"].token_url) document.getElementById("token-link-us").href = eps["ovh-us"].token_url;
+  api("/api/fx")
+    .then((res) => {
+      if (res && res.rates) state.fxRates = res.rates;
+    })
+    .catch(() => {});
   await refreshAll();
   loadLogs();
   connectLogStream();
@@ -1122,5 +1350,8 @@ window.deleteVps = deleteVps;
 window.testAccount = testAccount;
 window.editAccount = editAccount;
 window.deleteAccount = deleteAccount;
+window.trackOrder = trackOrder;
+window.confirmShortLink = confirmShortLink;
+window.cancelShortLink = cancelShortLink;
 
 document.addEventListener("DOMContentLoaded", init);

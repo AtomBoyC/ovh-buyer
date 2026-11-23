@@ -23,6 +23,11 @@ class OVHAPIError(Exception):
         self.status_code = status_code
         self.payload = payload
 
+    @property
+    def is_definite_rejection(self) -> bool:
+        """True if OVH definitively rejected the request (4xx except 429) and did NOT create an order."""
+        return self.status_code in (400, 401, 403, 404, 409, 410, 422)
+
 
 class OVHAuthError(OVHAPIError):
     """Authentication or permission error from OVHcloud API."""
@@ -424,15 +429,17 @@ class OVHClient:
     # ---------- High-level Helpers ----------
 
     def verify_credentials(self) -> Dict[str, Any]:
-        """Verify API keys against /me and fetch credit balance summary."""
+        """Verify API keys against /me, credit balance, and default payment method."""
         me = self.get("/me", need_auth=True)
-        result = {
+        result: Dict[str, Any] = {
             "nichandle": me.get("nichandle", ""),
             "email": me.get("email", ""),
             "subsidiary": me.get("ovhSubsidiary", ""),
             "currency": (me.get("currency") or {}).get("code", "EUR"),
             "state": me.get("state", ""),
             "credit_balance": None,
+            "payment_methods_count": 0,
+            "default_payment_type": None,
         }
         try:
             balances = self.get("/me/credit/balance", need_auth=True)
@@ -446,11 +453,23 @@ class OVHClient:
                 result["credit_balance"] = round(total_val, 2)
         except Exception:
             pass
+        try:
+            methods = self.get("/me/payment/method", need_auth=True)
+            if isinstance(methods, list):
+                result["payment_methods_count"] = len(methods)
+                for m in methods[:10]:
+                    md = m if isinstance(m, dict) else self.get(f"/me/payment/method/{m}", need_auth=True)
+                    if isinstance(md, dict) and md.get("default"):
+                        result["default_payment_type"] = str(md.get("paymentType") or md.get("label") or "DEFAULT")
+                        break
+        except Exception:
+            pass
         return result
 
-    def get_recent_orders(self, limit: int = 15) -> list:
-        """Fetch recent OVH account orders with URL & status."""
-        order_ids = self.get("/me/order", need_auth=True)
+    def get_recent_orders(self, limit: int = 15, since_iso: str = "") -> list:
+        """Fetch recent OVH account orders with URL & live status."""
+        params = {"date.from": since_iso} if since_iso else None
+        order_ids = self.get("/me/order", params=params, need_auth=True)
         if not isinstance(order_ids, list):
             return []
         recent_ids = sorted(order_ids, reverse=True)[:limit]
@@ -459,10 +478,48 @@ class OVHClient:
             try:
                 item = self.get(f"/me/order/{oid}", need_auth=True)
                 if isinstance(item, dict):
+                    try:
+                        item["status"] = self.get(f"/me/order/{oid}/status", need_auth=True)
+                    except Exception:
+                        item["status"] = "unknown"
                     details.append(item)
             except Exception:
                 continue
         return details
+
+    def get_order_status(self, order_id: Any) -> str:
+        st = self.get(f"/me/order/{order_id}/status", need_auth=True)
+        return str(st or "unknown")
+
+    def get_order_details(self, order_id: Any) -> list:
+        ids = self.get(f"/me/order/{order_id}/details", need_auth=True)
+        if not isinstance(ids, list):
+            return []
+        out = []
+        for did in ids[:20]:
+            try:
+                d = self.get(f"/me/order/{order_id}/details/{did}", need_auth=True)
+                if isinstance(d, dict):
+                    out.append(d)
+            except Exception:
+                continue
+        return out
+
+    def list_dedicated_servers(self) -> list:
+        names = self.get("/dedicated/server", need_auth=True)
+        return names if isinstance(names, list) else []
+
+    def get_dedicated_server(self, service_name: str) -> Dict[str, Any]:
+        res = self.get(f"/dedicated/server/{urllib.parse.quote(service_name)}", need_auth=True)
+        return res if isinstance(res, dict) else {}
+
+    def get_dedicated_hardware(self, service_name: str) -> Dict[str, Any]:
+        res = self.get(f"/dedicated/server/{urllib.parse.quote(service_name)}/specifications/hardware", need_auth=True)
+        return res if isinstance(res, dict) else {}
+
+    def get_dedicated_service_infos(self, service_name: str) -> Dict[str, Any]:
+        res = self.get(f"/dedicated/server/{urllib.parse.quote(service_name)}/serviceInfos", need_auth=True)
+        return res if isinstance(res, dict) else {}
 
     def get_availabilities(self, plan_code: str = "") -> list:
         """Query /dedicated/server/datacenter/availabilities (public endpoint, works with or without auth)."""

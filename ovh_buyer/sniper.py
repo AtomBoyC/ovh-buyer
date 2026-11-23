@@ -1,30 +1,38 @@
-"""Background Sniper, Black Friday Catalog Radar, and VPS Monitor Engines."""
+"""Background Sniper v2.0, Prebuilt Cart Fast Lane, Delivery Tracker, BF Radar, and VPS Monitor."""
 
 import os
 import re
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from .catalog import (
     CatalogManager,
+    is_config_orderable,
+    is_default_fqn_config,
     match_filter_expression,
-    resolve_addons_for_fqn,
+    resolve_cart_addons,
     standardize_config,
 )
 from .config import (
+    OVH_ORDER_STATUS_LABELS,
+    build_express_order_url,
+    decode_short_order_url,
     format_datacenter_label,
     is_availability_orderable,
     normalize_datacenter,
 )
 from .database import Database, now_iso
 from .notifier import Notifier
-from .order_engine import OrderEngine
-from .ovh_client import OVHAPIError, OVHClient
+from .order_engine import CartSlotPool, OrderEngine, safe_delete_cart
+from .ovh_client import OVHClient
+from .specs import GLOBAL_FX
+from .tracker import OrderTracker
 
 
 class SniperEngine:
-    """Orchestrates shared availability polling, auto-ordering, Black Friday radar, and VPS watching."""
+    """Orchestrates shared/bulk polling, Fast Lane prebuilt carts, delivery/lottery tracking, BF radar & VPS."""
 
     def __init__(
         self,
@@ -40,34 +48,48 @@ class SniperEngine:
         self.notifier = notifier
         self._custom_client_factory = client_factory
 
+        self.slot_pool = CartSlotPool(order_engine, log_fn=db.add_log)
+        self.tracker = OrderTracker(
+            db=db,
+            catalog_manager=catalog_manager,
+            notifier=notifier,
+            client_builder=self.build_client,
+        )
+
         self._stop_event = threading.Event()
         self._threads: List[threading.Thread] = []
         self._oneshot_threads: List[threading.Thread] = []
         self._lock = threading.RLock()
 
-        # In-memory cooldown maps to avoid spam & runaway retries
+        # In-memory cooldown & short-link cart cache
         self._task_last_poll: Dict[str, float] = {}
         self._stock_notify_cooldown: Dict[str, float] = {}
         self._order_fail_cooldown: Dict[str, float] = {}
         self._radar_last_poll: float = 0.0
         self._vps_last_poll: float = 0.0
+        self._fastlane_last_tick: float = 0.0
+        self._tracker_last_tick: float = 0.0
+        self._short_link_lock = threading.Lock()
+        self._short_link_carts: Dict[str, Dict[str, Any]] = {}
 
         # Telemetry
         self.started_at: Optional[float] = None
         self.total_polls: int = 0
         self.stock_hits: int = 0
-        self._clients_cache: Dict[str, OVHClient] = {}
 
-        # Wire Telegram Bot commands
         self.notifier.register_bot_handlers(
             {
                 "status": self._tg_cmd_status,
                 "tasks": self._tg_cmd_tasks,
                 "check": self._tg_cmd_check,
+                "order": self._tg_cmd_short_order,
                 "orders": self._tg_cmd_orders,
+                "servers": self._tg_cmd_servers,
                 "pause": self._tg_cmd_pause,
                 "resume": self._tg_cmd_resume,
                 "quick_buy": self._tg_action_quick_buy,
+                "short_confirm": self._tg_action_short_confirm,
+                "short_cancel": self._tg_action_short_cancel,
             }
         )
 
@@ -109,13 +131,15 @@ class SniperEngine:
             self.started_at = time.time()
             self._threads = [
                 threading.Thread(target=self._sniper_loop, name="sniper-loop", daemon=True),
+                threading.Thread(target=self._fastlane_loop, name="fastlane-loop", daemon=True),
+                threading.Thread(target=self._tracker_loop, name="tracker-loop", daemon=True),
                 threading.Thread(target=self._radar_loop, name="radar-loop", daemon=True),
                 threading.Thread(target=self._vps_loop, name="vps-loop", daemon=True),
             ]
             for t in self._threads:
                 t.start()
             self.notifier.start_telegram_polling()
-            self.db.add_log("INFO", "OVH 抢购与监控引擎已启动", "engine")
+            self.db.add_log("INFO", "OVH Sniper v2.0 引擎已启动（含快速通道 & 交付中奖跟踪）", "engine")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -127,7 +151,11 @@ class SniperEngine:
             if t.is_alive() and t is not threading.current_thread():
                 t.join(timeout=3.0)
         try:
-            self.db.add_log("INFO", "OVH 抢购与监控引擎已停止", "engine")
+            self.slot_pool.cleanup_all()
+        except Exception:
+            pass
+        try:
+            self.db.add_log("INFO", "OVH Sniper 引擎已优雅停止", "engine")
         except Exception:
             pass
 
@@ -152,6 +180,8 @@ class SniperEngine:
         return {
             "running": not self._stop_event.is_set() and any(t.is_alive() for t in self._threads),
             "sniper_enabled": bool(settings.get("sniper_enabled", True)),
+            "fast_lane_enabled": bool(settings.get("fast_lane_enabled", True)),
+            "tracker_enabled": bool(settings.get("tracker_enabled", True)),
             "radar_enabled": bool(settings.get("radar_enabled", False)),
             "vps_monitor_enabled": bool(settings.get("vps_monitor_enabled", False)),
             "uptime_seconds": uptime,
@@ -159,6 +189,85 @@ class SniperEngine:
             "stock_hits": self.stock_hits,
             "stats": self.db.get_stats(),
         }
+
+    # ---------- Fast Lane Prebuilt Cart Maintenance Loop ----------
+
+    def _fastlane_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                settings = self.db.get_settings()
+                if settings.get("sniper_enabled", True) and settings.get("fast_lane_enabled", True):
+                    if time.time() - self._fastlane_last_tick >= 15.0:
+                        self._fastlane_last_tick = time.time()
+                        self.run_fastlane_maintenance()
+            except Exception as exc:
+                self.db.add_log("WARNING", f"快速通道维护循环异常: {exc}", "fastlane")
+            self._stop_event.wait(3.0)
+
+    def run_fastlane_maintenance(self) -> int:
+        """Maintain prebuilt carts for all running buy-mode non-dry-run tasks with fast_lane=True."""
+        tasks = self.db.list_tasks()
+        active_fl_ids = set()
+        built = 0
+        for task in tasks:
+            eligible = (
+                task["status"] == "running"
+                and task["mode"] == "buy"
+                and not task["dry_run"]
+                and task.get("fast_lane")
+                and task["product_line"] != "vps"
+                and int(task["ordered_count"]) < int(task["max_orders"])
+            )
+            if not eligible:
+                self.slot_pool.cleanup_task(task["id"])
+                continue
+            active_fl_ids.add(task["id"])
+            acc = self.get_account_for_id(task["account_id"])
+            if not acc or not acc.get("app_key"):
+                continue
+            target_dcs = task.get("datacenters") or []
+            if not target_dcs:
+                continue
+            client = self.build_client(account=acc)
+            plan_summary = None
+            try:
+                plan_summary = self.catalog_manager.find_plan(
+                    client, task["plan_code"], subsidiary=acc["subsidiary"], product_line=task["product_line"]
+                )
+            except Exception:
+                plan_summary = None
+            try:
+                resolved_opts = resolve_cart_addons(
+                    plan_summary,
+                    fqn_memory=task.get("memory_filter") or "",
+                    fqn_storage=task.get("storage_filter") or "",
+                    explicit_options=task.get("options") or [],
+                )
+            except ValueError:
+                # Filter expression (e.g. '>=32g') isn't an exact addon code; use catalog defaults for prebuilt slot
+                resolved_opts = resolve_cart_addons(plan_summary, explicit_options=task.get("options") or [])
+            built += self.slot_pool.maintain_task(
+                task=task,
+                client=client,
+                subsidiary=acc["subsidiary"],
+                target_dcs=target_dcs,
+                resolved_options=resolved_opts,
+                stop_event=self._stop_event,
+            )
+        return built
+
+    # ---------- Order Delivery Tracker Loop ----------
+
+    def _tracker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                settings = self.db.get_settings()
+                if settings.get("tracker_enabled", True) and (time.time() - self._tracker_last_tick >= 30.0):
+                    self._tracker_last_tick = time.time()
+                    self.tracker.tick()
+            except Exception as exc:
+                self.db.add_log("WARNING", f"交付跟踪循环异常: {exc}", "tracker")
+            self._stop_event.wait(5.0)
 
     # ---------- Sniper Queue Loop ----------
 
@@ -186,6 +295,7 @@ class SniperEngine:
                 continue
             if int(task["ordered_count"]) >= int(task["max_orders"]) and task["mode"] == "buy":
                 self.db.update_task(task["id"], {"status": "completed", "last_status_msg": "已达到最大购买数量"})
+                self.slot_pool.cleanup_task(task["id"])
                 continue
             last_ts = self._task_last_poll.get(task["id"], 0.0)
             if now - last_ts >= max(2, int(task["poll_interval"] or 5)):
@@ -194,7 +304,6 @@ class SniperEngine:
         if not due_tasks:
             return 0
 
-        # Group due tasks by endpoint to share & batch availability requests
         by_endpoint: Dict[str, List[Dict[str, Any]]] = {}
         for task in due_tasks:
             acc = self.get_account_for_id(task["account_id"])
@@ -210,7 +319,6 @@ class SniperEngine:
             avail_by_plan: Dict[str, List[Dict[str, Any]]] = {}
             pub_client = self.build_client(account=None, endpoint=ep)
 
-            # Use 1 bulk request when monitoring >= threshold distinct plans on the same endpoint
             if len(unique_plans) >= bulk_threshold:
                 try:
                     bulk_list = pub_client.get_availabilities("")
@@ -248,11 +356,11 @@ class SniperEngine:
         plan_code = task["plan_code"]
         target_dcs = [normalize_datacenter(d) for d in (task.get("datacenters") or [])]
         only_instant = bool(task.get("only_instant"))
+        allow_non_default = bool(task.get("allow_non_default", True))
         mem_filter = task.get("memory_filter") or ""
         stor_filter = task.get("storage_filter") or ""
         explicit_options = task.get("options") or []
 
-        # Also extract explicit memory/storage filter from explicit options if filters are empty
         if explicit_options and not mem_filter and not stor_filter:
             for opt in explicit_options:
                 ol = opt.lower()
@@ -261,7 +369,19 @@ class SniperEngine:
                 elif any(k in ol for k in ("softraid", "raid", "nvme", "ssd", "hybrid")) and not stor_filter:
                     stor_filter = standardize_config(opt)
 
+        acc = self.get_account_for_id(task["account_id"])
+        subsidiary = (acc or {}).get("subsidiary") or "IE"
+        plan_summary = None
+        try:
+            pub_client = self.build_client(account=None, endpoint=endpoint)
+            plan_summary = self.catalog_manager.find_plan(
+                pub_client, plan_code, subsidiary=subsidiary, product_line=task["product_line"]
+            )
+        except Exception:
+            plan_summary = None
+
         matched_hits: List[Dict[str, Any]] = []
+        skip_reasons: List[str] = []
         summary_map: Dict[str, str] = {}
 
         for entry in avail_items:
@@ -269,11 +389,7 @@ class SniperEngine:
             entry_stor = str(entry.get("storage") or "")
             entry_fqn = str(entry.get("fqn") or plan_code)
 
-            if not match_filter_expression(mem_filter, entry_mem, is_memory=True):
-                continue
-            if not match_filter_expression(stor_filter, entry_stor, is_memory=False):
-                continue
-
+            orderable_dcs = []
             for dc_obj in entry.get("datacenters") or []:
                 dc = normalize_datacenter(str(dc_obj.get("datacenter") or ""))
                 status = str(dc_obj.get("availability") or "unknown")
@@ -281,36 +397,75 @@ class SniperEngine:
                     continue
                 if target_dcs and dc not in target_dcs:
                     continue
-                # Preserve best status per DC in summary_map
                 prev = summary_map.get(dc)
                 if prev is None or (not is_availability_orderable(prev) and is_availability_orderable(status)):
                     summary_map[dc] = status
                 if is_availability_orderable(status, instant_only=only_instant):
-                    matched_hits.append(
-                        {
-                            "dc": dc,
-                            "status": status,
-                            "fqn": entry_fqn,
-                            "memory": entry_mem,
-                            "storage": entry_stor,
-                        }
-                    )
+                    orderable_dcs.append((dc, status))
 
-        # Preserve DC priority order if user specified datacenters
+            if not orderable_dcs:
+                continue
+
+            # 1. Phantom stock guard (e.g. KS-LE-3 64GB listed in /availabilities but absent from catalog)
+            cfg_ok, phantom_reason = is_config_orderable(plan_summary, entry_mem, entry_stor)
+            if not cfg_ok:
+                skip_reasons.append(f"{entry_mem}+{entry_stor}: {phantom_reason}")
+                continue
+
+            # 2. User hardware filters
+            if not match_filter_expression(mem_filter, entry_mem, is_memory=True):
+                skip_reasons.append(f"内存不匹配({entry_mem})")
+                continue
+            if not match_filter_expression(stor_filter, entry_stor, is_memory=False):
+                skip_reasons.append(f"硬盘不匹配({entry_stor})")
+                continue
+
+            # 3. Optional base-config-only guard when user didn't pin RAM/disk
+            is_def = is_default_fqn_config(plan_summary, entry_mem, entry_stor)
+            if not is_def and not allow_non_default and not mem_filter and not stor_filter:
+                skip_reasons.append(f"非默认配置({entry_mem}+{entry_stor})")
+                continue
+
+            for dc, status in orderable_dcs:
+                matched_hits.append(
+                    {
+                        "dc": dc,
+                        "status": status,
+                        "fqn": entry_fqn,
+                        "memory": entry_mem,
+                        "storage": entry_stor,
+                        "is_default": is_def,
+                    }
+                )
+
+        # Prefer default config first (unless pinned) and respect target DC priority order
         if target_dcs and matched_hits:
             dc_rank = {d: idx for idx, d in enumerate(target_dcs)}
-            matched_hits.sort(key=lambda h: dc_rank.get(h["dc"], 999))
+            matched_hits.sort(
+                key=lambda h: (0 if h["is_default"] else 1, dc_rank.get(h["dc"], 999))
+            )
+        elif matched_hits:
+            matched_hits.sort(key=lambda h: 0 if h["is_default"] else 1)
 
         attempts = int(task.get("attempts") or 0) + 1
         prev_avail = task.get("last_availability") or {}
+        card_key = f"task:{task['id']}"
 
+        # Detect sold-out transition to strikethrough previous Telegram restock card
+        prev_had_stock = any(is_availability_orderable(str(v), instant_only=only_instant) for v in prev_avail.values())
         if not matched_hits:
+            if prev_had_stock:
+                self.notifier.mark_stock_card_sold_out(card_key)
+            if skip_reasons:
+                msg = f"有货但不匹配: {'；'.join(skip_reasons[:2])}"
+            else:
+                msg = f"暂无符合条件的库存 (已检 {len(avail_items)} 组配置)"
             self.db.update_task(
                 task["id"],
                 {
                     "attempts": attempts,
                     "last_check_at": now_iso(),
-                    "last_status_msg": f"暂无符合条件的库存 (已检 {len(avail_items)} 组配置)",
+                    "last_status_msg": msg,
                     "last_availability": summary_map,
                 },
             )
@@ -321,7 +476,6 @@ class SniperEngine:
         hit_summary = ", ".join(f"{h['dc'].upper()}({h['status']})" for h in matched_hits[:5])
         self.db.add_log("SUCCESS", f"🎯 发现有货! [{task['name']}] {plan_code}: {hit_summary}", "sniper")
 
-        # Notify on newly available DCs (with 5-minute cooldown per task+dc)
         settings = self.db.get_settings()
         if settings.get("notify_on_stock", True):
             fresh_dcs = []
@@ -339,10 +493,18 @@ class SniperEngine:
                     plan_code=plan_code,
                     available_dcs=fresh_dcs,
                     account_id=task["account_id"],
+                    endpoint=endpoint,
+                    subsidiary=subsidiary,
                     product_line=task["product_line"],
+                    server_name=(plan_summary or {}).get("name") or "",
+                    cpu=(plan_summary or {}).get("cpu") or "",
                     memory=top0["memory"],
                     storage=top0["storage"],
                     options=explicit_options,
+                    price_val=(plan_summary or {}).get("price"),
+                    setup_val=(plan_summary or {}).get("setupFee"),
+                    currency=(plan_summary or {}).get("currency") or "EUR",
+                    card_key=card_key,
                 )
 
         if task["mode"] == "notify_only":
@@ -357,7 +519,6 @@ class SniperEngine:
             )
             return
 
-        # Attempt order on the highest-priority available hit
         self.db.update_task(
             task["id"],
             {
@@ -368,7 +529,6 @@ class SniperEngine:
             },
         )
 
-        acc = self.get_account_for_id(task["account_id"])
         if not acc or not acc.get("app_key"):
             msg = "未配置有效 OVH 账号，无法自动下单"
             self.db.add_log("ERROR", f"[{task['name']}] {msg}", "sniper")
@@ -376,17 +536,8 @@ class SniperEngine:
             return
 
         client = self.build_client(account=acc)
-        plan_summary = None
-        if not explicit_options:
-            try:
-                plan_summary = self.catalog_manager.find_plan(
-                    client, plan_code, subsidiary=acc["subsidiary"], product_line=task["product_line"]
-                )
-            except Exception:
-                plan_summary = None
 
         for hit in matched_hits:
-            # Refresh task quota check before each attempt
             fresh_task = self.db.get_task(task["id"])
             if not fresh_task or fresh_task["status"] != "running":
                 break
@@ -397,28 +548,59 @@ class SniperEngine:
             if time.time() - self._order_fail_cooldown.get(fail_key, 0.0) < 20.0:
                 continue
 
-            options_to_use = list(explicit_options)
-            if not options_to_use and plan_summary:
-                options_to_use = resolve_addons_for_fqn(plan_summary, hit["memory"], hit["storage"])
+            try:
+                options_to_use = resolve_cart_addons(
+                    plan_summary,
+                    fqn_memory=hit["memory"],
+                    fqn_storage=hit["storage"],
+                    explicit_options=explicit_options,
+                )
+            except ValueError as opt_err:
+                self.db.add_log("WARNING", f"[{task['name']}] 跳过不可下单配置: {opt_err}", "sniper")
+                continue
 
-            result = self.order_engine.place_order(
-                client=client,
-                subsidiary=acc["subsidiary"],
-                plan_code=plan_code,
-                datacenter=hit["dc"],
-                product_line=task["product_line"],
-                options=options_to_use,
-                duration=task["duration"],
-                pricing_mode=task["pricing_mode"],
-                os_code=task["os_code"],
-                coupons=task["coupons"],
-                quantity=task["quantity"],
-                max_price=float(task["max_price"] or 0),
-                price_includes_tax=bool(task["price_includes_tax"]),
-                auto_pay=bool(task["auto_pay"]),
-                waive_retractation=bool(task["waive_retractation"]),
-                dry_run=bool(task["dry_run"]),
-            )
+            # ⚡ Fast Lane: try prebuilt verified cart first (1 single POST /checkout!)
+            result = None
+            if not task["dry_run"] and task.get("fast_lane"):
+                slot = self.slot_pool.take_ready_slot(task["id"], hit["dc"], options=options_to_use)
+                if slot:
+                    self.db.add_log(
+                        "INFO",
+                        f"⚡ [快速通道命中] {plan_code}@{hit['dc'].upper()} 使用预建购物车 {slot['cart_id']} 直接 Checkout!",
+                        "order",
+                    )
+                    result = self.order_engine.checkout_cart(
+                        client=client,
+                        cart_id=slot["cart_id"],
+                        plan_code=plan_code,
+                        datacenter=hit["dc"],
+                        prices_info=slot["prices"],
+                        applied_options=slot["options"],
+                        auto_pay=bool(task["auto_pay"]),
+                        waive_retractation=bool(task["waive_retractation"]),
+                        fast_lane=True,
+                    )
+
+            # Standard single-cart parallel path if no prebuilt slot was used
+            if result is None:
+                result = self.order_engine.place_order(
+                    client=client,
+                    subsidiary=acc["subsidiary"],
+                    plan_code=plan_code,
+                    datacenter=hit["dc"],
+                    product_line=task["product_line"],
+                    options=options_to_use,
+                    duration=task["duration"],
+                    pricing_mode=task["pricing_mode"],
+                    os_code=task["os_code"],
+                    coupons=task["coupons"],
+                    quantity=task["quantity"],
+                    max_price=float(task["max_price"] or 0),
+                    price_includes_tax=bool(task["price_includes_tax"]),
+                    auto_pay=bool(task["auto_pay"]),
+                    waive_retractation=bool(task["waive_retractation"]),
+                    dry_run=bool(task["dry_run"]),
+                )
 
             self.db.add_order(
                 {
@@ -429,6 +611,8 @@ class SniperEngine:
                     "plan_code": plan_code,
                     "datacenter": hit["dc"],
                     "options": result.get("applied_options") or options_to_use,
+                    "memory": hit["memory"],
+                    "storage": hit["storage"],
                     "status": result["status"],
                     "dry_run": bool(task["dry_run"]),
                     "order_id": result.get("order_id", ""),
@@ -442,13 +626,15 @@ class SniperEngine:
 
             if result["success"]:
                 tag = "演练通过" if task["dry_run"] else f"下单成功 #{result['order_id']}"
-                msg = f"{tag} ({hit['dc'].upper()}, {result.get('price_without_tax')}/{result.get('price_with_tax')} {result.get('currency')})"
-                self.db.record_task_order_success(task["id"], msg)
+                ms_str = f" {result['checkout_ms']}ms" if result.get("checkout_ms") else ""
+                lane = "⚡" if result.get("fast_lane") else ""
+                msg = f"{lane}{tag}{ms_str} ({hit['dc'].upper()}, {result.get('price_without_tax')}/{result.get('price_with_tax')} {result.get('currency')})"
+                updated = self.db.record_task_order_success(task["id"], msg)
+                if updated and updated["status"] == "completed":
+                    self.slot_pool.cleanup_task(task["id"])
                 if settings.get("notify_on_order", True):
-                    price_line = (
-                        f"不含税 {result.get('price_without_tax')} / 含税 {result.get('price_with_tax')} {result.get('currency')}"
-                        if result.get("price_without_tax") is not None or result.get("price_with_tax") is not None
-                        else "待确认"
+                    cny_with_tax = GLOBAL_FX.format_price_with_cny(
+                        result.get("price_with_tax"), result.get("currency") or "EUR"
                     )
                     body = (
                         f"任务: {task['name']}\n"
@@ -456,8 +642,9 @@ class SniperEngine:
                         f"型号: {plan_code}\n"
                         f"机房: {format_datacenter_label(hit['dc'])}\n"
                         f"配置: {hit['memory'] or '默认'} + {hit['storage'] or '默认'}\n"
-                        f"价格: {price_line}\n"
+                        f"含税总价: {cny_with_tax}\n"
                         f"订单号: {result.get('order_id')}\n"
+                        f"通道: {'⚡ 预建快速通道' if result.get('fast_lane') else '直通下单'}{ms_str}\n"
                         f"自动扣款: {'是' if task['auto_pay'] else '否 (请尽快付款)'}"
                     )
                     self.notifier.notify(
@@ -469,15 +656,164 @@ class SniperEngine:
                         extra=result,
                     )
                 break
-            else:
-                self._order_fail_cooldown[fail_key] = time.time()
-                self.db.update_task(task["id"], {"last_status_msg": f"尝试下单失败({hit['dc'].upper()}): {result['error']}"})
-                if settings.get("notify_on_error", False) or result["status"] == "budget_exceeded":
-                    self.notifier.notify(
-                        title=f"⚠️ OVH 下单未完成: {plan_code}@{hit['dc'].upper()}",
-                        body=f"任务: {task['name']}\n原因: {result['error']}",
-                        event="order_error",
-                    )
+
+            # 🛡️ Uncertain checkout: HALT task immediately, NEVER auto-retry!
+            if result["status"] == "pending_confirm":
+                self.slot_pool.cleanup_task(task["id"])
+                self.db.update_task(
+                    task["id"],
+                    {
+                        "status": "pending_confirm",
+                        "last_status_msg": f"⚠️ {result['error']}（已自动暂停防重单，请人工核对 OVH 后台）",
+                    },
+                )
+                self.notifier.notify(
+                    title=f"⚠️ 结账结果待核对（任务已自动停止防重单）: {plan_code}@{hit['dc'].upper()}",
+                    body=(
+                        f"任务: {task['name']}\n"
+                        f"账号: {acc['name']} ({acc['subsidiary']})\n"
+                        f"详情: {result['error']}\n\n"
+                        "请登录 OVH 后台检查是否已生成订单，确认无误后再决定是否恢复任务。"
+                    ),
+                    event="pending_confirm",
+                    urgent=True,
+                    url_link=result.get("order_url", ""),
+                )
+                break
+
+            self._order_fail_cooldown[fail_key] = time.time()
+            self.db.update_task(task["id"], {"last_status_msg": f"尝试下单失败({hit['dc'].upper()}): {result['error']}"})
+            if settings.get("notify_on_error", False) or result["status"] == "budget_exceeded":
+                self.notifier.notify(
+                    title=f"⚠️ OVH 下单未完成: {plan_code}@{hit['dc'].upper()}",
+                    body=f"任务: {task['name']}\n原因: {result['error']}",
+                    event="order_error",
+                )
+
+    # ---------- @ovheco / PoorVPS Short Order Link Support ----------
+
+    def preview_short_order_link(self, url: str, account_id: str = "") -> Dict[str, Any]:
+        """Decode /o/<region>/<token> locally, build cart for exact live quote, return confirm token."""
+        cfg = decode_short_order_url(url)
+        acc = self.get_account_for_id(account_id)
+        if not acc or not acc.get("app_key"):
+            raise ValueError("未配置有效 OVH 账号，请先在「多账号管理」添加账号")
+        if acc["endpoint"] != cfg["endpoint"]:
+            # Try to find an account matching the short-link region
+            for cand in self.db.list_accounts(mask=False):
+                if cand["endpoint"] == cfg["endpoint"]:
+                    acc = cand
+                    break
+        if acc["endpoint"] != cfg["endpoint"]:
+            raise ValueError(f"该短链属于区域 {cfg['endpoint']}，但当前未配置该区域的 OVH 账号")
+
+        client = self.build_client(account=acc)
+        built = self.order_engine.build_cart(
+            client=client,
+            subsidiary=acc["subsidiary"],
+            plan_code=cfg["plan_code"],
+            datacenter=cfg["datacenter"],
+            product_line="eco",
+            options=cfg["options"],
+            duration="auto",
+            pricing_mode="auto",
+            parallel=True,
+        )
+        token = uuid.uuid4().hex[:12]
+        with self._short_link_lock:
+            self._short_link_carts[token] = {
+                "token": token,
+                "state": "pending",
+                "cart_id": built["cart_id"],
+                "account_id": acc["id"],
+                "account_name": acc["name"],
+                "endpoint": acc["endpoint"],
+                "subsidiary": acc["subsidiary"],
+                "plan_code": cfg["plan_code"],
+                "datacenter": cfg["datacenter"],
+                "memory": cfg["memory"],
+                "storage": cfg["storage"],
+                "options": built["applied_options"] or cfg["options"],
+                "prices": built["prices"],
+                "duration": built["duration"],
+                "pricing_mode": built["pricing_mode"],
+                "created_ts": time.time(),
+            }
+        return {
+            "token": token,
+            "account_name": acc["name"],
+            "subsidiary": acc["subsidiary"],
+            "plan_code": cfg["plan_code"],
+            "datacenter": cfg["datacenter"],
+            "options": built["applied_options"] or cfg["options"],
+            "duration": built["duration"],
+            "pricing_mode": built["pricing_mode"],
+            "prices": built["prices"],
+            "price_with_tax_cny": GLOBAL_FX.format_price_with_cny(
+                built["prices"].get("withTax"), built["prices"].get("currencyCode") or "EUR"
+            ),
+        }
+
+    def confirm_short_order_link(self, token: str, auto_pay: bool = False) -> Dict[str, Any]:
+        """Atomically confirm & checkout a previewed short-link cart (unpaid by default, never double-clicks)."""
+        with self._short_link_lock:
+            rec = self._short_link_carts.get(token)
+            if not rec:
+                return {"success": False, "error": "该预览购物车已过期或不存在，请重新解析短链"}
+            if rec["state"] != "pending":
+                return {"success": False, "error": f"该订单已处理（当前状态: {rec['state']}），禁止重复提交"}
+            rec["state"] = "submitting"
+
+        acc = self.db.get_account(rec["account_id"], mask=False)
+        if not acc:
+            return {"success": False, "error": "账号不存在"}
+        client = self.build_client(account=acc)
+        res = self.order_engine.checkout_cart(
+            client=client,
+            cart_id=rec["cart_id"],
+            plan_code=rec["plan_code"],
+            datacenter=rec["datacenter"],
+            prices_info=rec["prices"],
+            applied_options=rec["options"],
+            auto_pay=auto_pay,
+            waive_retractation=False,
+            fast_lane=False,
+        )
+        with self._short_link_lock:
+            rec["state"] = res["status"]
+
+        self.db.add_order(
+            {
+                "task_id": f"short:{token}",
+                "account_id": acc["id"],
+                "account_name": acc["name"],
+                "product_line": "eco",
+                "plan_code": rec["plan_code"],
+                "datacenter": rec["datacenter"],
+                "options": rec["options"],
+                "memory": rec["memory"],
+                "storage": rec["storage"],
+                "status": res["status"],
+                "dry_run": False,
+                "order_id": res.get("order_id", ""),
+                "order_url": res.get("order_url", ""),
+                "price_without_tax": res.get("price_without_tax"),
+                "price_with_tax": res.get("price_with_tax"),
+                "currency": res.get("currency", ""),
+                "error_message": res.get("error", ""),
+            }
+        )
+        return res
+
+    def cancel_short_order_link(self, token: str) -> bool:
+        with self._short_link_lock:
+            rec = self._short_link_carts.pop(token, None)
+        if not rec:
+            return False
+        acc = self.db.get_account(rec["account_id"], mask=False)
+        if acc:
+            safe_delete_cart(self.build_client(account=acc), rec["cart_id"])
+        return True
 
     # ---------- Black Friday Radar Loop (New SKU + Config Fingerprint) ----------
 
@@ -523,7 +859,6 @@ class SniperEngine:
         stor_pat = rule.get("storage_pattern") or ""
         max_price = float(rule.get("max_price") or 0)
 
-        # For new_sku rules, first run establishes the baseline catalog snapshot
         if rule["rule_type"] == "new_sku" and not known:
             self.db.update_radar_rule(
                 rule["id"],
@@ -540,7 +875,6 @@ class SniperEngine:
             if pc in matched_prev:
                 continue
 
-            # Keyword / regex filter on planCode + name + cpu
             if kw_pat:
                 haystack = f"{pc} {plan.get('name', '')} {plan.get('cpu', '')}"
                 try:
@@ -550,11 +884,9 @@ class SniperEngine:
                     if kw_pat.lower() not in haystack.lower():
                         continue
 
-            # Price filter (base monthly price from catalog)
             if max_price > 0 and plan.get("price") is not None and float(plan["price"]) > max_price:
                 continue
 
-            # Hardware filter (for config_match or optional constraints)
             if mem_pat:
                 mem_candidates = list(plan.get("memoryAddons") or []) + [plan.get("memoryCode") or "", plan.get("memory") or ""]
                 if not any(match_filter_expression(mem_pat, m, is_memory=True) for m in mem_candidates):
@@ -584,7 +916,7 @@ class SniperEngine:
 
         lines = [f"规则: {rule['name']} ({rule['endpoint']}/{rule['subsidiary']})"]
         for p in discoveries[:10]:
-            p_str = f"{p['price']} {p['currency']}" if p.get("price") is not None else "未知价格"
+            p_str = GLOBAL_FX.format_price_with_cny(p.get("price"), p.get("currency") or "EUR") if p.get("price") is not None else "未知价格"
             lines.append(f"  • {p['planCode']} | {p['cpu']} | {p['memory']} | {p['storage']} | {p_str}")
 
             if rule["auto_snipe"]:
@@ -609,7 +941,6 @@ class SniperEngine:
 
         if rule["auto_snipe"]:
             lines.append("\n🚀 已自动加入高优先级抢购队列!")
-            # Trigger immediate sniper tick in background
             self._spawn_immediate_tick()
 
         self.db.add_log("SUCCESS", f"🆕 黑五雷达 [{rule['name']}] 发现 {len(discoveries)} 个目标: {', '.join(new_codes)}", "radar")
@@ -724,12 +1055,20 @@ class SniperEngine:
 
     # ---------- Synchronous On-Demand Operations ----------
 
-    def check_plan_live(self, plan_code: str, endpoint: str = "ovh-eu") -> List[Dict[str, Any]]:
-        """Query live datacenter availabilities for a single planCode."""
+    def check_plan_live(self, plan_code: str, endpoint: str = "ovh-eu", subsidiary: str = "IE") -> List[Dict[str, Any]]:
+        """Query live datacenter availabilities + phantom-stock status + Express URLs for a planCode."""
         client = self.build_client(account=None, endpoint=endpoint)
         items = client.get_availabilities(plan_code)
+        plan_summary = None
+        try:
+            plan_summary = self.catalog_manager.find_plan(client, plan_code, subsidiary=subsidiary, product_line="eco")
+        except Exception:
+            plan_summary = None
         out = []
         for entry in items:
+            mem = str(entry.get("memory") or "")
+            stor = str(entry.get("storage") or "")
+            cfg_ok, cfg_reason = is_config_orderable(plan_summary, mem, stor)
             dcs = []
             for dc_obj in entry.get("datacenters") or []:
                 dc = normalize_datacenter(str(dc_obj.get("datacenter") or ""))
@@ -739,22 +1078,30 @@ class SniperEngine:
                         "datacenter": dc,
                         "label": format_datacenter_label(dc),
                         "availability": status,
-                        "orderable": is_availability_orderable(status),
+                        "orderable": is_availability_orderable(status) and cfg_ok,
+                        "express_url": build_express_order_url(
+                            endpoint=endpoint,
+                            subsidiary=subsidiary,
+                            plan_code=plan_code,
+                            datacenter=dc,
+                        ),
                     }
                 )
             out.append(
                 {
                     "planCode": entry.get("planCode") or plan_code,
                     "fqn": entry.get("fqn") or plan_code,
-                    "memory": entry.get("memory") or "",
-                    "storage": entry.get("storage") or "",
+                    "memory": mem,
+                    "storage": stor,
+                    "configOrderable": cfg_ok,
+                    "unorderableReason": cfg_reason,
+                    "isDefault": is_default_fqn_config(plan_summary, mem, stor),
                     "datacenters": dcs,
                 }
             )
         return out
 
     def execute_task_now(self, task_id: str, force_dry_run: bool = False) -> Dict[str, Any]:
-        """Manually trigger one immediate availability check + order/dry-run for a task."""
         task = self.db.get_task(task_id)
         if not task:
             return {"success": False, "error": "任务不存在"}
@@ -764,16 +1111,31 @@ class SniperEngine:
 
         client = self.build_client(account=acc)
         if force_dry_run:
-            # Test checkout pipeline directly using first target DC (or 'gra')
             dcs = task.get("datacenters") or []
             dc = normalize_datacenter(dcs[0]) if dcs else "gra"
+            plan_summary = None
+            try:
+                plan_summary = self.catalog_manager.find_plan(
+                    client, task["plan_code"], subsidiary=acc["subsidiary"], product_line=task["product_line"]
+                )
+            except Exception:
+                pass
+            try:
+                resolved_opts = resolve_cart_addons(
+                    plan_summary,
+                    fqn_memory=task.get("memory_filter") or "",
+                    fqn_storage=task.get("storage_filter") or "",
+                    explicit_options=task.get("options") or [],
+                )
+            except ValueError:
+                resolved_opts = list(task.get("options") or [])
             res = self.order_engine.place_order(
                 client=client,
                 subsidiary=acc["subsidiary"],
                 plan_code=task["plan_code"],
                 datacenter=dc,
                 product_line=task["product_line"],
-                options=task.get("options") or [],
+                options=resolved_opts,
                 duration=task["duration"],
                 pricing_mode=task["pricing_mode"],
                 os_code=task["os_code"],
@@ -793,7 +1155,7 @@ class SniperEngine:
                     "product_line": task["product_line"],
                     "plan_code": task["plan_code"],
                     "datacenter": dc,
-                    "options": res.get("applied_options") or task.get("options") or [],
+                    "options": res.get("applied_options") or resolved_opts,
                     "status": res["status"],
                     "dry_run": True,
                     "order_id": res.get("order_id", ""),
@@ -811,18 +1173,58 @@ class SniperEngine:
         self._evaluate_task_availability(task, acc["endpoint"], avail)
         return {"success": True, "task": self.db.get_task(task_id)}
 
+    def list_account_servers(self, account_id: str) -> List[Dict[str, Any]]:
+        """Fetch read-only summary of delivered dedicated servers on an OVH account."""
+        acc = self.db.get_account(account_id, mask=False) or self.db.get_default_account(mask=False)
+        if not acc or not acc.get("app_key"):
+            return []
+        client = self.build_client(account=acc)
+        names = client.list_dedicated_servers()
+        out = []
+        for name in names[:30]:
+            try:
+                srv = client.get_dedicated_server(name)
+                hw = {}
+                try:
+                    hw = client.get_dedicated_hardware(name)
+                except Exception:
+                    pass
+                si = {}
+                try:
+                    si = client.get_dedicated_service_infos(name)
+                except Exception:
+                    pass
+                out.append(
+                    {
+                        "name": name,
+                        "commercialRange": srv.get("commercialRange") or "",
+                        "datacenter": srv.get("datacenter") or "",
+                        "ip": srv.get("ip") or "",
+                        "state": srv.get("state") or "",
+                        "os": srv.get("os") or "",
+                        "cpu": hw.get("processorName") or "",
+                        "memory": hw.get("memorySize"),
+                        "expiration": si.get("expiration") or "",
+                        "creation": si.get("creation") or "",
+                    }
+                )
+            except Exception:
+                continue
+        return out
+
     # ---------- Telegram Bot Command Handlers ----------
 
     def _tg_cmd_status(self, _args: List[str]) -> str:
         st = self.get_status()
         s = st["stats"]
         return (
-            f"📊 OVH Sniper 运行状态\n\n"
+            f"📊 OVH Sniper v2.0 运行状态\n\n"
             f"抢购引擎: {'🟢 运行中' if st['sniper_enabled'] else '⏸ 已暂停'}\n"
+            f"预建快速通道: {'⚡ 开启' if st['fast_lane_enabled'] else '⚪ 关闭'}\n"
+            f"交付/中奖跟踪: {'🎰 开启' if st['tracker_enabled'] else '⚪ 关闭'}\n"
             f"黑五雷达: {'🟢 开启' if st['radar_enabled'] else '⚪ 关闭'}\n"
             f"VPS 监控: {'🟢 开启' if st['vps_monitor_enabled'] else '⚪ 关闭'}\n"
-            f"账号数: {s['accounts_count']}\n"
-            f"运行中任务: {s['tasks_running']} / 总任务 {s['tasks_total']}\n"
+            f"账号数: {s['accounts_count']} | 运行中任务: {s['tasks_running']}/{s['tasks_total']}\n"
             f"累计轮询: {st['total_polls']} | 命中库存: {st['stock_hits']}\n"
             f"成功订单: {s['orders_success']} | 演练: {s['orders_dry_run']}"
         )
@@ -833,10 +1235,15 @@ class SniperEngine:
             return "当前没有抢购任务。"
         lines = ["🎯 抢购任务列表:"]
         for t in tasks[:15]:
-            icon = "🟢" if t["status"] == "running" else ("✅" if t["status"] == "completed" else "⏸")
+            icon = (
+                "🟢"
+                if t["status"] == "running"
+                else ("⚠️" if t["status"] == "pending_confirm" else ("✅" if t["status"] == "completed" else "⏸"))
+            )
             dcs = ",".join(d.upper() for d in t["datacenters"]) if t["datacenters"] else "ALL"
+            fl = " ⚡" if t.get("fast_lane") else ""
             dry = " [演练]" if t["dry_run"] else ""
-            lines.append(f"{icon} {t['plan_code']}@{dcs}{dry} ({t['ordered_count']}/{t['max_orders']})")
+            lines.append(f"{icon} {t['plan_code']}@{dcs}{fl}{dry} ({t['ordered_count']}/{t['max_orders']})")
         return "\n".join(lines)
 
     def _tg_cmd_check(self, args: List[str]) -> str:
@@ -849,10 +1256,50 @@ class SniperEngine:
             return f"未查到 {plan_code} ({ep}) 的库存数据。"
         lines = [f"🔍 实时库存 {plan_code} ({ep}):"]
         for entry in items[:4]:
+            tag = " [⚠️目录不可订]" if not entry.get("configOrderable", True) else ""
             avail_dcs = [d for d in entry["datacenters"] if d["orderable"]]
             dc_txt = ", ".join(f"{d['datacenter'].upper()}({d['availability']})" for d in avail_dcs) if avail_dcs else "全无货"
-            lines.append(f"• {entry['memory'] or '默认'} + {entry['storage'] or '默认'} -> {dc_txt}")
+            lines.append(f"• {entry['memory'] or '默认'} + {entry['storage'] or '默认'}{tag} -> {dc_txt}")
         return "\n".join(lines)
+
+    def _tg_cmd_short_order(self, args: List[str]) -> Any:
+        if not args:
+            return "用法: /order <https://.../o/e/SHORT_TOKEN>\n支持直接粘贴 @ovheco 频道的补货直达链接！"
+        preview = self.preview_short_order_link(args[0])
+        p = preview["prices"]
+        text = (
+            f"🧾 短链购物车报价预览\n\n"
+            f"账号: {preview['account_name']} ({preview['subsidiary']})\n"
+            f"型号: {preview['plan_code']} @ {format_datacenter_label(preview['datacenter'])}\n"
+            f"配件: {', '.join(preview['options']) or '默认'}\n"
+            f"周期: {preview['duration']} / {preview['pricing_mode']}\n"
+            f"不含税: {p.get('withoutTax')} {p.get('currencyCode')}\n"
+            f"含税总计: {preview['price_with_tax_cny']}\n\n"
+            f"⚠️ 仅生成未付款正式订单（不会自动扣款），请确认："
+        )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ 确认生成未付款订单", "callback_data": f"sc:{preview['token']}"},
+                    {"text": "❌ 取消并删车", "callback_data": f"sx:{preview['token']}"},
+                ]
+            ]
+        }
+        return {"text": text, "reply_markup": markup}
+
+    def _tg_action_short_confirm(self, token: str) -> str:
+        res = self.confirm_short_order_link(token, auto_pay=False)
+        if res.get("success"):
+            return (
+                f"🎉 订单生成成功！\n"
+                f"订单号: #{res.get('order_id')}\n"
+                f"付款链接: {res.get('order_url') or '请登录 OVH 后台付款'}"
+            )
+        return f"⚠️ 下单未完成 ({res.get('status')}): {res.get('error')}"
+
+    def _tg_action_short_cancel(self, token: str) -> str:
+        ok = self.cancel_short_order_link(token)
+        return "✅ 已取消并清理临时购物车。" if ok else "该预览购物车已清理或过期。"
 
     def _tg_cmd_orders(self, _args: List[str]) -> str:
         orders = self.db.list_orders(limit=8)
@@ -860,9 +1307,27 @@ class SniperEngine:
             return "暂无订单记录。"
         lines = ["🧾 最近订单:"]
         for o in orders:
-            icon = "✅" if o["status"] == "success" else ("🧪" if o["status"] == "dry_run" else "❌")
+            icon = (
+                "🎰"
+                if (o.get("spec") or {}).get("lottery")
+                else ("✅" if o["status"] == "success" else ("⚠️" if o["status"] == "pending_confirm" else ("🧪" if o["status"] == "dry_run" else "❌")))
+            )
+            ovh_st = f" [{OVH_ORDER_STATUS_LABELS.get(o['ovh_status'], o['ovh_status'])}]" if o.get("ovh_status") else ""
+            srv_str = f" -> {o['server_name']}" if o.get("server_name") else ""
             url_part = f"\n  付款: {o['order_url']}" if o.get("order_url") else ""
-            lines.append(f"{icon} {o['plan_code']}@{o['datacenter'].upper()} #{o['order_id'] or '-'} ({o['created_at']}){url_part}")
+            lines.append(f"{icon} {o['plan_code']}@{o['datacenter'].upper()} #{o['order_id'] or '-'}{ovh_st}{srv_str}{url_part}")
+        return "\n".join(lines)
+
+    def _tg_cmd_servers(self, _args: List[str]) -> str:
+        accs = self.db.list_accounts(mask=True)
+        if not accs:
+            return "尚未配置 OVH 账号。"
+        servers = self.list_account_servers(accs[0]["id"])
+        if not servers:
+            return f"账号 {accs[0]['name']} 下暂无独服（或当前 Token 无 GET /dedicated/server 权限）。"
+        lines = [f"🖥️ {accs[0]['name']} 独服列表 ({len(servers)}):"]
+        for s in servers[:15]:
+            lines.append(f"• {s['name']} | {s['datacenter'].upper()} | {s['ip']} | {s['cpu']} | 到期 {str(s['expiration'])[:10]}")
         return "\n".join(lines)
 
     def _tg_cmd_pause(self, _args: List[str]) -> str:

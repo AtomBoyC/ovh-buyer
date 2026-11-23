@@ -35,7 +35,7 @@
         <span class="brand-icon">⚡</span>
         <div>
           <div class="brand-title">OVH Sniper</div>
-          <div class="brand-sub">Black Friday Edition</div>
+          <div class="brand-sub">v2.0 · Black Friday Edition</div>
         </div>
       </div>
 
@@ -67,6 +67,10 @@
           <label class="switch-chip" title="全局抢购队列开关">
             <input type="checkbox" id="toggle-sniper" />
             <span>抢购引擎</span>
+          </label>
+          <label class="switch-chip" title="预建购物车快速通道（提前建车，有货 1 次请求秒结账）">
+            <input type="checkbox" id="toggle-fastlane" />
+            <span>⚡ 快速通道</span>
           </label>
           <label class="switch-chip" title="黑五新品与配置雷达开关">
             <input type="checkbox" id="toggle-radar" />
@@ -265,8 +269,22 @@
       <section id="tab-orders" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>🧾 抢购与演练订单历史</h3>
+            <h3>🔗 @ovheco 短链一键解析 &amp; 实时报价下单</h3>
+            <span class="muted">本地解码 /o/&lt;region&gt;/&lt;token&gt;，先建车报含税价再由你二次确认（默认仅生成未付款单）</span>
+          </div>
+          <form id="short-link-form" class="inline-form">
+            <input type="text" id="short-link-url" placeholder="粘贴 @ovheco 频道短链，例如 https://.../o/e/eJx..." required />
+            <select id="short-link-account" style="width:auto;min-width:170px"></select>
+            <button type="submit" class="btn btn-primary" id="btn-short-link-preview">解析并报价</button>
+          </form>
+          <div id="short-link-preview" class="short-preview-box hidden"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3>🧾 抢购与演练订单历史（含交付与中奖跟踪）</h3>
             <div class="toolbar">
+              <button class="btn btn-ghost btn-sm" id="btn-fetch-my-servers">🖥️ 我的独服列表</button>
               <button class="btn btn-ghost btn-sm" id="btn-fetch-ovh-orders">同步官方账号最近订单</button>
               <button class="btn btn-danger btn-sm" id="btn-clear-orders">清空本地记录</button>
             </div>
@@ -278,14 +296,21 @@
                   <th>时间</th>
                   <th>型号 / 机房</th>
                   <th>账号</th>
-                  <th>状态</th>
+                  <th>状态 / 交付与中奖</th>
                   <th>价格 (不含税 / 含税)</th>
-                  <th>订单号 / 支付链接</th>
+                  <th>订单号 / 操作</th>
                 </tr>
               </thead>
               <tbody id="orders-tbody"></tbody>
             </table>
           </div>
+        </div>
+        <div id="my-servers-card" class="card hidden">
+          <div class="card-header">
+            <h3>🖥️ 我的 OVH 独立服务器 (/dedicated/server)</h3>
+            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('my-servers-card').classList.add('hidden')">关闭</button>
+          </div>
+          <div id="my-servers-list" class="list-stack"></div>
         </div>
         <div id="ovh-official-orders-card" class="card hidden">
           <div class="card-header">
@@ -304,13 +329,13 @@
             <button class="btn btn-primary btn-sm" id="btn-open-account-modal">+ 添加 OVH 账号</button>
           </div>
           <div class="info-banner mb-12">
-            <b>快速申请 API Token（建议勾选全部 <code>GET / POST / PUT / DELETE</code> 权限 <code>/*</code>，有效期选 30 天或无限）：</b>
-            <div class="mt-6">
-              <a href="https://eu.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇪🇺 OVH EU 申请入口 ↗</a>
+            <b>🛡️ 最小权限快速申请 API Token（已预填安全权限：仅允许账号只读、购物车下单、独服配置只读，绝不申请删机/重启权限）：</b>
+            <div class="mt-6" id="accounts-token-links">
+              <a id="token-link-eu" href="https://eu.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇪🇺 OVH EU 最小权限一键申请 ↗</a>
               &nbsp;|&nbsp;
-              <a href="https://ca.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇨🇦 OVH CA/亚太 申请入口 ↗</a>
+              <a id="token-link-ca" href="https://ca.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇨🇦 OVH CA/亚太 最小权限一键申请 ↗</a>
               &nbsp;|&nbsp;
-              <a href="https://api.us.ovhcloud.com/createToken/" target="_blank" rel="noreferrer">🇺🇸 OVH US 申请入口 ↗</a>
+              <a id="token-link-us" href="https://api.us.ovhcloud.com/createToken/" target="_blank" rel="noreferrer">🇺🇸 OVH US 最小权限一键申请 ↗</a>
             </div>
           </div>
           <div class="table-wrap">
@@ -418,8 +443,13 @@
                 <input type="text" name="http_proxy" placeholder="http://127.0.0.1:7890" />
               </div>
               <div class="field checkbox-row">
+                <label><input type="checkbox" name="fast_lane_enabled" /> ⚡ 启用预建购物车快速通道（为开启快速通道的任务提前建车并自动续期）</label>
+                <label><input type="checkbox" name="tracker_enabled" /> 🎰 启用订单交付与硬件中奖跟踪（自动查询付款/交付状态并比对实机硬件）</label>
+                <label><input type="checkbox" name="edit_sold_out_telegram" /> ✂️ Telegram 补货卡片在售罄后自动划删除线（标记「已被抢完」）</label>
                 <label><input type="checkbox" name="notify_on_stock" /> 发现补货时推送通知</label>
                 <label><input type="checkbox" name="notify_on_order" /> 下单成功/演练完成时推送通知</label>
+                <label><input type="checkbox" name="notify_on_paid" /> 订单付款完成时推送通知</label>
+                <label><input type="checkbox" name="notify_on_delivered" /> 服务器交付 &amp; 硬件中奖检查完成时推送通知</label>
                 <label><input type="checkbox" name="notify_on_error" /> 下单失败时也推送通知</label>
               </div>
               <button type="submit" class="btn btn-primary btn-block mt-12">保存全部设置</button>
@@ -460,7 +490,9 @@
               <select id="log-filter-source">
                 <option value="">全部模块</option>
                 <option value="sniper">sniper</option>
+                <option value="fastlane">fastlane</option>
                 <option value="order">order</option>
+                <option value="tracker">tracker</option>
                 <option value="radar">radar</option>
                 <option value="vps">vps</option>
                 <option value="notify">notify</option>
@@ -576,9 +608,11 @@
           </div>
         </div>
         <div class="checkbox-grid mt-8">
+          <label><input type="checkbox" name="fast_lane" /> ⚡ 预建购物车快速通道（提前建车，有货 1 次请求秒结账）</label>
+          <label><input type="checkbox" name="allow_non_default" checked /> 🔧 允许非默认内存/硬盘配置（取消勾选则仅抢默认标配）</label>
           <label><input type="checkbox" name="dry_run" /> 🧪 演练模式（校验购物车与实时价格但不提交订单）</label>
           <label><input type="checkbox" name="auto_pay" /> 💳 自动扣款（使用默认支付方式/余额直接支付）</label>
-          <label><input type="checkbox" name="only_instant" /> ⚡ 仅抢现货（忽略 24H/72H/240H 排队机型）</label>
+          <label><input type="checkbox" name="only_instant" /> ⏱️ 仅抢现货（忽略 24H/72H/240H 排队机型）</label>
           <label><input type="checkbox" name="price_includes_tax" /> 🧾 价格上限按含税价判断（默认按不含税价）</label>
           <label><input type="checkbox" name="waive_retractation" checked /> 🚀 放弃冷静期（立即开通交付）</label>
         </div>
