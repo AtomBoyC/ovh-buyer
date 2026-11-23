@@ -1,10 +1,12 @@
 # 🎯 OVH Buyer (OVH Sniper) — 黑五 OVH 独服 / Eco / VPS 自动抢购与监控面板
 
+[![Release](https://img.shields.io/github/v/release/AtomBoyC/ovh-buyer?logo=github&color=F59E0B)](https://github.com/AtomBoyC/ovh-buyer/releases)
 [![CI](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/ci.yml/badge.svg)](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/ci.yml)
 [![Docker Publish](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/AtomBoyC/ovh-buyer/actions/workflows/docker-publish.yml)
+[![Docker Hub](https://img.shields.io/docker/v/atomboyc/ovh-buyer?sort=semver&label=Docker%20Hub&logo=docker&logoColor=white)](https://hub.docker.com/r/atomboyc/ovh-buyer)
+[![GHCR](https://img.shields.io/badge/GHCR-amd64%20%7C%20arm64-2496ED?logo=github&logoColor=white)](https://github.com/AtomBoyC/ovh-buyer/pkgs/container/ovh-buyer)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20Stdlib-10B981)](#核心特性)
-[![GHCR](https://img.shields.io/badge/GHCR-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)](https://github.com/AtomBoyC/ovh-buyer/pkgs/container/ovh-buyer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F59E0B.svg)](LICENSE)
 
 一款专为 **OVHcloud 黑五（Black Friday）/ 闪购 / 日常补货** 打造的高速、轻量、全功能自动抢购与监控系统，覆盖 **Eco（Kimsufi / SoYouStart / Rise / LE）**、**Baremetal（Advance / Game / Storage）** 与 **VPS** 全系列。
@@ -89,15 +91,19 @@ python3 run.py --headless
 
 ## 🐳 二、远程 Linux 服务器 Docker 部署
 
-每次推送到 `main` 分支都会由 GitHub Actions 自动构建并发布 **多架构镜像（`linux/amd64` + `linux/arm64`）**：
-- **GHCR 镜像地址**：`ghcr.io/atomboyc/ovh-buyer:latest`
-- **Docker Hub 镜像（可选同步）**：在仓库 Secrets 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 后，自动同步推送至 `<你的用户名>/ovh-buyer:latest`
+每次推送到 `main` 分支或发布 [GitHub Release](https://github.com/AtomBoyC/ovh-buyer/releases) 标签时，GitHub Actions 均会自动构建并同步推送 **双架构预构建镜像（`linux/amd64` + `linux/arm64`）** 到以下两个公开仓库，按服务器网络任选其一即可：
+
+| 镜像仓库 | 最新版镜像 (`latest`) | 稳定版标签示例 (`Release`) | 仓库主页 |
+| :--- | :--- | :--- | :--- |
+| **GHCR** | `ghcr.io/atomboyc/ovh-buyer:latest` | `ghcr.io/atomboyc/ovh-buyer:1.0.0` | [GitHub Packages](https://github.com/AtomBoyC/ovh-buyer/pkgs/container/ovh-buyer) |
+| **Docker Hub** | `atomboyc/ovh-buyer:latest` | `atomboyc/ovh-buyer:1.0.0` | [Docker Hub](https://hub.docker.com/r/atomboyc/ovh-buyer) |
 
 ### 方式 A：免 `git clone`，一条 `docker run` 秒级启动（最快捷）
 
 ```bash
 mkdir -p ~/ovh-buyer/data && cd ~/ovh-buyer
 
+# 从 Docker Hub 拉取（也可把最后一行替换为 ghcr.io/atomboyc/ovh-buyer:latest）
 docker run -d \
   --name ovh-sniper \
   --restart unless-stopped \
@@ -105,17 +111,19 @@ docker run -d \
   -e TZ=Asia/Shanghai \
   -e PANEL_PASSWORD="请改成你的强密码" \
   -v $(pwd)/data:/app/data \
-  ghcr.io/atomboyc/ovh-buyer:latest
+  atomboyc/ovh-buyer:latest
 ```
 
 ### 方式 B：免 `git clone`，仅下载 `docker-compose.yml` 部署（推荐）
+
+可直接从 [Releases 页面](https://github.com/AtomBoyC/ovh-buyer/releases/latest) 或下方命令下载编排文件：
 
 ```bash
 mkdir -p ~/ovh-buyer && cd ~/ovh-buyer
 curl -fsSLO https://raw.githubusercontent.com/AtomBoyC/ovh-buyer/main/docker-compose.yml
 curl -fsSLO https://raw.githubusercontent.com/AtomBoyC/ovh-buyer/main/.env.example
 cp .env.example .env
-nano .env   # 修改 PANEL_PASSWORD（强烈建议），可按需填写 OVH 凭据或 Telegram Token
+nano .env   # 修改 PANEL_PASSWORD（强烈建议）；如需从 Docker Hub 拉取可取消注释 OVH_IMAGE=atomboyc/ovh-buyer:latest
 
 docker compose pull && docker compose up -d
 docker compose logs -f
@@ -130,10 +138,13 @@ git clone https://github.com/AtomBoyC/ovh-buyer.git
 cd ovh-buyer
 chmod +x scripts/deploy-docker.sh
 
-# 默认直接拉取 ghcr.io 预构建镜像启动（自动生成随机强密码）
+# 默认直接拉取预构建镜像启动（自动生成 16 位随机强密码）
 ./scripts/deploy-docker.sh
 
-# 如修改了源码想本地构建：
+# 若想从 Docker Hub 拉取：
+OVH_IMAGE=atomboyc/ovh-buyer:latest ./scripts/deploy-docker.sh
+
+# 若修改了源码想本地构建：
 ./scripts/deploy-docker.sh --build
 ```
 
@@ -150,27 +161,13 @@ docker compose pull && docker compose up -d
 docker compose down
 ```
 
-### 同步发布到 Docker Hub（可选）
-
-[docker-publish.yml](.github/workflows/docker-publish.yml) 已内置双仓库同步推送。只需在你的 GitHub 仓库中添加 2 个 Actions Secrets，下一次 push 或手动点 **Run workflow** 就会同时推送到 GHCR 与 Docker Hub：
-
-- `DOCKERHUB_USERNAME`：你的 Docker Hub 用户名
-- `DOCKERHUB_TOKEN`：Docker Hub Access Token（在 https://hub.docker.com/settings/security 创建，权限选 Read & Write）
-
-```bash
-# 也可直接用 gh CLI 一行写入（在本地执行）：
-gh secret set DOCKERHUB_USERNAME --repo AtomBoyC/ovh-buyer
-gh secret set DOCKERHUB_TOKEN --repo AtomBoyC/ovh-buyer
-gh workflow run docker-publish.yml --repo AtomBoyC/ovh-buyer
-```
-
-配置完成后，服务器即可使用 `OVH_IMAGE=<你的用户名>/ovh-buyer:latest` 从 Docker Hub 拉取镜像。
-
 ### 方式 D：无头纯配置文件部署（适合极简 VPS）
 
 1. 复制 `config.example.json` 到 `./data/config.json`，填入 OVH 凭据、抢购任务与黑五雷达规则
 2. 在 `.env` 中设置 `HEADLESS=true`、`TELEGRAM_BOT_TOKEN` 与 `TELEGRAM_CHAT_ID`
 3. 执行 `docker compose up -d`，全程通过 Telegram Bot 交互控制
+
+> 💡 **Fork 二次开发自动发布说明**：[docker-publish.yml](.github/workflows/docker-publish.yml) 默认自动推送至你的 GHCR；若也想同步推送至你自己的 Docker Hub，在仓库 `Settings → Secrets → Actions` 添加 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 即可自动启用双推。
 
 ### 公网安全建议（Caddy / Nginx 反代 HTTPS）
 
@@ -233,6 +230,7 @@ location / {
 
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
+| `OVH_IMAGE` | `ghcr.io/atomboyc/ovh-buyer:latest` | Docker Compose 拉取的镜像地址（可改为 `atomboyc/ovh-buyer:latest` 或指定版本 `:1.0.0`） |
 | `PORT` | `8888` | Web 控制台监听与 Docker 映射端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `TZ` | `Asia/Shanghai` | 容器与日志时区 |
@@ -264,7 +262,8 @@ location / {
 ovh-buyer/
 ├── run.py                      # 统一入口（Web 控制台 / Headless / CLI 工具）
 ├── Dockerfile                  # 轻量单容器 Alpine 镜像 (~55MB)
-├── docker-compose.yml          # Docker Compose 编排配置
+├── docker-compose.yml          # Docker Compose 编排配置（默认拉取预构建镜像）
+├── docker-compose.build.yml    # 本地源码构建覆盖配置
 ├── .env.example                # 环境变量配置模板
 ├── config.example.json         # 声明式配置导入模板
 ├── scripts/
@@ -283,7 +282,9 @@ ovh-buyer/
 │   └── web/                    # 零 CDN 暗黑控制台前端 (HTML / CSS / JS)
 ├── tests/
 │   └── test_core.py            # 完整单元测试与本地 Mock OVH API 端到端集成测试
-└── .github/workflows/ci.yml    # GitHub Actions 自动测试与 Docker 构建验证
+└── .github/workflows/
+    ├── ci.yml                  # GitHub Actions 自动测试与 Docker 构建验证
+    └── docker-publish.yml      # 双架构自动发布至 GHCR 与 Docker Hub
 ```
 
 ---
