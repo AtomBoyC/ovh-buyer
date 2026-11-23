@@ -17,6 +17,18 @@ from .config import DATA_DIR, DB_PATH
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
+# Settings that must never leave the box in clear text via /api/export
+EXPORT_SECRET_SETTING_KEYS = (
+    "telegram_bot_token",
+    "bark_url",
+    "serverchan_key",
+    "dingtalk_webhook",
+    "dingtalk_secret",
+    "feishu_webhook",
+    "discord_webhook",
+    "custom_webhook_url",
+)
+
 
 def now_iso() -> str:
     """Return current timestamp in UTC+8 ISO format."""
@@ -460,7 +472,7 @@ class Database:
 
     def create_account(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
-        acc_id = data.get("id") or str(uuid.uuid4())[:8]
+        acc_id = str(uuid.uuid4())[:8]
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT COUNT(*) FROM accounts")
@@ -601,7 +613,7 @@ class Database:
 
     def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
-        task_id = data.get("id") or str(uuid.uuid4())[:8]
+        task_id = str(uuid.uuid4())[:8]
         plan_code = str(data.get("plan_code", "")).strip()
         name = str(data.get("name", "")).strip() or plan_code
         account_id = str(data.get("account_id", "")).strip()
@@ -674,6 +686,12 @@ class Database:
         return self.get_task(task_id)  # type: ignore[return-value]
 
     def update_task(self, task_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Whole read-modify-write under the (re-entrant) lock so concurrent writers can never
+        # overwrite a fresher status (e.g. pending_confirm) or ordered_count with stale values.
+        with self._lock:
+            return self._update_task_locked(task_id, patch)
+
+    def _update_task_locked(self, task_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         existing = self.get_task(task_id)
         if not existing:
             return None
@@ -803,7 +821,7 @@ class Database:
 
     def create_radar_rule(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
-        rule_id = data.get("id") or str(uuid.uuid4())[:8]
+        rule_id = str(uuid.uuid4())[:8]
         dcs = data.get("datacenters") or []
         if isinstance(dcs, str):
             dcs = [x.strip().lower() for x in dcs.split(",") if x.strip()]
@@ -921,7 +939,7 @@ class Database:
 
     def create_vps_watch(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
-        wid = data.get("id") or str(uuid.uuid4())[:8]
+        wid = str(uuid.uuid4())[:8]
         dcs = data.get("datacenters") or []
         if isinstance(dcs, str):
             dcs = [x.strip().upper() for x in dcs.split(",") if x.strip()]
@@ -1165,6 +1183,14 @@ class Database:
             )
             self._conn.commit()
 
+    def kv_pop(self, key: str) -> Optional[Any]:
+        """Atomically read AND delete a key (single-use tokens, e.g. Telegram buy buttons)."""
+        with self._lock:
+            val = self.kv_get(key)
+            self._conn.execute("DELETE FROM kv_cache WHERE key = ?", (key,))
+            self._conn.commit()
+            return val
+
     def kv_get(self, key: str) -> Optional[Any]:
         now = time.time()
         with self._lock:
@@ -1215,9 +1241,16 @@ class Database:
             }
 
     def export_config(self, include_secrets: bool = False) -> Dict[str, Any]:
+        settings = dict(self.get_settings())
+        settings.pop("panel_password_hash", None)
+        settings.pop("panel_signing_secret", None)
+        if not include_secrets:
+            for sk in EXPORT_SECRET_SETTING_KEYS:
+                val = str(settings.get(sk) or "")
+                settings[sk] = mask_secret(val) if val else ""
         return {
             "exported_at": now_iso(),
-            "settings": self.get_settings(),
+            "settings": settings,
             "accounts": self.list_accounts(mask=not include_secrets),
             "tasks": self.list_tasks(),
             "radar_rules": self.list_radar_rules(),

@@ -6,6 +6,7 @@ import mimetypes
 import queue
 import socketserver
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -22,6 +23,17 @@ from .specs import GLOBAL_FX
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
+
+LOGIN_MAX_FAILURES = 8
+LOGIN_LOCK_SECONDS = 300
+
+
+def _safe_int(raw: str, default: int, lo: int = 1, hi: int = 1000) -> int:
+    try:
+        return max(lo, min(hi, int(str(raw).strip())))
+    except (TypeError, ValueError):
+        return default
+
 
 SECRET_SETTING_KEYS = {
     "telegram_bot_token",
@@ -53,6 +65,8 @@ class AppContext:
         self.notifier = notifier
         self.engine = engine
         self.auth = auth
+        self.login_failures: Dict[str, Tuple[int, float]] = {}
+        self.login_lock = threading.Lock()
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -108,8 +122,14 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_static(self, req_path: str) -> None:
         rel = req_path.lstrip("/") or "index.html"
+        root = WEB_ROOT.resolve()
         target = (WEB_ROOT / rel).resolve()
-        if not str(target).startswith(str(WEB_ROOT.resolve())) or not target.is_file():
+        try:
+            target.relative_to(root)
+            inside = True
+        except ValueError:
+            inside = False
+        if not inside or not target.is_file():
             target = WEB_ROOT / "index.html"
         if not target.is_file():
             self._send_json({"error": "Web UI assets missing"}, status=404)
@@ -122,6 +142,14 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
+
+    def _client_ip(self) -> str:
+        return str(self.client_address[0] if self.client_address else "?")
+
+    def _session_cookie(self) -> str:
+        token = self.ctx.auth.create_session_token()
+        secure = "; Secure" if str(self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else ""
+        return f"{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{secure}"
 
     def _check_auth(self, path: str) -> bool:
         public_api = {"/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/logout"}
@@ -301,7 +329,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/orders":
-            limit = int(q1("limit", "100") or 100)
+            limit = _safe_int(q1("limit", "100"), 100, 1, 1000)
             self._send_json({"items": self.ctx.db.list_orders(limit=limit)})
             return
 
@@ -318,7 +346,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/logs":
-            limit = int(q1("limit", "200") or 200)
+            limit = _safe_int(q1("limit", "200"), 200, 1, 2000)
             level = q1("level", "")
             source = q1("source", "")
             search = q1("search", "")
@@ -373,16 +401,25 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _route_post(self, path: str, body: Dict[str, Any]) -> None:
         if path == "/api/auth/login":
+            ip = self._client_ip()
+            now = time.time()
+            with self.ctx.login_lock:
+                fails, until = self.ctx.login_failures.get(ip, (0, 0.0))
+            if until > now:
+                self._send_json({"error": f"登录失败次数过多，请 {int(until - now)} 秒后再试"}, status=429)
+                return
             password = str(body.get("password") or "")
             if not self.ctx.auth.verify_secret(password):
+                with self.ctx.login_lock:
+                    fails += 1
+                    lock_until = now + LOGIN_LOCK_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
+                    self.ctx.login_failures[ip] = (0 if lock_until else fails, lock_until)
+                time.sleep(0.4)
                 self._send_json({"error": "密码错误"}, status=401)
                 return
-            token = self.ctx.auth.create_session_token()
-            cookie = (
-                f"{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; "
-                f"Max-Age={SESSION_TTL_SECONDS}"
-            )
-            self._send_json({"ok": True}, extra_headers={"Set-Cookie": cookie})
+            with self.ctx.login_lock:
+                self.ctx.login_failures.pop(ip, None)
+            self._send_json({"ok": True}, extra_headers={"Set-Cookie": self._session_cookie()})
             return
 
         if path == "/api/auth/logout":
@@ -393,8 +430,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/auth/password":
             new_pw = str(body.get("password") or "").strip()
             self.ctx.auth.set_panel_password(new_pw)
-            self.ctx.db.add_log("INFO", "面板访问密码已更新", "auth")
-            self._send_json({"ok": True, "auth_enabled": self.ctx.auth.is_auth_enabled()})
+            self.ctx.db.add_log("INFO", "面板访问密码已更新（旧登录会话已全部失效）", "auth")
+            # Signing secret was rotated: hand the current operator a fresh session cookie
+            extra = {"Set-Cookie": self._session_cookie()} if self.ctx.auth.is_auth_enabled() else None
+            self._send_json({"ok": True, "auth_enabled": self.ctx.auth.is_auth_enabled()}, extra_headers=extra)
             return
 
         if path == "/api/engine/toggle":

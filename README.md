@@ -13,7 +13,9 @@
 
 深度吸收了 `moonheart/OVH20251109`、`gokele/ovh`、`katorly/ovh-auto-buy` 以及 NodeSeek 社区最新实战项目 `super888-png/stockhawk-ovh`、`PoorVPS/ovh-eco-telegram-order-bot` 的架构精华，在保持 **纯 Python 3.9+ 零第三方依赖** 的前提下，全面升级至 **v2.0.0**（完整变更见 [CHANGELOG.md](CHANGELOG.md)）。
 
-![OVH Sniper 控制台预览](docs/screenshots/catalog.png)
+| 深色主题 | 浅色主题 |
+| :---: | :---: |
+| ![OVH Sniper 控制台 · 深色](docs/screenshots/dashboard-dark.png) | ![OVH Sniper 控制台 · 浅色](docs/screenshots/dashboard-light.png) |
 
 ---
 

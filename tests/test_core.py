@@ -61,6 +61,8 @@ class MockOVHState:
         self.bulk_calls = 0
         self.per_plan_calls = 0
         self.me_order_calls = 0
+        self.checkout_attempts = 0
+        self.summary_broken = False
         self.reject_os_en = False
         self.checkout_error_code = 0
         self.price_without_tax = 14.99
@@ -333,7 +335,10 @@ class MockOVHHandler(http.server.BaseHTTPRequestHandler):
             cart = self.st.carts.get(cart_id, {})
             self._send(cart.get("configs", []))
             return
-        if path.endswith("/summary"):
+        if path.endswith("/summary") or (path.endswith("/checkout") and self.st.summary_broken):
+            if self.st.summary_broken:
+                self._send({"message": "summary unavailable"}, 503)
+                return
             self._send(
                 {
                     "prices": {
@@ -397,6 +402,7 @@ class MockOVHHandler(http.server.BaseHTTPRequestHandler):
             return
         if path.endswith("/checkout"):
             cid = path.split("/")[4]
+            self.st.checkout_attempts += 1
             if self.st.checkout_error_code:
                 self._send({"message": "Gateway timeout / server error"}, self.st.checkout_error_code)
                 return
@@ -739,6 +745,47 @@ class TestOVHSniper(unittest.TestCase):
         carts_before = len(self.mock_state.carts)
         self.engine.run_sniper_tick()
         self.assertEqual(len(self.mock_state.carts), carts_before)
+        # The money-moving POST /checkout must have been sent exactly ONCE (no transport/5xx retries)
+        self.assertEqual(self.mock_state.checkout_attempts, 1)
+        # Uncertain checkout is never auto-linked to an arbitrary recent account order
+        self.assertEqual(orders[0]["order_id"], "")
+
+    def test_review_unknown_price_with_ceiling_never_checks_out(self):
+        acc = self._create_test_account()
+        client = self._make_client(self.db.get_account(acc["id"], mask=False))
+        self.mock_state.summary_broken = True
+        res = self.order_engine.place_order(
+            client=client,
+            subsidiary="IE",
+            plan_code="26skleb01",
+            datacenter="gra",
+            max_price=20.0,
+            dry_run=False,
+        )
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "budget_exceeded")
+        self.assertEqual(self.mock_state.checkout_attempts, 0)
+        self.assertEqual(len(self.mock_state.deleted_carts), 1)
+
+    def test_review_export_masks_secrets_and_ignores_client_ids(self):
+        self.db.update_settings({"telegram_bot_token": "123456:SECRET-TOKEN-VALUE", "dingtalk_secret": "SECabcdef123456"})
+        exported = self.db.export_config(include_secrets=False)
+        self.assertNotIn("SECRET-TOKEN-VALUE", json.dumps(exported, ensure_ascii=False))
+        self.assertNotIn("SECabcdef123456", json.dumps(exported, ensure_ascii=False))
+        self.assertNotIn("panel_password_hash", exported["settings"])
+        t = self.db.create_task({"id": "x');alert(1)//", "plan_code": "26skleb01"})
+        self.assertNotIn("'", t["id"])
+
+    def test_review_deleted_account_never_falls_back_to_default(self):
+        acc = self._create_test_account()
+        task = self.db.create_task(
+            {"name": "Orphan", "account_id": "deleted-acc", "plan_code": "26skleb01", "datacenters": ["gra"], "max_price": 20.0}
+        )
+        self.assertIsNone(self.engine.get_account_for_id("deleted-acc"))
+        self.assertEqual(self.engine.get_account_for_id("")["id"], acc["id"])
+        self.engine.run_sniper_tick()
+        self.assertEqual(self.mock_state.checkout_attempts, 0)
+        self.assertIn("账号", self.db.get_task(task["id"])["last_status_msg"])
 
     def test_v2_order_delivery_tracker_and_hardware_lottery(self):
         acc = self._create_test_account()
@@ -897,10 +944,20 @@ class TestOVHSniper(unittest.TestCase):
         self.assertEqual(len(self.mock_state.checkouts), 1)
 
         tok = self.notifier.create_action_button_token(
-            {"action": "quick_buy", "plan_code": "26skleb01", "datacenter": "gra"}
+            {"action": "quick_buy", "plan_code": "26skleb01", "datacenter": "gra", "price_val": 14.99}
         )
         buy_reply = self.notifier._dispatch_callback(f"buy:{tok}")
         self.assertIn("已创建高优先级抢购任务", buy_reply)
+        # Button is single-use: a second tap must NOT create another real-buy task
+        again = self.notifier._dispatch_callback(f"buy:{tok}")
+        self.assertIn("已使用或已过期", again)
+        tg_tasks = [t for t in self.db.list_tasks() if t["source"] == "telegram"]
+        self.assertEqual(len(tg_tasks), 1)
+        self.assertAlmostEqual(tg_tasks[0]["max_price"], 16.49, places=2)
+
+        # Without a known price the one-tap buy is refused (no uncapped real-buy tasks)
+        tok2 = self.notifier.create_action_button_token({"action": "quick_buy", "plan_code": "26skleb01", "datacenter": "gra"})
+        self.assertIn("拒绝一键抢购", self.notifier._dispatch_callback(f"buy:{tok2}"))
 
     def test_v2_sqlite_v1_to_v2_auto_migration(self):
         v1_path = Path(self.tmpdir.name) / "legacy_v1.db"

@@ -64,15 +64,22 @@ class PanelAuth:
         stored = str(self.db.get_setting("panel_password_hash", "") or "")
         if stored and verify_password_hash(candidate, stored):
             return True
-        if self._env_password and hmac.compare_digest(candidate, self._env_password):
+        if self._env_password and hmac.compare_digest(candidate.encode("utf-8"), self._env_password.encode("utf-8")):
             return True
         return False
+
+    def rotate_signing_secret(self) -> None:
+        """Invalidate every existing session cookie (used on password change)."""
+        new_secret = secrets.token_hex(32)
+        self.db.kv_set("panel_signing_secret", new_secret, ttl_seconds=10 * 365 * 86400)
+        self._signing_secret = new_secret.encode("utf-8")
 
     def set_panel_password(self, new_password: str) -> None:
         if not new_password:
             self.db.update_settings({"panel_password_hash": ""})
         else:
             self.db.update_settings({"panel_password_hash": hash_password(new_password)})
+        self.rotate_signing_secret()
 
     def create_session_token(self) -> str:
         exp = int(time.time()) + SESSION_TTL_SECONDS
@@ -93,7 +100,7 @@ class PanelAuth:
             return False
         payload = f"{exp_str}.{nonce}"
         expected = hmac.new(self._signing_secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, sig)
+        return hmac.compare_digest(expected.encode("ascii"), sig.encode("utf-8", errors="replace"))
 
     def is_request_authorized(self, headers: dict) -> bool:
         if not self.is_auth_enabled():

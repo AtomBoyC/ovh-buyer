@@ -160,6 +160,38 @@ def safe_delete_cart(client: OVHClient, cart_id: Optional[str]) -> None:
         pass
 
 
+def _is_core_hardware_option(code: str) -> bool:
+    """RAM / disk addons: missing them would silently downgrade the server you pay for."""
+    c = str(code or "").lower()
+    return c.startswith("ram-") or "softraid" in c or "hybridsoftraid" in c or c.startswith("raid") or "-raid-" in c or "nvme" in c
+
+
+def _price_within_ceiling(prices: Dict[str, Any], max_price: float, price_includes_tax: bool) -> Tuple[bool, Optional[float]]:
+    """Return (ok, checked_price). With a ceiling set, an UNKNOWN price is never ok."""
+    check = prices.get("withTax") if price_includes_tax else prices.get("withoutTax")
+    if check is None:
+        check = prices.get("withTax") if prices.get("withTax") is not None else prices.get("withoutTax")
+    if max_price and max_price > 0:
+        return (check is not None and float(check) <= float(max_price)), check
+    return True, check
+
+
+def task_cart_fingerprint(task: Dict[str, Any], options: List[str]) -> str:
+    """Everything that changes WHAT a prebuilt cart would buy; a slot is only reusable on an exact match."""
+    parts = [
+        str(task.get("plan_code") or ""),
+        str(task.get("account_id") or ""),
+        str(task.get("product_line") or ""),
+        str(task.get("duration") or ""),
+        str(task.get("pricing_mode") or ""),
+        str(int(task.get("quantity") or 1)),
+        str(task.get("os_code") or ""),
+        ",".join(sorted(str(c).strip().lower() for c in (task.get("coupons") or []) if c)),
+        "|".join(sorted({str(o).strip().lower() for o in options if o})),
+    ]
+    return "\x1f".join(parts)
+
+
 class OrderEngine:
     """Executes OVH cart creation, parallel configuration, Fast Lane slots, price guard, and safe checkout."""
 
@@ -442,12 +474,13 @@ class OrderEngine:
         hint = ""
         if recent:
             ids = ", ".join(f"#{r.get('orderId')}({r.get('status')})" for r in recent)
-            hint = f" | 近期账号订单: {ids}"
+            hint = f" | 近期账号订单（请人工确认是否为本次）: {ids}"
+        # Do NOT auto-link recent[0]: it may be another task's or a manual order.
         return {
             "success": False,
             "status": "pending_confirm",
-            "order_id": str(recent[0].get("orderId") or "") if recent else "",
-            "order_url": str(recent[0].get("url") or "") if recent else "",
+            "order_id": "",
+            "order_url": "",
             "price_without_tax": prices_info["withoutTax"],
             "price_with_tax": prices_info["withTax"],
             "currency": prices_info["currencyCode"],
@@ -510,13 +543,16 @@ class OrderEngine:
             if check_price is None:
                 check_price = prices_info["withTax"] if prices_info["withTax"] is not None else prices_info["withoutTax"]
 
-            if max_price and max_price > 0 and check_price is not None and check_price > max_price:
+            if max_price and max_price > 0 and (check_price is None or check_price > max_price):
                 safe_delete_cart(client, cart_id)
                 tax_label = "含税" if price_includes_tax else "不含税"
-                msg = (
-                    f"触发价格封顶保护: 实际{tax_label}价 {check_price} {prices_info['currencyCode']} "
-                    f"> 上限 {max_price}，已自动取消购物车"
-                )
+                if check_price is None:
+                    msg = f"无法获取购物车实时价格，已设置价格上限 {max_price}，为安全起见取消下单并删除购物车"
+                else:
+                    msg = (
+                        f"触发价格封顶保护: 实际{tax_label}价 {check_price} {prices_info['currencyCode']} "
+                        f"> 上限 {max_price}，已自动取消购物车"
+                    )
                 self._log("WARNING", f"{plan_code}@{api_dc} {msg}", "order")
                 return {
                     "success": False,
@@ -646,6 +682,9 @@ class OrderEngine:
                         None,
                     )
             if not match:
+                if _is_core_hardware_option(wanted):
+                    # Never silently downgrade RAM / disk: abort so the cart gets deleted.
+                    raise OVHAPIError(f"所需硬件配件 {wanted} 不在 {plan_code} 可选列表中，拒绝降级下单", status_code=409)
                 self._log("WARNING", f"硬件选项 {wanted} 未在 {plan_code} 可选列表中匹配到", "order")
                 continue
             opt_code = str(match["planCode"])
@@ -749,6 +788,8 @@ class OrderEngine:
                     else:
                         raise exc
                 else:
+                    if _is_core_hardware_option(str(data[0])):
+                        raise OVHAPIError(f"挂载硬件配件 {data[0]} 失败，拒绝降级下单: {exc}", status_code=getattr(exc, "status_code", 0))
                     self._log("WARNING", f"添加选项 {data[0]} 失败: {exc}", "order")
 
         if need_dynamic_fallback:
@@ -805,18 +846,31 @@ class OrderEngine:
 
 
 class CartSlotPool:
-    """Fast Lane prebuilt cart pool: maintains 1 verified, budget-checked cart per (task_id, datacenter)."""
+    """Fast Lane prebuilt cart pool: maintains 1 verified, budget-checked cart per (task_id, datacenter).
+
+    Safety rules:
+    - A slot is only reused on an EXACT cart fingerprint match (plan, account, duration, pricing mode,
+      quantity, OS, coupons, options). Any task edit evicts stale slots.
+    - Prices are re-checked against the task ceiling at build, at revalidation AND at hit time;
+      an unknown price with a ceiling set is never accepted.
+    - A per-task generation counter prevents carts built concurrently with cleanup_task() from leaking.
+    """
 
     def __init__(self, order_engine: OrderEngine, log_fn=None):
         self.order_engine = order_engine
         self._log = log_fn or (lambda level, msg, source="fastlane": None)
         self._lock = threading.RLock()
-        # task_id -> {dc: {cart_id, client, expire_ts, checked_ts, prices, options, options_fp, ok, plan_code}}
+        # task_id -> {dc: {cart_id, client, expire_ts, checked_ts, prices, options, cfg_fp, ok, plan_code}}
         self._slots: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._gen: Dict[str, int] = {}
 
     @staticmethod
     def _options_fp(options: List[str]) -> str:
         return "|".join(sorted({str(o).strip().lower() for o in options if o}))
+
+    def _generation(self, task_id: str) -> int:
+        with self._lock:
+            return self._gen.get(task_id, 0)
 
     def maintain_task(
         self,
@@ -832,18 +886,24 @@ class CartSlotPool:
         dcs = [normalize_datacenter(d) for d in target_dcs if d][:6]
         if not dcs:
             return 0
-        opts_fp = self._options_fp(resolved_options)
+        cfg_fp = task_cart_fingerprint(task, resolved_options)
+        max_price = float(task.get("max_price") or 0)
+        incl_tax = bool(task.get("price_includes_tax"))
+        gen = self._generation(task_id)
         now = time.time()
         built_count = 0
 
-        # Evict slots for removed DCs or changed options/plan
+        # Evict slots for removed DCs or any changed cart-affecting setting
+        evicted: List[Dict[str, Any]] = []
         with self._lock:
             task_map = self._slots.setdefault(task_id, {})
             for old_dc in list(task_map.keys()):
                 sl = task_map[old_dc]
-                if old_dc not in dcs or sl["plan_code"] != task["plan_code"] or sl["options_fp"] != opts_fp:
-                    removed = task_map.pop(old_dc)
-                    safe_delete_cart(removed["client"], removed["cart_id"])
+                ok_price, _ = _price_within_ceiling(sl["prices"], max_price, incl_tax)
+                if old_dc not in dcs or sl.get("cfg_fp") != cfg_fp or not ok_price:
+                    evicted.append(task_map.pop(old_dc))
+        for removed in evicted:
+            safe_delete_cart(removed["client"], removed["cart_id"])
 
         for dc in dcs:
             if stop_event and stop_event.is_set():
@@ -870,18 +930,11 @@ class CartSlotPool:
                         parallel=True,
                     )
                     prices = built["prices"]
-                    max_price = float(task.get("max_price") or 0)
-                    check_p = prices["withTax"] if task.get("price_includes_tax") else prices["withoutTax"]
-                    if check_p is None:
-                        check_p = prices["withTax"] if prices["withTax"] is not None else prices["withoutTax"]
-                    ok = not (max_price > 0 and check_p is not None and check_p > max_price)
+                    ok, check_p = _price_within_ceiling(prices, max_price, incl_tax)
                     if not ok:
                         safe_delete_cart(client, built["cart_id"])
-                        self._log(
-                            "WARNING",
-                            f"⚡ [快速通道] {task['plan_code']}@{dc.upper()} 预建车价格 {check_p} 超过上限 {max_price}，跳过预建",
-                            "fastlane",
-                        )
+                        reason = "无法获取实时价格" if check_p is None else f"价格 {check_p} 超过上限 {max_price}"
+                        self._log("WARNING", f"⚡ [快速通道] {task['plan_code']}@{dc.upper()} 预建车{reason}，跳过预建", "fastlane")
                         continue
                     new_slot = {
                         "cart_id": built["cart_id"],
@@ -892,12 +945,21 @@ class CartSlotPool:
                         "checked_ts": time.time(),
                         "prices": prices,
                         "options": built["applied_options"],
-                        "options_fp": opts_fp,
+                        "cfg_fp": cfg_fp,
                         "ok": True,
                     }
+                    stale_gen = False
+                    old = None
                     with self._lock:
-                        old = self._slots.setdefault(task_id, {}).get(dc)
-                        self._slots[task_id][dc] = new_slot
+                        if self._gen.get(task_id, 0) != gen:
+                            stale_gen = True
+                        else:
+                            old = self._slots.setdefault(task_id, {}).get(dc)
+                            self._slots[task_id][dc] = new_slot
+                    if stale_gen:
+                        # Task was paused/edited/deleted while we were building: never leak the cart
+                        safe_delete_cart(client, built["cart_id"])
+                        break
                     if old and old["cart_id"] != built["cart_id"]:
                         safe_delete_cart(old["client"], old["cart_id"])
                     built_count += 1
@@ -909,31 +971,50 @@ class CartSlotPool:
                 except Exception as exc:
                     self._log("WARNING", f"⚡ [快速通道] 预建 {task['plan_code']}@{dc.upper()} 失败: {exc}", "fastlane")
             elif need_revalidate and slot:
+                drop = False
                 try:
                     info = client.get(f"/order/cart/{slot['cart_id']}", need_auth=True)
                     summary = client.get(f"/order/cart/{slot['cart_id']}/summary", need_auth=True)
                     prices = _extract_prices_from_summary(summary)
                     exp_ts = _parse_expire_ts((info or {}).get("expire"))
+                    ok, _ = _price_within_ceiling(prices, max_price, incl_tax)
                     with self._lock:
                         cur = self._slots.get(task_id, {}).get(dc)
                         if cur and cur["cart_id"] == slot["cart_id"]:
-                            cur["expire_ts"] = exp_ts
-                            cur["prices"] = prices
-                            cur["checked_ts"] = time.time()
+                            if ok:
+                                cur["expire_ts"] = exp_ts
+                                cur["prices"] = prices
+                                cur["checked_ts"] = time.time()
+                            else:
+                                self._slots[task_id].pop(dc, None)
+                                drop = True
                 except Exception:
                     with self._lock:
                         cur = self._slots.get(task_id, {}).get(dc)
                         if cur and cur["cart_id"] == slot["cart_id"]:
                             self._slots[task_id].pop(dc, None)
+                            drop = True
+                # Only delete the cart if THIS thread removed it (the sniper may have popped it for checkout)
+                if drop:
                     safe_delete_cart(client, slot["cart_id"])
 
         return built_count
 
-    def take_ready_slot(self, task_id: str, datacenter: str, options: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-        """Atomically pop a ready, non-expired prebuilt cart slot for immediate 1-call checkout."""
+    def take_ready_slot(
+        self,
+        task_id: str,
+        datacenter: str,
+        task: Optional[Dict[str, Any]] = None,
+        options: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically pop a ready, non-expired, exactly-matching, within-budget slot for 1-call checkout."""
         dc = normalize_datacenter(datacenter)
-        want_fp = self._options_fp(options or []) if options else ""
         now = time.time()
+        if task is None:
+            return None
+        want_fp = task_cart_fingerprint(task, options or [])
+        max_price = float(task.get("max_price") or 0)
+        incl_tax = bool(task.get("price_includes_tax"))
         with self._lock:
             task_map = self._slots.get(task_id)
             if not task_map or dc not in task_map:
@@ -941,7 +1022,10 @@ class CartSlotPool:
             slot = task_map[dc]
             if not slot.get("ok") or (slot["expire_ts"] - now < SLOT_MIN_TTL_AT_HIT):
                 return None
-            if want_fp and slot["options_fp"] and slot["options_fp"] != want_fp:
+            if slot.get("cfg_fp") != want_fp:
+                return None
+            ok, _ = _price_within_ceiling(slot["prices"], max_price, incl_tax)
+            if not ok:
                 return None
             return task_map.pop(dc)
 
@@ -966,6 +1050,7 @@ class CartSlotPool:
 
     def cleanup_task(self, task_id: str) -> None:
         with self._lock:
+            self._gen[task_id] = self._gen.get(task_id, 0) + 1
             removed = self._slots.pop(task_id, {})
         for sl in removed.values():
             safe_delete_cart(sl["client"], sl["cart_id"])

@@ -28,15 +28,27 @@ function fmtCny(amount, currency = "EUR") {
 }
 
 const TAB_TITLES = {
-  dashboard: "总览仪表盘",
-  catalog: "目录与实时查货",
-  tasks: "抢购任务队列",
-  radar: "黑五新品 & 配置雷达",
-  vps: "VPS 库存监控",
-  orders: "订单与历史记录",
-  accounts: "多账号 API 管理",
-  settings: "通知与系统设置",
-  logs: "实时运行日志",
+  dashboard: "总览",
+  catalog: "目录与查货",
+  tasks: "抢购任务",
+  radar: "黑五雷达",
+  vps: "VPS 监控",
+  orders: "订单与交付",
+  accounts: "OVH 账号",
+  settings: "通知与设置",
+  logs: "运行日志",
+};
+
+const TAB_SUBS = {
+  dashboard: "引擎状态、实时库存与最近订单一览",
+  catalog: "浏览 OVH 官方目录，查看各机房实时库存与幽灵库存标记",
+  tasks: "按型号 / 机房 / 硬件条件自动轮询，有货即下单",
+  radar: "黑五新品上线与配置指纹自动发现",
+  vps: "各机房 VPS 套餐补货状态",
+  orders: "短链下单、订单历史、交付进度与硬件中奖检测",
+  accounts: "管理多个 OVH API 凭据，检查默认支付方式",
+  settings: "推送渠道、引擎限流与面板安全",
+  logs: "SSE 实时日志流",
 };
 
 function esc(str) {
@@ -44,7 +56,13 @@ function esc(str) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function syncThemeButtons() {
+  const pref = (window.__theme && window.__theme.pref()) || "system";
+  document.querySelectorAll("[data-theme-set]").forEach((b) => b.setAttribute("aria-pressed", b.dataset.themeSet === pref ? "true" : "false"));
 }
 
 function toast(msg, type = "info") {
@@ -95,6 +113,7 @@ function switchTab(tab) {
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${tab}`));
   document.getElementById("page-title").textContent = TAB_TITLES[tab] || tab;
+  document.getElementById("page-sub").textContent = TAB_SUBS[tab] || "";
   if (tab === "settings") loadSettings();
   if (tab === "logs") loadLogs();
 }
@@ -162,7 +181,7 @@ function renderStatus() {
   const txt = document.getElementById("sidebar-engine-text");
   if (st.running && st.sniper_enabled) {
     pill.classList.add("ok");
-    txt.textContent = st.fast_lane_enabled ? "引擎在线 · ⚡快速通道就绪" : "引擎在线 · 抢购待命";
+    txt.textContent = st.fast_lane_enabled ? "引擎在线 · 快速通道就绪" : "引擎在线 · 抢购待命";
   } else if (st.running) {
     pill.classList.remove("ok");
     txt.textContent = "引擎在线 · 抢购已暂停";
@@ -421,10 +440,10 @@ function renderTasks() {
         </td>
         <td>
           <div class="toolbar">
-            <button class="btn btn-ghost btn-sm" onclick="toggleTaskStatus('${t.id}','${nextStatus}')">${toggleLabel}</button>
-            <button class="btn btn-success btn-sm" onclick="runTaskNow('${t.id}', true)" title="演练创建购物车与实时报价">演练</button>
-            <button class="btn btn-ghost btn-sm" onclick="editTask('${t.id}')">编辑</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteTask('${t.id}')">删</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleTaskStatus('${esc(t.id)}','${nextStatus}')">${toggleLabel}</button>
+            <button class="btn btn-success btn-sm" onclick="runTaskNow('${esc(t.id)}', true)" title="演练创建购物车与实时报价">演练</button>
+            <button class="btn btn-ghost btn-sm" onclick="editTask('${esc(t.id)}')">编辑</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteTask('${esc(t.id)}')">删</button>
           </div>
         </td>
       </tr>`;
@@ -550,8 +569,8 @@ function renderRadar() {
         <td><div>基线 ${r.known_plan_codes.length} · 命中 ${r.matched_plan_codes.length}</div><div class="muted">${esc(r.matched_plan_codes.slice(-3).join(", ") || r.last_check_at || "未扫描")}</div></td>
         <td>
           <div class="toolbar">
-            <button class="btn btn-ghost btn-sm" onclick="toggleRadar('${r.id}', ${!r.enabled})">${r.enabled ? "停用" : "启用"}</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteRadar('${r.id}')">删</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleRadar('${esc(r.id)}', ${!r.enabled})">${r.enabled ? "停用" : "启用"}</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteRadar('${esc(r.id)}')">删</button>
           </div>
         </td>
       </tr>`;
@@ -597,8 +616,8 @@ function renderVps() {
           </div>
           <div class="toolbar">
             <span class="muted">${esc(w.last_check_at || "尚未检测")}</span>
-            <button class="btn btn-ghost btn-sm" onclick="toggleVps('${w.id}', ${!w.enabled})">${w.enabled ? "暂停" : "启用"}</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteVps('${w.id}')">删除</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleVps('${esc(w.id)}', ${!w.enabled})">${w.enabled ? "暂停" : "启用"}</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteVps('${esc(w.id)}')">删除</button>
           </div>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${states || '<span class="muted">点击“立即刷新全部”获取各机房库存状态</span>'}</div>
@@ -787,9 +806,9 @@ function renderAccounts() {
         <td>${ver}</td>
         <td>
           <div class="toolbar">
-            <button class="btn btn-success btn-sm" onclick="testAccount('${a.id}')">测试连通</button>
-            <button class="btn btn-ghost btn-sm" onclick="editAccount('${a.id}')">编辑</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteAccount('${a.id}')">删</button>
+            <button class="btn btn-success btn-sm" onclick="testAccount('${esc(a.id)}')">测试连通</button>
+            <button class="btn btn-ghost btn-sm" onclick="editAccount('${esc(a.id)}')">编辑</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteAccount('${esc(a.id)}')">删</button>
           </div>
         </td>
       </tr>`;
@@ -920,6 +939,15 @@ function bindEvents() {
   document.querySelectorAll(".nav-item").forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
+
+  // Theme switch (system / light / dark)
+  document.querySelectorAll("[data-theme-set]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (window.__theme) window.__theme.set(btn.dataset.themeSet);
+      syncThemeButtons();
+    });
+  });
+  syncThemeButtons();
 
   // Login form
   document.getElementById("login-form").addEventListener("submit", async (e) => {
@@ -1301,6 +1329,7 @@ function bindEvents() {
 
 async function bootAfterAuth() {
   state.meta = await api("/api/meta");
+  if (state.meta && state.meta.version) document.getElementById("version-tag").textContent = `v${state.meta.version}`;
   const eps = (state.meta && state.meta.endpoints) || {};
   if (eps["ovh-eu"] && eps["ovh-eu"].token_url) document.getElementById("token-link-eu").href = eps["ovh-eu"].token_url;
   if (eps["ovh-ca"] && eps["ovh-ca"].token_url) document.getElementById("token-link-ca").href = eps["ovh-ca"].token_url;

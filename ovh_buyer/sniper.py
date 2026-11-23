@@ -71,6 +71,9 @@ class SniperEngine:
         self._tracker_last_tick: float = 0.0
         self._short_link_lock = threading.Lock()
         self._short_link_carts: Dict[str, Dict[str, Any]] = {}
+        # Tasks currently being evaluated/ordered (guards against concurrent double-orders)
+        self._inflight_tasks: set = set()
+        self._vps_tick_lock = threading.Lock()
 
         # Telemetry
         self.started_at: Optional[float] = None
@@ -119,7 +122,22 @@ class SniperEngine:
         return OVHClient(endpoint=endpoint, proxy_url=proxy, qps=qps)
 
     def get_account_for_id(self, account_id: str) -> Optional[Dict[str, Any]]:
-        return self.db.get_account(account_id, mask=False) or self.db.get_default_account(mask=False)
+        """Resolve an account. Falls back to the default account ONLY when no account was specified,
+        so a task bound to a deleted account never silently buys on another account."""
+        if account_id:
+            return self.db.get_account(account_id, mask=False)
+        return self.db.get_default_account(mask=False)
+
+    def _try_acquire_task(self, task_id: str) -> bool:
+        with self._lock:
+            if task_id in self._inflight_tasks:
+                return False
+            self._inflight_tasks.add(task_id)
+            return True
+
+    def _release_task(self, task_id: str) -> None:
+        with self._lock:
+            self._inflight_tasks.discard(task_id)
 
     # ---------- Lifecycle ----------
 
@@ -341,9 +359,17 @@ class SniperEngine:
                         avail_by_plan[pc] = []
 
             for task in ep_tasks:
-                self._task_last_poll[task["id"]] = time.time()
-                self._evaluate_task_availability(task, ep, avail_by_plan.get(task["plan_code"], []))
-                processed += 1
+                if not self._try_acquire_task(task["id"]):
+                    continue  # another thread is already evaluating/ordering this task
+                try:
+                    self._task_last_poll[task["id"]] = time.time()
+                    fresh = self.db.get_task(task["id"])
+                    if not fresh or fresh["status"] != "running":
+                        continue
+                    self._evaluate_task_availability(fresh, ep, avail_by_plan.get(fresh["plan_code"], []))
+                    processed += 1
+                finally:
+                    self._release_task(task["id"])
 
         return processed
 
@@ -562,7 +588,7 @@ class SniperEngine:
             # ⚡ Fast Lane: try prebuilt verified cart first (1 single POST /checkout!)
             result = None
             if not task["dry_run"] and task.get("fast_lane"):
-                slot = self.slot_pool.take_ready_slot(task["id"], hit["dc"], options=options_to_use)
+                slot = self.slot_pool.take_ready_slot(task["id"], hit["dc"], task=fresh_task, options=options_to_use)
                 if slot:
                     self.db.add_log(
                         "INFO",
@@ -720,7 +746,14 @@ class SniperEngine:
             parallel=True,
         )
         token = uuid.uuid4().hex[:12]
+        expired: List[Dict[str, Any]] = []
         with self._short_link_lock:
+            # Drop previews older than 30 min (OVH carts expire anyway) so the cache can't grow forever
+            cutoff = time.time() - 1800
+            for k in [k for k, v in self._short_link_carts.items() if v.get("created_ts", 0) < cutoff]:
+                rec = self._short_link_carts.pop(k)
+                if rec.get("state") == "pending":
+                    expired.append(rec)
             self._short_link_carts[token] = {
                 "token": token,
                 "state": "pending",
@@ -739,6 +772,10 @@ class SniperEngine:
                 "pricing_mode": built["pricing_mode"],
                 "created_ts": time.time(),
             }
+        for rec in expired:
+            old_acc = self.db.get_account(rec["account_id"], mask=False)
+            if old_acc:
+                safe_delete_cart(self.build_client(account=old_acc), rec["cart_id"])
         return {
             "token": token,
             "account_name": acc["name"],
@@ -968,6 +1005,15 @@ class SniperEngine:
             self._stop_event.wait(2.0)
 
     def run_vps_tick(self) -> int:
+        # Serialize VPS ticks (loop thread vs. /api/vps/check) so auto_order can't fire twice
+        if not self._vps_tick_lock.acquire(blocking=False):
+            return 0
+        try:
+            return self._run_vps_tick_locked()
+        finally:
+            self._vps_tick_lock.release()
+
+    def _run_vps_tick_locked(self) -> int:
         watches = [w for w in self.db.list_vps_watches() if w["enabled"]]
         if not watches:
             return 0
@@ -1168,9 +1214,16 @@ class SniperEngine:
             )
             return res
 
-        avail = client.get_availabilities(task["plan_code"])
-        self._task_last_poll[task["id"]] = time.time()
-        self._evaluate_task_availability(task, acc["endpoint"], avail)
+        if task["status"] != "running":
+            return {"success": False, "error": f"任务当前状态为 {task['status']}，请先启动任务"}
+        if not self._try_acquire_task(task_id):
+            return {"success": False, "error": "该任务正在检测/下单中，请稍后再试"}
+        try:
+            avail = client.get_availabilities(task["plan_code"])
+            self._task_last_poll[task["id"]] = time.time()
+            self._evaluate_task_availability(task, acc["endpoint"], avail)
+        finally:
+            self._release_task(task_id)
         return {"success": True, "task": self.db.get_task(task_id)}
 
     def list_account_servers(self, account_id: str) -> List[Dict[str, Any]]:
@@ -1343,6 +1396,16 @@ class SniperEngine:
         dc = meta.get("datacenter", "")
         if not plan_code or not dc:
             return "❌ 参数不完整"
+        price_val = meta.get("price_val")
+        try:
+            price_val = float(price_val) if price_val is not None else None
+        except (TypeError, ValueError):
+            price_val = None
+        if not price_val or price_val <= 0:
+            return "⚠️ 该补货未获取到参考价，为防止高价误下单已拒绝一键抢购，请在面板创建带价格上限的任务。"
+        settings = self.db.get_settings()
+        margin = float(settings.get("quick_buy_price_margin") or 0.10)
+        max_price = round(price_val * (1.0 + max(0.0, margin)), 2)
         task = self.db.create_task(
             {
                 "name": f"[TG一键] {plan_code}@{dc.upper()}",
@@ -1351,6 +1414,9 @@ class SniperEngine:
                 "plan_code": plan_code,
                 "datacenters": [dc],
                 "options": meta.get("options") or [],
+                "max_price": max_price,
+                "price_includes_tax": False,
+                "max_orders": 1,
                 "poll_interval": 2,
                 "priority": 100,
                 "mode": "buy",
@@ -1359,4 +1425,4 @@ class SniperEngine:
             }
         )
         self._spawn_immediate_tick()
-        return f"🚀 已创建高优先级抢购任务 #{task['id']}: {plan_code}@{dc.upper()}，正在立即尝试下单!"
+        return f"🚀 已创建高优先级抢购任务 #{task['id']}: {plan_code}@{dc.upper()}（不含税上限 {max_price}），正在立即尝试下单!"

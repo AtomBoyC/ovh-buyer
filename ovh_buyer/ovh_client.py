@@ -192,6 +192,7 @@ class OVHClient:
         full_url: str,
         headers: Optional[Dict[str, str]] = None,
         body_bytes: Optional[bytes] = None,
+        allow_resend: bool = True,
     ) -> Any:
         req_headers = {
             "Accept": "application/json",
@@ -204,7 +205,7 @@ class OVHClient:
 
         if self.proxy_url:
             return self._request_via_urllib(method, full_url, req_headers, body_bytes)
-        return self._request_via_pool(method, full_url, req_headers, body_bytes)
+        return self._request_via_pool(method, full_url, req_headers, body_bytes, allow_resend=allow_resend)
 
     def _request_via_urllib(
         self,
@@ -233,6 +234,7 @@ class OVHClient:
         full_url: str,
         headers: Dict[str, str],
         body_bytes: Optional[bytes],
+        allow_resend: bool = True,
     ) -> Any:
         parsed = urllib.parse.urlsplit(full_url)
         scheme = parsed.scheme.lower()
@@ -242,9 +244,11 @@ class OVHClient:
         if parsed.query:
             path_with_query += "?" + parsed.query
 
-        # Try once on a pooled connection; if stale keep-alive socket drops, retry on a fresh socket
+        # Try once on a pooled connection; if stale keep-alive socket drops, retry on a fresh socket.
+        # Non-idempotent requests (e.g. checkout) are NEVER re-sent: the server may already have processed them.
         last_exc: Optional[Exception] = None
-        for attempt in range(2):
+        max_attempts = 2 if allow_resend else 1
+        for attempt in range(max_attempts):
             conn = _GLOBAL_POOL.acquire(scheme, host, port, self.timeout)
             try:
                 conn.request(method, path_with_query, body=body_bytes, headers=headers)
@@ -266,7 +270,7 @@ class OVHClient:
                 except Exception:
                     pass
                 last_exc = exc
-                if attempt == 0:
+                if attempt + 1 < max_attempts:
                     continue
                 raise OVHAPIError(f"连接重置: {exc}", status_code=0) from exc
             except OVHAPIError:
@@ -342,6 +346,12 @@ class OVHClient:
         if need_auth and not self.is_authenticated:
             raise OVHAuthError("未配置 OVH API 凭据 (App Key / App Secret / Consumer Key)", status_code=401)
 
+        # Money-moving POSTs (checkout / pay) must never be re-sent after an ambiguous transport error or 5xx:
+        # the server may already have created the order. Only definite rejections (429, clock-skew 400) are retried.
+        non_idempotent = method_u == "POST" and (
+            path.rstrip("/").endswith("/checkout") or "/payWithRegisteredPaymentMean" in path or path.rstrip("/").endswith("/pay")
+        )
+
         resynced_clock = False
         for attempt in range(self.max_retries):
             self.rate_limiter.acquire()
@@ -363,7 +373,9 @@ class OVHClient:
                 headers["X-Ovh-Application"] = self.app_key
 
             try:
-                return self._raw_request(method_u, full_url, headers=headers, body_bytes=body_bytes)
+                return self._raw_request(
+                    method_u, full_url, headers=headers, body_bytes=body_bytes, allow_resend=not non_idempotent
+                )
             except OVHRateLimitError as exc:
                 self.failed_requests += 1
                 if attempt + 1 >= self.max_retries:
@@ -382,8 +394,12 @@ class OVHClient:
                     resynced_clock = True
                     self._get_time_delta(force=True)
                     continue
-                # Retry transient transport errors & 5xx
-                if exc.status_code in (0, 500, 502, 503, 504) and attempt + 1 < self.max_retries:
+                # Retry transient transport errors & 5xx (idempotent requests only!)
+                if (
+                    not non_idempotent
+                    and exc.status_code in (0, 500, 502, 503, 504)
+                    and attempt + 1 < self.max_retries
+                ):
                     delay = min(10.0, (2 ** attempt) * 0.8 + random.uniform(0.1, 0.5))
                     time.sleep(delay)
                     continue

@@ -3,28 +3,75 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
   <title>OVH Sniper · 黑五抢购控制台</title>
+  <script>
+    /* Theme: "system" (default) | "light" | "dark". Runs before first paint to avoid flash. */
+    (function () {
+      var k = "ovhsniper.theme", m = window.matchMedia("(prefers-color-scheme: dark)"), d = document.documentElement;
+      function pref() { try { return localStorage.getItem(k) || "system"; } catch (e) { return "system"; } }
+      function apply() { var p = pref(); d.dataset.theme = p === "system" ? (m.matches ? "dark" : "light") : p; d.dataset.themePref = p; }
+      apply();
+      window.__theme = { pref: pref, apply: apply, set: function (p) { try { p === "system" ? localStorage.removeItem(k) : localStorage.setItem(k, p); } catch (e) {} apply(); } };
+      m.addEventListener ? m.addEventListener("change", apply) : m.addListener(apply);
+    })();
+  </script>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+  <!-- Icon sprite (Lucide-style strokes, ISC) -->
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-logo" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></symbol>
+    <symbol id="i-dash" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></symbol>
+    <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></symbol>
+    <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+    <symbol id="i-radar" viewBox="0 0 24 24"><path d="M19.07 4.93A10 10 0 1 0 22 12"/><path d="M16.24 7.76A6 6 0 1 0 18 12"/><circle cx="12" cy="12" r="2"/><path d="m13.4 10.6 5.67-5.67"/></symbol>
+    <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></symbol>
+    <symbol id="i-receipt" viewBox="0 0 24 24"><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M16 8h-8M16 12h-8M13 16H8"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-cart" viewBox="0 0 24 24"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  </svg>
+
   <!-- Login Overlay -->
   <div id="login-overlay" class="overlay hidden">
-    <div class="modal modal-sm">
-      <div class="brand-lockup" style="margin-bottom:16px">
-        <span class="brand-icon">🎯</span>
-        <div>
-          <h2>OVH Sniper</h2>
-          <p class="muted">请输入面板访问密码</p>
-        </div>
+    <div class="login-box">
+      <div class="login-hero">
+        <div class="brand-icon"><svg class="ic"><use href="#i-logo"/></svg></div>
+        <h2>登录 OVH Sniper</h2>
+        <p>请输入面板访问密码以继续</p>
       </div>
-      <form id="login-form">
-        <div class="field">
-          <label>访问密码 / API Key</label>
-          <input type="password" id="login-password" placeholder="输入 PANEL_PASSWORD" required autocomplete="current-password" />
-        </div>
-        <div id="login-error" class="error-text hidden"></div>
-        <button type="submit" class="btn btn-primary btn-block">解锁控制台</button>
-      </form>
+      <div class="card">
+        <form id="login-form">
+          <div class="field">
+            <label for="login-password">访问密码 / API Key</label>
+            <input type="password" id="login-password" placeholder="输入 PANEL_PASSWORD" required autocomplete="current-password" />
+          </div>
+          <div id="login-error" class="error-text hidden"></div>
+          <button type="submit" class="btn btn-primary btn-block">解锁控制台</button>
+        </form>
+      </div>
     </div>
   </div>
 
@@ -32,23 +79,25 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand-lockup">
-        <span class="brand-icon">⚡</span>
+        <span class="brand-icon"><svg class="ic"><use href="#i-logo"/></svg></span>
         <div>
-          <div class="brand-title">OVH Sniper</div>
-          <div class="brand-sub">v2.0 · Black Friday Edition</div>
+          <div class="brand-title">OVH Sniper <em>v2</em></div>
+          <div class="brand-sub">黑五独服抢购控制台</div>
         </div>
       </div>
 
       <nav class="nav">
-        <button class="nav-item active" data-tab="dashboard">📊 总览仪表盘</button>
-        <button class="nav-item" data-tab="catalog">🗂️ 目录与查货</button>
-        <button class="nav-item" data-tab="tasks">🎯 抢购任务 <span class="badge" id="nav-tasks-badge">0</span></button>
-        <button class="nav-item" data-tab="radar">📡 黑五雷达</button>
-        <button class="nav-item" data-tab="vps">🖥️ VPS 监控</button>
-        <button class="nav-item" data-tab="orders">🧾 订单与历史</button>
-        <button class="nav-item" data-tab="accounts">🔑 多账号管理</button>
-        <button class="nav-item" data-tab="settings">⚙️ 通知与设置</button>
-        <button class="nav-item" data-tab="logs">📜 实时日志</button>
+        <button class="nav-item active" data-tab="dashboard"><svg class="ic"><use href="#i-dash"/></svg><span class="grow">总览</span></button>
+        <button class="nav-item" data-tab="catalog"><svg class="ic"><use href="#i-db"/></svg><span class="grow">目录与查货</span></button>
+        <button class="nav-item" data-tab="tasks"><svg class="ic"><use href="#i-target"/></svg><span class="grow">抢购任务</span><span class="badge" id="nav-tasks-badge">0</span></button>
+        <button class="nav-item" data-tab="orders"><svg class="ic"><use href="#i-receipt"/></svg><span class="grow">订单与交付</span></button>
+        <div class="nav-label">监控</div>
+        <button class="nav-item" data-tab="radar"><svg class="ic"><use href="#i-radar"/></svg><span class="grow">黑五雷达</span></button>
+        <button class="nav-item" data-tab="vps"><svg class="ic"><use href="#i-cloud"/></svg><span class="grow">VPS 监控</span></button>
+        <div class="nav-label">配置</div>
+        <button class="nav-item" data-tab="accounts"><svg class="ic"><use href="#i-key"/></svg><span class="grow">OVH 账号</span></button>
+        <button class="nav-item" data-tab="settings"><svg class="ic"><use href="#i-bell"/></svg><span class="grow">通知与设置</span></button>
+        <button class="nav-item" data-tab="logs"><svg class="ic"><use href="#i-terminal"/></svg><span class="grow">运行日志</span></button>
       </nav>
 
       <div class="sidebar-footer">
@@ -56,31 +105,32 @@
           <span class="dot"></span>
           <span id="sidebar-engine-text">引擎连接中...</span>
         </div>
-        <button id="btn-logout" class="btn btn-ghost btn-sm hidden" style="width:100%;margin-top:8px">退出登录</button>
+        <div class="sidebar-tools">
+          <div class="theme" role="group" aria-label="外观">
+            <button type="button" data-theme-set="system" title="跟随系统" aria-label="跟随系统"><svg class="ic"><use href="#i-monitor"/></svg></button>
+            <button type="button" data-theme-set="light" title="浅色" aria-label="浅色"><svg class="ic"><use href="#i-sun"/></svg></button>
+            <button type="button" data-theme-set="dark" title="深色" aria-label="深色"><svg class="ic"><use href="#i-moon"/></svg></button>
+          </div>
+          <button id="btn-logout" class="icon-btn hidden" title="退出登录" aria-label="退出登录"><svg class="ic"><use href="#i-logout"/></svg></button>
+          <span class="version-tag" id="version-tag">v2.0</span>
+        </div>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <h1 id="page-title">总览仪表盘</h1>
+        <div>
+          <h1 id="page-title">总览</h1>
+          <div class="page-sub" id="page-sub">引擎状态、实时库存与最近订单一览</div>
+        </div>
         <div class="topbar-actions">
-          <label class="switch-chip" title="全局抢购队列开关">
-            <input type="checkbox" id="toggle-sniper" />
-            <span>抢购引擎</span>
-          </label>
-          <label class="switch-chip" title="预建购物车快速通道（提前建车，有货 1 次请求秒结账）">
-            <input type="checkbox" id="toggle-fastlane" />
-            <span>⚡ 快速通道</span>
-          </label>
-          <label class="switch-chip" title="黑五新品与配置雷达开关">
-            <input type="checkbox" id="toggle-radar" />
-            <span>黑五雷达</span>
-          </label>
-          <label class="switch-chip" title="VPS 补货监控开关">
-            <input type="checkbox" id="toggle-vps" />
-            <span>VPS 监控</span>
-          </label>
-          <button class="btn btn-primary btn-sm" id="btn-quick-new-task">+ 新建抢购任务</button>
+          <div class="toggles">
+            <label class="toggle" title="全局抢购队列开关"><input type="checkbox" id="toggle-sniper" class="vh" /><span class="tr"></span>抢购引擎</label>
+            <label class="toggle" title="预建购物车快速通道（提前建车，有货 1 次请求秒结账）"><input type="checkbox" id="toggle-fastlane" class="vh" /><span class="tr"></span>快速通道</label>
+            <label class="toggle" title="黑五新品与配置雷达开关"><input type="checkbox" id="toggle-radar" class="vh" /><span class="tr"></span>雷达</label>
+            <label class="toggle" title="VPS 补货监控开关"><input type="checkbox" id="toggle-vps" class="vh" /><span class="tr"></span>VPS</label>
+          </div>
+          <button class="btn btn-primary" id="btn-quick-new-task"><svg class="ic"><use href="#i-plus"/></svg>新建任务</button>
         </div>
       </header>
 
@@ -88,22 +138,22 @@
       <section id="tab-dashboard" class="tab-panel active">
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-label">运行中抢购任务</div>
+            <div class="kpi-label"><svg class="ic"><use href="#i-target"/></svg>运行中任务</div>
             <div class="kpi-value accent" id="kpi-running">0</div>
             <div class="kpi-sub" id="kpi-tasks-sub">总计 0 个任务</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">累计成功抢购</div>
+            <div class="kpi-label"><svg class="ic"><use href="#i-check"/></svg>成功抢购</div>
             <div class="kpi-value success" id="kpi-orders">0</div>
             <div class="kpi-sub" id="kpi-dryrun-sub">演练通过 0 次</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">库存轮询 / 命中</div>
+            <div class="kpi-label"><svg class="ic"><use href="#i-activity"/></svg>库存轮询 / 命中</div>
             <div class="kpi-value" id="kpi-polls">0 / 0</div>
             <div class="kpi-sub" id="kpi-uptime-sub">运行时间 0m</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">已配置账号 / 雷达</div>
+            <div class="kpi-label"><svg class="ic"><use href="#i-users"/></svg>账号 / 雷达规则</div>
             <div class="kpi-value" id="kpi-accounts">0 / 0</div>
             <div class="kpi-sub" id="kpi-vps-sub">VPS 监控 0 个</div>
           </div>
@@ -111,17 +161,17 @@
 
         <div class="card">
           <div class="card-header">
-            <h3>⚡ 秒查任意型号实时库存</h3>
-            <span class="muted">无需 API Key 即可查询 OVH 公开库存</span>
+            <h3><svg class="ic"><use href="#i-search"/></svg>秒查任意型号实时库存</h3>
+            <span class="muted">公开接口，无需 API Key</span>
           </div>
           <form id="quick-check-form" class="inline-form">
-            <input type="text" id="quick-check-code" placeholder="输入 planCode，如 25skleb01 / 24ska01 / 24rise01" required />
+            <input type="text" id="quick-check-code" placeholder="输入 planCode，如 26skleb01 / 27skle01-v1 / 24rise01" required />
             <select id="quick-check-endpoint">
               <option value="ovh-eu">OVH EU (欧洲)</option>
               <option value="ovh-ca">OVH CA (加拿大/亚太)</option>
               <option value="ovh-us">OVH US (美国)</option>
             </select>
-            <button type="submit" class="btn btn-primary">立即查货</button>
+            <button type="submit" class="btn btn-primary">查询库存</button>
           </form>
           <div id="quick-check-result" class="mt-12"></div>
         </div>
@@ -129,15 +179,15 @@
         <div class="two-col">
           <div class="card">
             <div class="card-header">
-              <h3>🎯 活跃抢购任务</h3>
-              <button class="btn btn-ghost btn-sm" onclick="switchTab('tasks')">全部管理 →</button>
+              <h3><svg class="ic"><use href="#i-target"/></svg>活跃任务</h3>
+              <button class="btn btn-sm" onclick="switchTab('tasks')">全部任务</button>
             </div>
             <div id="dash-tasks-list" class="list-stack"></div>
           </div>
           <div class="card">
             <div class="card-header">
-              <h3>🧾 最近订单记录</h3>
-              <button class="btn btn-ghost btn-sm" onclick="switchTab('orders')">查看全部 →</button>
+              <h3><svg class="ic"><use href="#i-receipt"/></svg>最近订单</h3>
+              <button class="btn btn-sm" onclick="switchTab('orders')">全部订单</button>
             </div>
             <div id="dash-orders-list" class="list-stack"></div>
           </div>
@@ -148,7 +198,7 @@
       <section id="tab-catalog" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>🗂️ OVH 官方商品目录浏览器</h3>
+            <h3><svg class="ic"><use href="#i-db"/></svg>OVH 官方商品目录</h3>
             <div class="toolbar">
               <select id="cat-endpoint">
                 <option value="ovh-eu">ovh-eu</option>
@@ -156,33 +206,33 @@
                 <option value="ovh-us">ovh-us</option>
               </select>
               <select id="cat-subsidiary">
-                <option value="IE">IE (爱尔兰/免税热门)</option>
-                <option value="FR">FR (法国)</option>
-                <option value="DE">DE (德国)</option>
-                <option value="GB">GB (英国)</option>
-                <option value="CA">CA (加拿大)</option>
-                <option value="SG">SG (新加坡)</option>
-                <option value="US">US (美国)</option>
+                <option value="IE">IE · 爱尔兰</option>
+                <option value="FR">FR · 法国</option>
+                <option value="DE">DE · 德国</option>
+                <option value="GB">GB · 英国</option>
+                <option value="CA">CA · 加拿大</option>
+                <option value="SG">SG · 新加坡</option>
+                <option value="US">US · 美国</option>
               </select>
               <select id="cat-product">
-                <option value="eco">Eco (Kimsufi / SYS / Rise)</option>
-                <option value="baremetal">Baremetal (Advance / Game / Storage)</option>
+                <option value="eco">Eco (KS / SYS / Rise)</option>
+                <option value="baremetal">Baremetal (Advance / Game)</option>
               </select>
-              <input type="text" id="cat-search" placeholder="筛选关键字，如 skle / ks / nvme / rise" />
+              <input type="text" id="cat-search" placeholder="筛选：skle / ks / nvme / rise" />
               <button class="btn btn-primary btn-sm" id="btn-load-catalog">查询目录</button>
-              <button class="btn btn-ghost btn-sm" id="btn-refresh-catalog">强制刷新</button>
+              <button class="btn btn-sm" id="btn-refresh-catalog" title="忽略缓存强制刷新"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
             </div>
           </div>
-          <div id="catalog-meta" class="muted mb-8">点击“查询目录”实时拉取 OVH 商品目录与基础月付价格</div>
+          <div id="catalog-meta" class="muted mb-12">点击「查询目录」实时拉取 OVH 商品目录与基础月付价格（含人民币估价）</div>
           <div class="table-wrap">
             <table class="table">
               <thead>
                 <tr>
-                  <th>Plan Code / 名称</th>
+                  <th>型号</th>
                   <th>CPU</th>
                   <th>默认内存 / 存储</th>
-                  <th>参考价 (不含税)</th>
-                  <th>操作</th>
+                  <th>参考价（不含税）</th>
+                  <th style="text-align:right">操作</th>
                 </tr>
               </thead>
               <tbody id="catalog-tbody">
@@ -197,21 +247,19 @@
       <section id="tab-tasks" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>🎯 抢购任务队列</h3>
-            <div class="toolbar">
-              <button class="btn btn-primary btn-sm" id="btn-open-task-modal">+ 新建任务</button>
-            </div>
+            <h3><svg class="ic"><use href="#i-target"/></svg>抢购任务队列</h3>
+            <button class="btn btn-primary btn-sm" id="btn-open-task-modal"><svg class="ic"><use href="#i-plus"/></svg>新建任务</button>
           </div>
           <div class="table-wrap">
             <table class="table">
               <thead>
                 <tr>
                   <th>任务 / 型号</th>
-                  <th>机房 / 硬件过滤</th>
-                  <th>策略 / 价格上限</th>
-                  <th>进度 / 状态</th>
-                  <th>最近检测结果</th>
-                  <th>操作</th>
+                  <th>机房 / 硬件</th>
+                  <th>策略</th>
+                  <th>状态</th>
+                  <th>最近检测</th>
+                  <th style="text-align:right">操作</th>
                 </tr>
               </thead>
               <tbody id="tasks-tbody"></tbody>
@@ -224,25 +272,25 @@
       <section id="tab-radar" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>📡 黑五新品 & 配置指纹雷达</h3>
+            <h3><svg class="ic"><use href="#i-radar"/></svg>黑五新品 &amp; 配置指纹雷达</h3>
             <div class="toolbar">
-              <button class="btn btn-ghost btn-sm" id="btn-radar-scan">立即扫描一次</button>
-              <button class="btn btn-primary btn-sm" id="btn-open-radar-modal">+ 新建雷达规则</button>
+              <button class="btn btn-sm" id="btn-radar-scan"><svg class="ic"><use href="#i-refresh"/></svg>立即扫描</button>
+              <button class="btn btn-primary btn-sm" id="btn-open-radar-modal"><svg class="ic"><use href="#i-plus"/></svg>新建规则</button>
             </div>
           </div>
-          <p class="muted mb-12">
-            <b>新品上新雷达</b>：监控 OVH Eco 目录，黑五瞬间上线新 planCode（如 <code>26skle*</code> / <code>bf</code>）立即告警并可自动入队抢购。<br/>
-            <b>配置指纹狙击</b>：绑定目标内存/硬盘规格（如 <code>&gt;=32g</code> + <code>nvme</code>），自动发现所有匹配型号并狙击。
+          <p class="card-desc">
+            <b>新品雷达</b>：监控 Eco 目录，黑五上线新 planCode（如 <code>26skle*</code> / <code>bf</code>）立即告警并可自动入队。
+            <b>配置指纹</b>：按内存 / 硬盘规格（如 <code>&gt;=32g</code> + <code>nvme</code>）跨型号自动发现并狙击。
           </p>
           <div class="table-wrap">
             <table class="table">
               <thead>
                 <tr>
-                  <th>规则名称 / 类型</th>
+                  <th>规则 / 类型</th>
                   <th>区域 / 匹配条件</th>
-                  <th>预算 / 自动抢购</th>
-                  <th>基线 / 已命中</th>
-                  <th>操作</th>
+                  <th>预算 / 动作</th>
+                  <th>基线 / 命中</th>
+                  <th style="text-align:right">操作</th>
                 </tr>
               </thead>
               <tbody id="radar-tbody"></tbody>
@@ -255,10 +303,10 @@
       <section id="tab-vps" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>🖥️ OVH VPS 补货监控</h3>
+            <h3><svg class="ic"><use href="#i-cloud"/></svg>OVH VPS 补货监控</h3>
             <div class="toolbar">
-              <button class="btn btn-ghost btn-sm" id="btn-vps-scan">立即刷新全部</button>
-              <button class="btn btn-primary btn-sm" id="btn-open-vps-modal">+ 添加 VPS 监控</button>
+              <button class="btn btn-sm" id="btn-vps-scan"><svg class="ic"><use href="#i-refresh"/></svg>刷新全部</button>
+              <button class="btn btn-primary btn-sm" id="btn-open-vps-modal"><svg class="ic"><use href="#i-plus"/></svg>添加监控</button>
             </div>
           </div>
           <div id="vps-list" class="list-stack"></div>
@@ -269,12 +317,12 @@
       <section id="tab-orders" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>🔗 @ovheco 短链一键解析 &amp; 实时报价下单</h3>
-            <span class="muted">本地解码 /o/&lt;region&gt;/&lt;token&gt;，先建车报含税价再由你二次确认（默认仅生成未付款单）</span>
+            <h3><svg class="ic"><use href="#i-link"/></svg>@ovheco 短链下单</h3>
+            <span class="muted">本地解码 /o/&lt;region&gt;/&lt;token&gt; → 建车实时报价 → 二次确认生成未付款订单</span>
           </div>
           <form id="short-link-form" class="inline-form">
-            <input type="text" id="short-link-url" placeholder="粘贴 @ovheco 频道短链，例如 https://.../o/e/eJx..." required />
-            <select id="short-link-account" style="width:auto;min-width:170px"></select>
+            <input type="text" id="short-link-url" placeholder="粘贴补货短链，例如 https://…/o/e/eJx…" required />
+            <select id="short-link-account"></select>
             <button type="submit" class="btn btn-primary" id="btn-short-link-preview">解析并报价</button>
           </form>
           <div id="short-link-preview" class="short-preview-box hidden"></div>
@@ -282,11 +330,11 @@
 
         <div class="card">
           <div class="card-header">
-            <h3>🧾 抢购与演练订单历史（含交付与中奖跟踪）</h3>
+            <h3><svg class="ic"><use href="#i-receipt"/></svg>订单历史 · 交付与中奖跟踪</h3>
             <div class="toolbar">
-              <button class="btn btn-ghost btn-sm" id="btn-fetch-my-servers">🖥️ 我的独服列表</button>
-              <button class="btn btn-ghost btn-sm" id="btn-fetch-ovh-orders">同步官方账号最近订单</button>
-              <button class="btn btn-danger btn-sm" id="btn-clear-orders">清空本地记录</button>
+              <button class="btn btn-sm" id="btn-fetch-my-servers"><svg class="ic"><use href="#i-server"/></svg>我的独服</button>
+              <button class="btn btn-sm" id="btn-fetch-ovh-orders"><svg class="ic"><use href="#i-refresh"/></svg>同步官方订单</button>
+              <button class="btn btn-danger btn-sm" id="btn-clear-orders"><svg class="ic"><use href="#i-trash"/></svg>清空记录</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -296,9 +344,9 @@
                   <th>时间</th>
                   <th>型号 / 机房</th>
                   <th>账号</th>
-                  <th>状态 / 交付与中奖</th>
-                  <th>价格 (不含税 / 含税)</th>
-                  <th>订单号 / 操作</th>
+                  <th>状态 / 交付</th>
+                  <th>价格（不含税 / 含税）</th>
+                  <th style="text-align:right">订单 / 操作</th>
                 </tr>
               </thead>
               <tbody id="orders-tbody"></tbody>
@@ -307,15 +355,15 @@
         </div>
         <div id="my-servers-card" class="card hidden">
           <div class="card-header">
-            <h3>🖥️ 我的 OVH 独立服务器 (/dedicated/server)</h3>
-            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('my-servers-card').classList.add('hidden')">关闭</button>
+            <h3><svg class="ic"><use href="#i-server"/></svg>我的 OVH 独立服务器</h3>
+            <button class="icon-btn" title="关闭" onclick="document.getElementById('my-servers-card').classList.add('hidden')"><svg class="ic"><use href="#i-x"/></svg></button>
           </div>
           <div id="my-servers-list" class="list-stack"></div>
         </div>
         <div id="ovh-official-orders-card" class="card hidden">
           <div class="card-header">
-            <h3>🏛️ OVH 官方账号近期订单 (/me/order)</h3>
-            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('ovh-official-orders-card').classList.add('hidden')">关闭</button>
+            <h3><svg class="ic"><use href="#i-receipt"/></svg>OVH 官方近期订单（/me/order）</h3>
+            <button class="icon-btn" title="关闭" onclick="document.getElementById('ovh-official-orders-card').classList.add('hidden')"><svg class="ic"><use href="#i-x"/></svg></button>
           </div>
           <div id="ovh-official-orders-list" class="list-stack"></div>
         </div>
@@ -325,28 +373,29 @@
       <section id="tab-accounts" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>🔑 OVH 多账号 API 凭据管理</h3>
-            <button class="btn btn-primary btn-sm" id="btn-open-account-modal">+ 添加 OVH 账号</button>
+            <h3><svg class="ic"><use href="#i-key"/></svg>OVH 账号与 API 凭据</h3>
+            <button class="btn btn-primary btn-sm" id="btn-open-account-modal"><svg class="ic"><use href="#i-plus"/></svg>添加 OVH 账号</button>
           </div>
           <div class="info-banner mb-12">
-            <b>🛡️ 最小权限快速申请 API Token（已预填安全权限：仅允许账号只读、购物车下单、独服配置只读，绝不申请删机/重启权限）：</b>
-            <div class="mt-6" id="accounts-token-links">
-              <a id="token-link-eu" href="https://eu.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇪🇺 OVH EU 最小权限一键申请 ↗</a>
-              &nbsp;|&nbsp;
-              <a id="token-link-ca" href="https://ca.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇨🇦 OVH CA/亚太 最小权限一键申请 ↗</a>
-              &nbsp;|&nbsp;
-              <a id="token-link-us" href="https://api.us.ovhcloud.com/createToken/" target="_blank" rel="noreferrer">🇺🇸 OVH US 最小权限一键申请 ↗</a>
+            <svg class="ic"><use href="#i-shield"/></svg>
+            <div>
+              <b>最小权限一键申请 Token</b>：已预填安全权限（账号只读、购物车下单、独服配置只读），不会申请删机 / 重装 / 重启等危险权限。
+              <div class="ep-links" id="accounts-token-links">
+                <a id="token-link-eu" href="https://eu.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇪🇺 OVH EU</a>
+                <a id="token-link-ca" href="https://ca.api.ovh.com/createToken/" target="_blank" rel="noreferrer">🇨🇦 OVH CA / 亚太</a>
+                <a id="token-link-us" href="https://api.us.ovhcloud.com/createToken/" target="_blank" rel="noreferrer">🇺🇸 OVH US</a>
+              </div>
             </div>
           </div>
           <div class="table-wrap">
             <table class="table">
               <thead>
                 <tr>
-                  <th>账号名称</th>
+                  <th>账号</th>
                   <th>区域 / 子公司</th>
                   <th>App Key</th>
                   <th>验证信息</th>
-                  <th>操作</th>
+                  <th style="text-align:right">操作</th>
                 </tr>
               </thead>
               <tbody id="accounts-tbody"></tbody>
@@ -360,51 +409,60 @@
         <form id="settings-form" class="two-col">
           <div class="card">
             <div class="card-header">
-              <h3>📣 通知渠道配置</h3>
-              <button type="button" class="btn btn-primary btn-sm" id="btn-test-notify">发送测试通知</button>
+              <h3><svg class="ic"><use href="#i-send"/></svg>通知渠道</h3>
+              <button type="button" class="btn btn-sm" id="btn-test-notify">发送测试通知</button>
             </div>
+            <div class="form-section">Telegram（零域名 Long Polling）</div>
             <div class="field">
-              <label>Telegram Bot Token（支持零域名 Long Polling 交互按钮！）</label>
+              <label>Bot Token</label>
               <input type="text" name="telegram_bot_token" placeholder="123456:ABC-DEF..." />
             </div>
-            <div class="field">
-              <label>Telegram Chat ID（多个用英文逗号分隔）</label>
-              <input type="text" name="telegram_chat_id" placeholder="123456789" />
+            <div class="form-row">
+              <div class="field">
+                <label>Chat ID（逗号分隔多个）</label>
+                <input type="text" name="telegram_chat_id" placeholder="123456789" />
+              </div>
+              <div class="field">
+                <label>专用代理（可选）</label>
+                <input type="text" name="telegram_proxy" placeholder="http://127.0.0.1:7890" />
+              </div>
             </div>
             <div class="field checkbox-row">
-              <label><input type="checkbox" name="telegram_polling_enabled" /> 启用 Telegram Bot 交互指令 &amp; 一键下单按钮（无需公网 HTTPS 域名）</label>
+              <label><input type="checkbox" name="telegram_polling_enabled" /><span><b>启用 Bot 交互指令与一键下单按钮</b><small>无需公网 HTTPS 域名，支持 /status /check /order /servers 等</small></span></label>
+            </div>
+            <div class="form-section">其他渠道</div>
+            <div class="form-row">
+              <div class="field">
+                <label>Bark URL（iOS）</label>
+                <input type="text" name="bark_url" placeholder="https://api.day.app/KEY" />
+              </div>
+              <div class="field">
+                <label>Server酱 SendKey</label>
+                <input type="text" name="serverchan_key" placeholder="SCT..." />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="field">
+                <label>钉钉 Webhook</label>
+                <input type="text" name="dingtalk_webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+              </div>
+              <div class="field">
+                <label>钉钉加签 Secret</label>
+                <input type="text" name="dingtalk_secret" placeholder="SEC..." />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="field">
+                <label>飞书 Webhook</label>
+                <input type="text" name="feishu_webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+              </div>
+              <div class="field">
+                <label>Discord Webhook</label>
+                <input type="text" name="discord_webhook" placeholder="https://discord.com/api/webhooks/..." />
+              </div>
             </div>
             <div class="field">
-              <label>Telegram 专用代理（可选，留空则沿用全局 HTTP 代理）</label>
-              <input type="text" name="telegram_proxy" placeholder="http://127.0.0.1:7890" />
-            </div>
-            <hr class="sep" />
-            <div class="field">
-              <label>Bark 推送 URL（iOS 强提醒）</label>
-              <input type="text" name="bark_url" placeholder="https://api.day.app/YOUR_KEY" />
-            </div>
-            <div class="field">
-              <label>Server酱 SendKey</label>
-              <input type="text" name="serverchan_key" placeholder="SCT..." />
-            </div>
-            <div class="field">
-              <label>钉钉机器人 Webhook</label>
-              <input type="text" name="dingtalk_webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
-            </div>
-            <div class="field">
-              <label>钉钉加签 Secret（可选）</label>
-              <input type="text" name="dingtalk_secret" placeholder="SEC..." />
-            </div>
-            <div class="field">
-              <label>飞书机器人 Webhook</label>
-              <input type="text" name="feishu_webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
-            </div>
-            <div class="field">
-              <label>Discord Webhook</label>
-              <input type="text" name="discord_webhook" placeholder="https://discord.com/api/webhooks/..." />
-            </div>
-            <div class="field">
-              <label>自定义 Webhook URL (POST JSON)</label>
+              <label>自定义 Webhook（POST JSON）</label>
               <input type="text" name="custom_webhook_url" placeholder="https://..." />
             </div>
           </div>
@@ -412,63 +470,67 @@
           <div class="stack">
             <div class="card">
               <div class="card-header">
-                <h3>⚙️ 引擎限流与网络</h3>
+                <h3><svg class="ic"><use href="#i-zap"/></svg>引擎与网络</h3>
               </div>
               <div class="form-row">
                 <div class="field">
-                  <label>全局限流 (QPS，推荐 3~5)</label>
+                  <label>全局限流 QPS（推荐 3~5）</label>
                   <input type="number" step="0.5" min="0.5" max="20" name="global_qps" />
                 </div>
                 <div class="field">
-                  <label>默认轮询间隔 (秒)</label>
+                  <label>默认轮询间隔（秒）</label>
                   <input type="number" min="2" max="300" name="default_poll_interval" />
                 </div>
               </div>
               <div class="form-row">
                 <div class="field">
-                  <label>黑五雷达轮询间隔 (秒)</label>
+                  <label>雷达轮询间隔（秒）</label>
                   <input type="number" min="10" max="600" name="radar_poll_interval" />
                 </div>
                 <div class="field">
-                  <label>VPS 监控轮询间隔 (秒)</label>
+                  <label>VPS 轮询间隔（秒）</label>
                   <input type="number" min="5" max="600" name="vps_poll_interval" />
                 </div>
               </div>
-              <div class="field">
-                <label>批量库存查询阈值（同时监控 ≥ N 个型号时合并为 1 次全局请求）</label>
-                <input type="number" min="2" max="20" name="bulk_availability_threshold" />
+              <div class="form-row">
+                <div class="field">
+                  <label>批量查询阈值（≥ N 个型号合并请求）</label>
+                  <input type="number" min="2" max="20" name="bulk_availability_threshold" />
+                </div>
+                <div class="field">
+                  <label>全局 HTTP/HTTPS 代理</label>
+                  <input type="text" name="http_proxy" placeholder="http://127.0.0.1:7890" />
+                </div>
               </div>
-              <div class="field">
-                <label>全局 HTTP/HTTPS 代理（本地挂梯子或中转时填写）</label>
-                <input type="text" name="http_proxy" placeholder="http://127.0.0.1:7890" />
-              </div>
+              <div class="form-section">功能开关</div>
               <div class="field checkbox-row">
-                <label><input type="checkbox" name="fast_lane_enabled" /> ⚡ 启用预建购物车快速通道（为开启快速通道的任务提前建车并自动续期）</label>
-                <label><input type="checkbox" name="tracker_enabled" /> 🎰 启用订单交付与硬件中奖跟踪（自动查询付款/交付状态并比对实机硬件）</label>
-                <label><input type="checkbox" name="edit_sold_out_telegram" /> ✂️ Telegram 补货卡片在售罄后自动划删除线（标记「已被抢完」）</label>
-                <label><input type="checkbox" name="notify_on_stock" /> 发现补货时推送通知</label>
-                <label><input type="checkbox" name="notify_on_order" /> 下单成功/演练完成时推送通知</label>
-                <label><input type="checkbox" name="notify_on_paid" /> 订单付款完成时推送通知</label>
-                <label><input type="checkbox" name="notify_on_delivered" /> 服务器交付 &amp; 硬件中奖检查完成时推送通知</label>
-                <label><input type="checkbox" name="notify_on_error" /> 下单失败时也推送通知</label>
+                <label><input type="checkbox" name="fast_lane_enabled" /><span><b>预建购物车快速通道</b><small>为开启快速通道的任务提前建车并自动续期</small></span></label>
+                <label><input type="checkbox" name="tracker_enabled" /><span><b>订单交付与硬件中奖跟踪</b><small>自动查询付款 / 交付状态并比对实机硬件</small></span></label>
+                <label><input type="checkbox" name="edit_sold_out_telegram" /><span><b>售罄自动划线 Telegram 卡片</b><small>补货卡片在售罄后标记「已被抢完」</small></span></label>
               </div>
-              <button type="submit" class="btn btn-primary btn-block mt-12">保存全部设置</button>
+              <div class="form-section">推送事件</div>
+              <div class="field checkbox-grid">
+                <label><input type="checkbox" name="notify_on_stock" /><span>发现补货</span></label>
+                <label><input type="checkbox" name="notify_on_order" /><span>下单成功 / 演练完成</span></label>
+                <label><input type="checkbox" name="notify_on_paid" /><span>订单已付款</span></label>
+                <label><input type="checkbox" name="notify_on_delivered" /><span>交付 &amp; 中奖</span></label>
+                <label><input type="checkbox" name="notify_on_error" /><span>下单失败</span></label>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block">保存全部设置</button>
             </div>
 
             <div class="card">
               <div class="card-header">
-                <h3>🔒 面板安全与备份</h3>
+                <h3><svg class="ic"><use href="#i-lock"/></svg>面板安全与备份</h3>
               </div>
               <div class="field">
-                <label>设置 / 修改面板登录密码（部署到远程公网服务器强烈建议开启）</label>
+                <label>面板登录密码（部署到公网强烈建议设置）</label>
                 <div class="inline-form">
-                  <input type="password" id="new-panel-password" placeholder="输入新密码（留空可清除数据库密码）" />
-                  <button type="button" class="btn btn-ghost" id="btn-save-password">更新密码</button>
+                  <input type="password" id="new-panel-password" placeholder="输入新密码（留空可清除数据库密码）" autocomplete="new-password" />
+                  <button type="button" class="btn" id="btn-save-password">更新密码</button>
                 </div>
               </div>
-              <div class="mt-12">
-                <button type="button" class="btn btn-ghost btn-sm" id="btn-export-config">📥 导出 JSON 配置备份（脱敏）</button>
-              </div>
+              <button type="button" class="btn btn-sm" id="btn-export-config"><svg class="ic"><use href="#i-download"/></svg>导出 JSON 配置备份（脱敏）</button>
             </div>
           </div>
         </form>
@@ -478,7 +540,7 @@
       <section id="tab-logs" class="tab-panel">
         <div class="card">
           <div class="card-header">
-            <h3>📜 实时运行日志 (SSE)</h3>
+            <h3><svg class="ic"><use href="#i-terminal"/></svg>实时运行日志</h3>
             <div class="toolbar">
               <select id="log-filter-level">
                 <option value="">全部级别</option>
@@ -498,13 +560,15 @@
                 <option value="notify">notify</option>
                 <option value="telegram">telegram</option>
               </select>
-              <label class="switch-chip"><input type="checkbox" id="log-autoscroll" checked /><span>自动滚底</span></label>
-              <button class="btn btn-danger btn-sm" id="btn-clear-logs">清空日志</button>
+              <label class="toggle"><input type="checkbox" id="log-autoscroll" class="vh" checked /><span class="tr"></span>自动滚底</label>
+              <button class="btn btn-danger btn-sm" id="btn-clear-logs"><svg class="ic"><use href="#i-trash"/></svg>清空</button>
             </div>
           </div>
           <div id="log-terminal" class="log-terminal"></div>
         </div>
       </section>
+
+      <div class="foot">OVH Sniper 为非 OVHcloud 官方项目 · 自动下单涉及真实资金，请先使用演练模式与价格封顶充分验证</div>
     </main>
   </div>
 
@@ -513,10 +577,11 @@
     <div class="modal modal-lg">
       <div class="modal-header">
         <h3 id="task-modal-title">新建抢购任务</h3>
-        <button class="icon-btn" onclick="closeModal('task-modal')">✕</button>
+        <button class="icon-btn" onclick="closeModal('task-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <form id="task-form">
         <input type="hidden" name="id" />
+        <div class="form-section">目标</div>
         <div class="form-row">
           <div class="field">
             <label>任务名称</label>
@@ -536,43 +601,44 @@
             </select>
           </div>
           <div class="field">
-            <label>目标型号 (planCode) *</label>
-            <input type="text" name="plan_code" placeholder="如 25skleb01 / 26skleb01 / 24ska01" required />
+            <label>目标型号 planCode *</label>
+            <input type="text" name="plan_code" placeholder="如 26skleb01 / 27skle01-v1 / 24ska01" required />
           </div>
         </div>
         <div class="field">
-          <label>目标机房（点击选择，留空表示监控全部机房，按选择顺序优先下单）</label>
+          <label>目标机房（按点选顺序优先下单，留空 = 全部机房）</label>
           <div id="dc-picker" class="dc-picker"></div>
-          <input type="text" name="datacenters" id="task-dcs-input" placeholder="也可手动输入逗号分隔，如 gra,rbx,fra,bhs" class="mt-6" />
+          <input type="text" name="datacenters" id="task-dcs-input" placeholder="也可手动输入，逗号分隔：gra,rbx,fra,bhs" class="mt-8" />
         </div>
+        <div class="form-section">硬件与价格</div>
         <div class="form-row">
           <div class="field">
-            <label>内存过滤（可选，如 <code>&gt;=32g</code> / <code>64g</code> / <code>ram-32g</code>）</label>
+            <label>内存过滤（如 <code>&gt;=32g</code> / <code>64g</code>）</label>
             <input type="text" name="memory_filter" placeholder="留空匹配任意内存" />
           </div>
           <div class="field">
-            <label>硬盘过滤（可选，如 <code>nvme</code> / <code>2x450nvme</code> / <code>ssd</code>）</label>
+            <label>硬盘过滤（如 <code>nvme</code> / <code>2x450nvme</code>）</label>
             <input type="text" name="storage_filter" placeholder="留空匹配任意存储" />
           </div>
         </div>
         <div class="field">
-          <label>指定硬件选项 Addon Codes（可选，逗号分隔，留空自动按匹配 FQN 推断）</label>
+          <label>指定配件 Addon Codes（可选，逗号分隔，留空按 FQN 自动推断）</label>
           <input type="text" name="options" placeholder="如 ram-32g-ecc-2400-25skle,softraid-2x450nvme-25skle" />
         </div>
         <div class="form-row-3">
           <div class="field">
-            <label>价格封顶上限 (0=不限)</label>
+            <label>价格上限（0 = 不限）</label>
             <input type="number" step="0.01" min="0" name="max_price" value="0" />
           </div>
           <div class="field">
             <label>周期 Duration</label>
             <select name="duration">
-              <option value="auto">auto (自动选择)</option>
-              <option value="P1M">P1M (月付)</option>
-              <option value="P3M">P3M (季付)</option>
-              <option value="P6M">P6M (半年)</option>
-              <option value="P12M">P12M (年付/黑五特惠)</option>
-              <option value="P24M">P24M (两年)</option>
+              <option value="auto">auto（自动）</option>
+              <option value="P1M">P1M 月付</option>
+              <option value="P3M">P3M 季付</option>
+              <option value="P6M">P6M 半年</option>
+              <option value="P12M">P12M 年付</option>
+              <option value="P24M">P24M 两年</option>
             </select>
           </div>
           <div class="field">
@@ -580,12 +646,13 @@
             <input type="text" name="pricing_mode" value="auto" placeholder="auto / default / upfront12" />
           </div>
         </div>
+        <div class="form-section">执行</div>
         <div class="form-row-3">
           <div class="field">
             <label>抢购模式</label>
             <select name="mode">
-              <option value="buy">自动下单 (Buy)</option>
-              <option value="notify_only">仅补货通知 (Notify Only)</option>
+              <option value="buy">自动下单</option>
+              <option value="notify_only">仅补货通知</option>
             </select>
           </div>
           <div class="field">
@@ -593,7 +660,7 @@
             <input type="number" min="1" max="20" name="max_orders" value="1" />
           </div>
           <div class="field">
-            <label>轮询间隔 (秒)</label>
+            <label>轮询间隔（秒）</label>
             <input type="number" min="2" max="300" name="poll_interval" value="5" />
           </div>
         </div>
@@ -603,21 +670,21 @@
             <input type="text" name="os_code" value="none_64.en" />
           </div>
           <div class="field">
-            <label>优惠码 Coupons（可选，逗号分隔）</label>
+            <label>优惠码（可选，逗号分隔）</label>
             <input type="text" name="coupons" placeholder="黑五折扣码（如有）" />
           </div>
         </div>
-        <div class="checkbox-grid mt-8">
-          <label><input type="checkbox" name="fast_lane" /> ⚡ 预建购物车快速通道（提前建车，有货 1 次请求秒结账）</label>
-          <label><input type="checkbox" name="allow_non_default" checked /> 🔧 允许非默认内存/硬盘配置（取消勾选则仅抢默认标配）</label>
-          <label><input type="checkbox" name="dry_run" /> 🧪 演练模式（校验购物车与实时价格但不提交订单）</label>
-          <label><input type="checkbox" name="auto_pay" /> 💳 自动扣款（使用默认支付方式/余额直接支付）</label>
-          <label><input type="checkbox" name="only_instant" /> ⏱️ 仅抢现货（忽略 24H/72H/240H 排队机型）</label>
-          <label><input type="checkbox" name="price_includes_tax" /> 🧾 价格上限按含税价判断（默认按不含税价）</label>
-          <label><input type="checkbox" name="waive_retractation" checked /> 🚀 放弃冷静期（立即开通交付）</label>
+        <div class="checkbox-grid">
+          <label><input type="checkbox" name="dry_run" /><span><b>演练模式</b><small>校验购物车与实时价格，不提交订单</small></span></label>
+          <label><input type="checkbox" name="fast_lane" /><span><b>快速通道</b><small>提前建车，有货 1 次请求秒结账</small></span></label>
+          <label class="danger"><input type="checkbox" name="auto_pay" /><span><b>自动扣款</b><small>使用默认支付方式 / 余额直接支付</small></span></label>
+          <label><input type="checkbox" name="allow_non_default" checked /><span><b>允许非默认配置</b><small>取消则只抢默认标配内存 / 硬盘</small></span></label>
+          <label><input type="checkbox" name="only_instant" /><span><b>仅抢现货</b><small>忽略 24H / 72H / 240H 排队机型</small></span></label>
+          <label><input type="checkbox" name="price_includes_tax" /><span><b>上限按含税价</b><small>默认按不含税价判断</small></span></label>
+          <label><input type="checkbox" name="waive_retractation" checked /><span><b>放弃冷静期</b><small>立即开通交付</small></span></label>
         </div>
         <div class="modal-footer">
-          <button type="button" class="btn btn-ghost" onclick="closeModal('task-modal')">取消</button>
+          <button type="button" class="btn" onclick="closeModal('task-modal')">取消</button>
           <button type="submit" class="btn btn-primary">保存任务</button>
         </div>
       </form>
@@ -629,7 +696,7 @@
     <div class="modal">
       <div class="modal-header">
         <h3 id="account-modal-title">添加 OVH 账号</h3>
-        <button class="icon-btn" onclick="closeModal('account-modal')">✕</button>
+        <button class="icon-btn" onclick="closeModal('account-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <form id="account-form">
         <input type="hidden" name="id" />
@@ -641,9 +708,9 @@
           <div class="field">
             <label>API Endpoint</label>
             <select name="endpoint" id="acc-endpoint-select">
-              <option value="ovh-eu">ovh-eu (欧洲)</option>
-              <option value="ovh-ca">ovh-ca (加拿大/亚太)</option>
-              <option value="ovh-us">ovh-us (美国)</option>
+              <option value="ovh-eu">ovh-eu（欧洲）</option>
+              <option value="ovh-ca">ovh-ca（加拿大/亚太）</option>
+              <option value="ovh-us">ovh-us（美国）</option>
             </select>
           </div>
           <div class="field">
@@ -652,22 +719,22 @@
           </div>
         </div>
         <div class="field">
-          <label>Application Key (AK)</label>
+          <label>Application Key</label>
           <input type="text" name="app_key" required />
         </div>
         <div class="field">
-          <label>Application Secret (AS)</label>
-          <input type="password" name="app_secret" placeholder="编辑时留空则保留原密钥" />
+          <label>Application Secret</label>
+          <input type="password" name="app_secret" placeholder="编辑时留空则保留原密钥" autocomplete="off" />
         </div>
         <div class="field">
-          <label>Consumer Key (CK)</label>
-          <input type="password" name="consumer_key" placeholder="编辑时留空则保留原密钥" />
+          <label>Consumer Key</label>
+          <input type="password" name="consumer_key" placeholder="编辑时留空则保留原密钥" autocomplete="off" />
         </div>
         <div class="field checkbox-row">
-          <label><input type="checkbox" name="is_default" /> 设为默认账号</label>
+          <label><input type="checkbox" name="is_default" /><span>设为默认账号</span></label>
         </div>
         <div class="modal-footer">
-          <button type="button" class="btn btn-ghost" onclick="closeModal('account-modal')">取消</button>
+          <button type="button" class="btn" onclick="closeModal('account-modal')">取消</button>
           <button type="submit" class="btn btn-primary">保存账号</button>
         </div>
       </form>
@@ -678,8 +745,8 @@
   <div id="radar-modal" class="overlay hidden">
     <div class="modal">
       <div class="modal-header">
-        <h3>新建黑五雷达规则</h3>
-        <button class="icon-btn" onclick="closeModal('radar-modal')">✕</button>
+        <h3>新建雷达规则</h3>
+        <button class="icon-btn" onclick="closeModal('radar-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <form id="radar-form">
         <div class="field">
@@ -690,8 +757,8 @@
           <div class="field">
             <label>雷达类型</label>
             <select name="rule_type">
-              <option value="new_sku">新品上新雷达 (New SKU)</option>
-              <option value="config_match">配置指纹狙击 (Config Match)</option>
+              <option value="new_sku">新品上新（New SKU）</option>
+              <option value="config_match">配置指纹（Config Match）</option>
             </select>
           </div>
           <div class="field">
@@ -714,16 +781,16 @@
           </div>
         </div>
         <div class="field">
-          <label>型号/名称正则匹配（留空匹配所有新品，如 <code>26skle|25skle|bf|sysle</code>）</label>
+          <label>型号 / 名称正则（留空匹配所有新品）</label>
           <input type="text" name="keyword_pattern" placeholder="26skle|25skle|bf|le" />
         </div>
         <div class="form-row">
           <div class="field">
-            <label>内存条件（可选，如 <code>&gt;=32g</code>）</label>
+            <label>内存条件（如 <code>&gt;=32g</code>）</label>
             <input type="text" name="memory_pattern" placeholder=">=32g" />
           </div>
           <div class="field">
-            <label>存储条件（可选，如 <code>nvme</code>）</label>
+            <label>存储条件（如 <code>nvme</code>）</label>
             <input type="text" name="storage_pattern" placeholder="nvme" />
           </div>
         </div>
@@ -733,17 +800,17 @@
             <input type="text" name="datacenters" placeholder="gra,rbx,fra" />
           </div>
           <div class="field">
-            <label>最高预算 (0=不限)</label>
+            <label>最高预算（0 = 不限）</label>
             <input type="number" step="0.01" min="0" name="max_price" value="25" />
           </div>
         </div>
-        <div class="checkbox-grid mt-8">
-          <label><input type="checkbox" name="auto_snipe" /> 命中后自动创建抢购任务并立即开抢</label>
-          <label><input type="checkbox" name="dry_run" checked /> 自动创建的任务启用演练模式 (推荐先演练)</label>
-          <label><input type="checkbox" name="auto_pay" /> 自动扣款</label>
+        <div class="checkbox-row">
+          <label><input type="checkbox" name="auto_snipe" /><span><b>命中后自动创建任务并开抢</b></span></label>
+          <label><input type="checkbox" name="dry_run" checked /><span><b>自动任务使用演练模式</b><small>推荐先演练确认</small></span></label>
+          <label class="danger"><input type="checkbox" name="auto_pay" /><span><b>自动扣款</b></span></label>
         </div>
         <div class="modal-footer">
-          <button type="button" class="btn btn-ghost" onclick="closeModal('radar-modal')">取消</button>
+          <button type="button" class="btn" onclick="closeModal('radar-modal')">取消</button>
           <button type="submit" class="btn btn-primary">创建规则</button>
         </div>
       </form>
@@ -755,7 +822,7 @@
     <div class="modal modal-sm">
       <div class="modal-header">
         <h3>添加 VPS 监控</h3>
-        <button class="icon-btn" onclick="closeModal('vps-modal')">✕</button>
+        <button class="icon-btn" onclick="closeModal('vps-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <form id="vps-form">
         <div class="field">
@@ -791,16 +858,16 @@
           <input type="text" name="datacenters" placeholder="GRA,SBG,BHS,SGP" />
         </div>
         <div class="field">
-          <label>下单账号（开启自动下单时使用）</label>
+          <label>下单账号（自动下单时使用）</label>
           <select name="account_id" id="vps-account-select"></select>
         </div>
-        <div class="checkbox-grid mt-8">
-          <label><input type="checkbox" name="auto_order" /> 有货时自动下单</label>
-          <label><input type="checkbox" name="dry_run" checked /> 演练模式</label>
-          <label><input type="checkbox" name="auto_pay" /> 自动扣款</label>
+        <div class="checkbox-row">
+          <label><input type="checkbox" name="auto_order" /><span>有货时自动下单</span></label>
+          <label><input type="checkbox" name="dry_run" checked /><span>演练模式</span></label>
+          <label class="danger"><input type="checkbox" name="auto_pay" /><span>自动扣款</span></label>
         </div>
         <div class="modal-footer">
-          <button type="button" class="btn btn-ghost" onclick="closeModal('vps-modal')">取消</button>
+          <button type="button" class="btn" onclick="closeModal('vps-modal')">取消</button>
           <button type="submit" class="btn btn-primary">添加监控</button>
         </div>
       </form>
@@ -812,7 +879,7 @@
     <div class="modal modal-lg">
       <div class="modal-header">
         <h3 id="avail-modal-title">实时库存详情</h3>
-        <button class="icon-btn" onclick="closeModal('avail-modal')">✕</button>
+        <button class="icon-btn" onclick="closeModal('avail-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <div id="avail-modal-body"></div>
     </div>

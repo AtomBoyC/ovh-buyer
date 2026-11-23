@@ -126,7 +126,10 @@ def render_telegram_stock_card(
         html_text = f"<b>{esc(header)}</b>\n\n" + "\n".join(html_body_lines)
         plain_text = "\n".join(plain_lines)
 
-    return html_text[:4000], plain_text
+    if len(html_text) > 4000:
+        # Never cut through an HTML tag (Telegram would reject the message): fall back to escaped plain text
+        html_text = esc(plain_text[:3900])
+    return html_text, plain_text
 
 
 class Notifier:
@@ -441,6 +444,7 @@ class Notifier:
                     "account_id": account_id,
                     "product_line": product_line,
                     "options": options or [],
+                    "price_val": price_val,
                 }
             )
             row.append({"text": f"🛒 {dc.upper()} API抢购", "callback_data": f"buy:{tok}"})
@@ -577,8 +581,14 @@ class Notifier:
             cq = upd["callback_query"]
             cq_id = cq.get("id", "")
             msg = cq.get("message") or {}
-            chat_id = str((msg.get("chat") or {}).get("id") or "")
+            chat = msg.get("chat") or {}
+            chat_id = str(chat.get("id") or "")
             if chat_id not in allowed_chats:
+                return
+            # In groups, buttons can move real money: the pressing USER must be authorized too
+            from_id = str((cq.get("from") or {}).get("id") or "")
+            if chat.get("type") != "private" and from_id not in allowed_chats:
+                self.db.add_log("WARNING", f"拒绝未授权 Telegram 用户 {from_id} 在群组 {chat_id} 中的按钮操作", "telegram")
                 return
             data_str = str(cq.get("data") or "")
             reply_text = self._dispatch_callback(data_str)
@@ -595,9 +605,13 @@ class Notifier:
             return
 
         msg = upd.get("message") or {}
-        chat_id = str((msg.get("chat") or {}).get("id") or "")
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
         text = str(msg.get("text") or "").strip()
         if not text or chat_id not in allowed_chats:
+            return
+        from_id = str((msg.get("from") or {}).get("id") or "")
+        if chat.get("type") not in (None, "private") and from_id not in allowed_chats:
             return
         if not text.startswith("/"):
             return
@@ -618,9 +632,10 @@ class Notifier:
     def _dispatch_callback(self, data_str: str) -> str:
         if data_str.startswith("buy:"):
             tok = data_str[4:]
-            meta = self.db.kv_get(f"tg_btn:{tok}")
+            # Single-use: consume atomically so double-taps can never create duplicate real-buy tasks
+            meta = self.db.kv_pop(f"tg_btn:{tok}")
             if not meta:
-                return "⚠️ 按钮已过期，请在面板或使用 /check 重新查询。"
+                return "⚠️ 按钮已使用或已过期，请在面板或使用 /check 重新查询。"
             handler = self._bot_handlers.get("quick_buy")
             if handler:
                 try:
