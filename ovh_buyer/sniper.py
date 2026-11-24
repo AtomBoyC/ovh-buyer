@@ -157,7 +157,7 @@ class SniperEngine:
             for t in self._threads:
                 t.start()
             self.notifier.start_telegram_polling()
-            self.db.add_log("INFO", "OVH Sniper v2.0 引擎已启动（含快速通道 & 交付中奖跟踪）", "engine")
+            self.db.add_log("INFO", "OVH Sniper v2.1 引擎已启动（含快速通道 & 交付中奖跟踪）", "engine")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1271,7 +1271,7 @@ class SniperEngine:
         st = self.get_status()
         s = st["stats"]
         return (
-            f"📊 OVH Sniper v2.0 运行状态\n\n"
+            f"📊 OVH Sniper v2.1 运行状态\n\n"
             f"抢购引擎: {'🟢 运行中' if st['sniper_enabled'] else '⏸ 已暂停'}\n"
             f"预建快速通道: {'⚡ 开启' if st['fast_lane_enabled'] else '⚪ 关闭'}\n"
             f"交付/中奖跟踪: {'🎰 开启' if st['tracker_enabled'] else '⚪ 关闭'}\n"

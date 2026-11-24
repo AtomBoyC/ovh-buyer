@@ -662,7 +662,7 @@ class Notifier:
     def _dispatch_command(self, cmd: str, args: List[str]) -> Any:
         if cmd in ("/start", "/help"):
             return (
-                "🎯 OVH Sniper v2.0 Bot\n\n"
+                "🎯 OVH Sniper v2.1 Bot\n\n"
                 "可用命令:\n"
                 "/status - 查看引擎、快速通道与统计状态\n"
                 "/tasks - 查看抢购任务列表\n"

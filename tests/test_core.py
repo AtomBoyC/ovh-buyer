@@ -921,7 +921,7 @@ class TestOVHSniper(unittest.TestCase):
         self.assertIn("<s>", card_sold)
 
         status_reply = self.notifier._dispatch_command("/status", [])
-        self.assertIn("OVH Sniper v2.0 运行状态", status_reply)
+        self.assertIn("OVH Sniper v2.1 运行状态", status_reply)
         check_reply = self.notifier._dispatch_command("/check", ["26skleb01"])
         self.assertIn("GRA(1H-high)", check_reply)
         srv_reply = self.notifier._dispatch_command("/servers", [])
@@ -1052,7 +1052,7 @@ class TestOVHSniper(unittest.TestCase):
             with opener.open(f"{base}/api/health", timeout=5) as r:
                 health = json.loads(r.read())
                 self.assertEqual(health["ok"], True)
-                self.assertEqual(health["version"], "2.0.0")
+                self.assertEqual(health["version"], "2.1.0")
 
             # 2. Protected endpoint returns 401 without auth
             with self.assertRaises(urllib.error.HTTPError) as ctx_err:

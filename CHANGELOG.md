@@ -6,7 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0
 
 ---
 
-## [Unreleased]
+## [2.1.0] - 2026-11-24
+
+> 界面全新设计 + 一批涉及真实扣款的安全修复，**强烈建议所有用户升级**。数据库结构不变，直接 `docker compose pull && docker compose up -d` 即可。
+> v2.0.0 旧版本代码已存档到 [`legacy-v2.0`](https://github.com/AtomBoyC/ovh-buyer/tree/legacy-v2.0) 分支（不再更新，不含以下安全修复）。
+
+### Breaking / 行为变化
+
+- 设了价格上限但取不到购物车价格时，不再下单（之前会跳过检查直接结账）。
+- Telegram 群组中，只有 ID 在 `Chat ID` 列表里的**用户**才能点按钮或发命令；请把自己的用户 ID 一并填入。
+- Telegram「API 抢购」按钮改为一次性，且必须有参考价，自动建的任务上限为参考价 +10%（可用设置项 `quick_buy_price_margin` 调整）。
+- 任务绑定的账号被删除后，任务不再改用默认账号下单。
+- 修改面板密码会让所有旧登录会话失效。
 
 ### Changed
 
