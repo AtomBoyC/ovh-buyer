@@ -43,7 +43,7 @@ from ovh_buyer.config import (
     normalize_datacenter,
 )
 from ovh_buyer.database import Database, protect_secret, reveal_secret
-from ovh_buyer.notifier import Notifier, render_telegram_stock_card
+from ovh_buyer.notifier import Notifier, parse_telegram_target, render_telegram_stock_card
 from ovh_buyer.order_engine import OrderEngine
 from ovh_buyer.ovh_client import OVHClient
 from ovh_buyer.sniper import SniperEngine
@@ -1187,6 +1187,38 @@ class TestOVHSniper(unittest.TestCase):
 
         cm = CatalogManager(ttl_seconds=60, cache_dir=blocker / "cache")
         cm.clear()
+
+    def test_telegram_topic_target_parsing_and_routing(self):
+        self.assertEqual(parse_telegram_target("-1002134567890/45"), ("-1002134567890", 45))
+        self.assertEqual(parse_telegram_target("-1002134567890:88"), ("-1002134567890", 88))
+        self.assertEqual(parse_telegram_target("-1002134567890#12"), ("-1002134567890", 12))
+        self.assertEqual(parse_telegram_target("https://t.me/c/2134567890/45"), ("-1002134567890", 45))
+        self.assertEqual(parse_telegram_target("https://t.me/c/2134567890/45/999"), ("-1002134567890", 45))
+        self.assertEqual(parse_telegram_target("https://t.me/ovh_sniper_group/19"), ("@ovh_sniper_group", 19))
+        self.assertEqual(parse_telegram_target("-1002134567890", default_topic_id=33), ("-1002134567890", 33))
+        # Positive personal User IDs must NOT inherit group default_topic_id
+        self.assertEqual(parse_telegram_target("987654321", default_topic_id=33), ("987654321", None))
+
+        self.db.update_settings(
+            {
+                "telegram_chat_id": "https://t.me/c/2134567890/45, -100999888777, 111222333",
+                "telegram_topic_id": "77",
+                "telegram_admin_ids": "555666777",
+            }
+        )
+        settings = self.db.get_settings()
+        self.assertEqual(
+            self.notifier._parsed_targets(settings),
+            [("-1002134567890", 45), ("-100999888777", 77), ("111222333", None)],
+        )
+        self.assertEqual(
+            self.notifier._authorized_chat_ids(settings),
+            ["-1002134567890", "-100999888777", "111222333"],
+        )
+        self.assertEqual(
+            self.notifier._authorized_user_ids(settings),
+            {"111222333", "555666777"},
+        )
 
 
 if __name__ == "__main__":

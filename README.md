@@ -305,12 +305,22 @@ location / {
 | `/order <短链>` | 解析 `@ovheco` 短链，报价后点确认生成未付款订单 |
 | `/servers` | 账号名下已交付独服 |
 | `/orders` | 近期订单与付款链接 |
+| `/id` | 查看当前会话的 `Chat ID`、话题 `Topic ID` 与个人 `User ID` |
 | `/pause` / `/resume` | 暂停 / 恢复抢购引擎 |
 | `🛒 GRA API抢购` 按钮 | 一次性按钮；需有参考价，自动建「上限 = 参考价 +10%」的实单任务（比例可用 `quick_buy_price_margin` 设置调整） |
 | `🌐 官网直达` 按钮 | 打开 OVH Express 结账页 |
 
+### 推送到指定 Topic（话题）的三种写法（v2.1.2+）
+
+> [!NOTE]
+> Telegram 官方本身不支持在**单向广播频道（Channel）**里创建多个子话题；所谓「分频道 / 多 Topic」需要使用 **开启了话题（Topics）功能的超级群组（Supergroup）**（或给频道绑定一个开启话题的讨论群组），并将机器人拉入群组赋予发消息权限。
+
+1. **直接粘贴话题链接（最省事）**：在 Telegram 右键目标话题点击 **「复制话题链接 (Copy Topic Link)」**（如 `https://t.me/c/2134567890/45` 或 `https://t.me/mygroup/45`），原样粘贴进面板 `Chat ID` 即可自动识别群组与 Topic ID。
+2. **`Chat ID/Topic ID` 简写（支持同时推多个不同群/不同话题）**：在 `Chat ID` 中直接填 `-1002134567890/45`（兼容 `/`、`:`、`#` 分隔，多个目标用英文逗号分隔）。
+3. **独立输入框**：`Chat ID` 填 `-1002134567890`，旁边的 **「默认话题 Topic ID」** 填 `45`（也可在群话题里发 `/id` 查看当前话题 ID）。
+
 > [!IMPORTANT]
-> **群组使用**：v2.1 起，在群组里只有 ID 出现在 `Chat ID` 列表中的**用户**才能点按钮或发命令。把群 ID 和你自己的用户 ID（可向 `@userinfobot` 查询）都填进去，例如 `-1001234567890,123456789`。私聊不受影响。
+> **群组按钮授权**：在群组或话题中点击抢购按钮 / 发送指令时，操作人的个人 User ID 需要在 **「群组授权用户 ID」**（`TELEGRAM_ADMIN_IDS`，仅授权不重复收私聊推送）或 `Chat ID` 列表中；未授权用户点击按钮时会弹窗提示其个人 ID 方便添加。私聊不受影响。
 
 还支持同时推送到 **Bark**、**Server酱**、**钉钉（含加签）**、**飞书**、**Discord** 和 **自定义 JSON Webhook**。
 
@@ -347,7 +357,8 @@ location / {
 | `PUID` / `PGID` | `1000` / `1000` | Docker 容器运行与修正 `/app/data` 归属的目标 UID / GID |
 | `HEADLESS` | `false` | `true` 时只运行后台引擎与 Telegram Bot |
 | `OVH_HTTP_PROXY` / `HTTPS_PROXY` | 空 | 全局代理，如 `http://127.0.0.1:7890` |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 空 | Telegram 机器人与授权 ID 列表 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 空 | Telegram 机器人与推送目标（支持 `-100xxx/话题ID` 或 `https://t.me/c/xxx/话题ID`） |
+| `TELEGRAM_TOPIC_ID` / `TELEGRAM_ADMIN_IDS` | 空 | 可选，默认群组话题 `message_thread_id` 与群内按钮授权个人 ID 列表 |
 | `OVH_ENDPOINT` / `OVH_SUBSIDIARY` / `OVH_APP_KEY` / `OVH_APP_SECRET` / `OVH_CONSUMER_KEY` | 空 | 可选，首次启动自动导入的默认账号 |
 
 ---
@@ -399,9 +410,9 @@ OVH 查价接口临时不可用。v2.1 起为安全起见不会盲下，接口�
 
 | 分支 / 标签 | 内容 |
 | :--- | :--- |
-| `main` | 最新版 **v2.1.x**（新界面 + 安全与 Docker/反代修复），镜像 `:latest` / `:2.1.1` |
+| `main` | 最新版 **v2.1.x**（新界面 + 安全与 Docker/反代/Topic 修复），镜像 `:latest` / `:2.1.2` |
 | [`legacy-v2.0`](https://github.com/AtomBoyC/ovh-buyer/tree/legacy-v2.0) | v2.0.0 旧界面版本，仅存档、不再更新；镜像 `:2.0.0` |
-| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
+| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` / `v2.1.2` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
 
 想继续用旧界面：
 

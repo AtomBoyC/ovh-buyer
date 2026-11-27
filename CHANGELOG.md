@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0
 
 ---
 
+## [2.1.2] - 2026-11-27
+
+### Added
+
+- **支持推送到 Telegram 超级群组 / 讨论群组的指定 Topic（话题 `message_thread_id`）**：
+  - Web 面板「通知与设置」新增 **「默认话题 Topic ID」**（`TELEGRAM_TOPIC_ID`）与 **「群组授权用户 ID」**（`TELEGRAM_ADMIN_IDS`，在群内授权点击抢购按钮而无需把个人私聊加进重复推送列表）；
+  - `Chat ID` 同时支持直接粘贴 Telegram 话题链接（如 `https://t.me/c/2134567890/45`、`https://t.me/group/45`）或简写 `-1002134567890/45`（兼容 `/`、`:`、`#` 分隔），可同时向多个不同群组的不同话题推送，且售罄自动划删除线（`editMessageText`）完全兼容话题消息；
+  - Telegram Bot 新增 `/id`（`/topic`）指令，一键查看当前群组 `Chat ID`、话题 `Topic ID` 与个人 `User ID`，并在话题内原位回复所有指令与按钮操作；未授权用户在群内点击按钮时会弹窗提示其个人 ID。
+
+### Fixed
+
+- **保留并展示 Telegram Bot API 在 HTTP 4xx/5xx 时的完整 JSON 错误描述**，当误将单向广播频道当作多话题群组或填错 Topic ID 时，运行日志会给出明确的中文排障提示；对部分旧群组 `General (Topic #1)` 自动兼容回退。
+
+---
+
 ## [2.1.1] - 2026-11-27
 
 ### Fixed
