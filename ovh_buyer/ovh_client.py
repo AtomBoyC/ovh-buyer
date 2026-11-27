@@ -135,16 +135,16 @@ def normalize_proxy_url(raw: str) -> str:
     if not s or s.lower() in ("direct", "none", "off"):
         return ""
     if "://" not in s:
-        if "@" in s:
-            return f"http://{s}"
         parts = s.split(":")
-        # Commercial shorthand: host:port:user:pass (where port is numeric)
-        if len(parts) >= 4 and parts[1].isdigit():
+        # Commercial shorthand: host:port:user:pass (check BEFORE '@' so '@' inside password works)
+        if len(parts) >= 4 and parts[1].isdigit() and "@" not in parts[0] and "@" not in parts[1]:
             host, port, user = parts[0], parts[1], parts[2]
             pw = ":".join(parts[3:])
             u_enc = urllib.parse.quote(user, safe="")
             p_enc = urllib.parse.quote(pw, safe="")
             return f"http://{u_enc}:{p_enc}@{host}:{port}"
+        if "@" in s:
+            return f"http://{s}"
         return f"http://{s}"
     return s
 
