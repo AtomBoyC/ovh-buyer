@@ -607,6 +607,14 @@ class Database:
 
     # ---------- Sniper Tasks ----------
 
+    @staticmethod
+    def _normalize_poll_interval(raw: Any, default: float = 5) -> Any:
+        if raw in (None, ""):
+            val = float(default)
+        else:
+            val = max(0.0, float(raw))
+        return int(val) if val.is_integer() else val
+
     def _row_to_task(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
         for field in ("datacenters", "options", "coupons"):
@@ -706,7 +714,7 @@ class Database:
                     1 if data.get("only_instant") else 0,
                     1 if data.get("fast_lane") else 0,
                     1 if data.get("allow_non_default", True) else 0,
-                    max(2, int(data.get("poll_interval") or self.get_setting("default_poll_interval", 5))),
+                    self._normalize_poll_interval(data.get("poll_interval"), self.get_setting("default_poll_interval", 5)),
                     int(data.get("priority") or 10),
                     str(data.get("proxy_url", "") or "").strip(),
                     str(data.get("status", "running")).strip().lower() or "running",
@@ -787,7 +795,7 @@ class Database:
                     1 if merged.get("only_instant") else 0,
                     1 if merged.get("fast_lane") else 0,
                     1 if merged.get("allow_non_default", True) else 0,
-                    max(2, int(merged.get("poll_interval") or 5)),
+                    self._normalize_poll_interval(merged.get("poll_interval"), 5),
                     int(merged.get("priority") or 10),
                     str(merged.get("proxy_url", "") or "").strip(),
                     str(merged.get("status", "running")).strip().lower(),

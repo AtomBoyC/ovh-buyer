@@ -494,7 +494,7 @@ function openTaskModal(prefill = {}) {
   form.elements.pricing_mode.value = prefill.pricing_mode || "auto";
   form.elements.mode.value = prefill.mode || "buy";
   form.elements.max_orders.value = prefill.max_orders || 1;
-  form.elements.poll_interval.value = prefill.poll_interval || 5;
+  form.elements.poll_interval.value = prefill.poll_interval ?? 5;
   form.elements.os_code.value = prefill.os_code || "none_64.en";
   form.elements.coupons.value = (prefill.coupons || []).join(",");
   if (form.elements.proxy_url) form.elements.proxy_url.value = prefill.proxy_url || "";
@@ -1086,7 +1086,7 @@ function bindEvents() {
       pricing_mode: f.elements.pricing_mode.value.trim() || "auto",
       mode: f.elements.mode.value,
       max_orders: parseInt(f.elements.max_orders.value || "1", 10) || 1,
-      poll_interval: parseInt(f.elements.poll_interval.value || "5", 10) || 5,
+      poll_interval: f.elements.poll_interval.value === "" ? 5 : Math.max(0, parseFloat(f.elements.poll_interval.value) || 0),
       os_code: f.elements.os_code.value.trim() || "none_64.en",
       coupons: f.elements.coupons.value,
       proxy_url: f.elements.proxy_url ? f.elements.proxy_url.value.trim() : "",

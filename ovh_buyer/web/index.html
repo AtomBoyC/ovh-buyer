@@ -498,17 +498,17 @@
                 </div>
                 <div class="field">
                   <label>默认轮询间隔（秒）</label>
-                  <input type="number" min="2" max="300" name="default_poll_interval" />
+                  <input type="number" step="any" min="0" max="300" name="default_poll_interval" />
                 </div>
               </div>
               <div class="form-row">
                 <div class="field">
                   <label>雷达轮询间隔（秒）</label>
-                  <input type="number" min="10" max="600" name="radar_poll_interval" />
+                  <input type="number" step="any" min="0" max="600" name="radar_poll_interval" />
                 </div>
                 <div class="field">
                   <label>VPS 轮询间隔（秒）</label>
-                  <input type="number" min="5" max="600" name="vps_poll_interval" />
+                  <input type="number" step="any" min="0" max="600" name="vps_poll_interval" />
                 </div>
               </div>
               <div class="form-row">
@@ -701,7 +701,7 @@
           </div>
           <div class="field">
             <label>轮询间隔（秒）</label>
-            <input type="number" min="2" max="300" name="poll_interval" value="5" />
+            <input type="number" step="any" min="0" max="300" name="poll_interval" value="5" />
           </div>
         </div>
         <div class="form-row">

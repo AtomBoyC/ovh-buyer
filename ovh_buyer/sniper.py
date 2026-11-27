@@ -436,15 +436,23 @@ class SniperEngine:
 
     def _sniper_loop(self) -> None:
         while not self._stop_event.is_set():
+            wait_sec = 1.0
             try:
                 settings = self.db.get_settings()
                 if not settings.get("sniper_enabled", True):
                     self._stop_event.wait(1.5)
                     continue
                 self.run_sniper_tick()
+                running_intervals = [
+                    max(0.0, float(t["poll_interval"]))
+                    for t in self.db.list_tasks()
+                    if t["status"] == "running" and t["product_line"] != "vps" and t.get("poll_interval") not in (None, "")
+                ]
+                if running_intervals:
+                    wait_sec = min(1.0, max(0.05, min(running_intervals)))
             except Exception as exc:
                 self.db.add_log("ERROR", f"抢购主循环异常: {exc}", "sniper")
-            self._stop_event.wait(1.0)
+            self._stop_event.wait(wait_sec)
 
     def run_sniper_tick(self) -> int:
         """Execute one polling cycle over all due running Eco/Baremetal sniper tasks."""
@@ -461,7 +469,9 @@ class SniperEngine:
                 self.slot_pool.cleanup_task(task["id"])
                 continue
             last_ts = self._task_last_poll.get(task["id"], 0.0)
-            if now - last_ts >= max(2, int(task["poll_interval"] or 5)):
+            raw_pi = task.get("poll_interval")
+            poll_interval = max(0.0, float(raw_pi)) if raw_pi not in (None, "") else 5.0
+            if now - last_ts >= poll_interval:
                 due_tasks.append(task)
 
         if not due_tasks:
@@ -1007,15 +1017,18 @@ class SniperEngine:
 
     def _radar_loop(self) -> None:
         while not self._stop_event.is_set():
+            wait_sec = 2.0
             try:
                 settings = self.db.get_settings()
-                interval = max(10, int(settings.get("radar_poll_interval") or 30))
+                raw_ri = settings.get("radar_poll_interval")
+                interval = max(0.0, float(raw_ri)) if raw_ri not in (None, "") else 30.0
+                wait_sec = min(2.0, max(0.1, interval))
                 if settings.get("radar_enabled", False) and (time.time() - self._radar_last_poll >= interval):
                     self._radar_last_poll = time.time()
                     self.run_radar_tick()
             except Exception as exc:
                 self.db.add_log("ERROR", f"黑五雷达循环异常: {exc}", "radar")
-            self._stop_event.wait(2.0)
+            self._stop_event.wait(wait_sec)
 
     def run_radar_tick(self) -> int:
         rules = [r for r in self.db.list_radar_rules() if r["enabled"]]
@@ -1152,15 +1165,18 @@ class SniperEngine:
 
     def _vps_loop(self) -> None:
         while not self._stop_event.is_set():
+            wait_sec = 2.0
             try:
                 settings = self.db.get_settings()
-                interval = max(5, int(settings.get("vps_poll_interval") or 15))
+                raw_vi = settings.get("vps_poll_interval")
+                interval = max(0.0, float(raw_vi)) if raw_vi not in (None, "") else 15.0
+                wait_sec = min(2.0, max(0.1, interval))
                 if settings.get("vps_monitor_enabled", False) and (time.time() - self._vps_last_poll >= interval):
                     self._vps_last_poll = time.time()
                     self.run_vps_tick()
             except Exception as exc:
                 self.db.add_log("ERROR", f"VPS 监控循环异常: {exc}", "vps")
-            self._stop_event.wait(2.0)
+            self._stop_event.wait(wait_sec)
 
     def run_vps_tick(self) -> int:
         # Serialize VPS ticks (loop thread vs. /api/vps/check) so auto_order can't fire twice
