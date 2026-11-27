@@ -1,16 +1,20 @@
 """Zero-dependency OVHcloud API client (1.0 & v1) with SHA-1 signing, clock sync, rate limiting, and proxy support."""
 
+import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import random
+import re
+import socket
 import ssl
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import ENDPOINTS
 
@@ -125,6 +129,243 @@ def get_endpoint_rate_limiter(endpoint: str, qps: float = 4.0) -> RateLimiter:
         return limiter
 
 
+def normalize_proxy_url(raw: str) -> str:
+    """Normalize proxy string into standard URL (supports http/https/socks5/socks5h & host:port:user:pass)."""
+    s = str(raw or "").strip()
+    if not s or s.lower() in ("direct", "none", "off"):
+        return ""
+    if "://" not in s:
+        if "@" in s:
+            return f"http://{s}"
+        parts = s.split(":")
+        # Commercial shorthand: host:port:user:pass (where port is numeric)
+        if len(parts) >= 4 and parts[1].isdigit():
+            host, port, user = parts[0], parts[1], parts[2]
+            pw = ":".join(parts[3:])
+            u_enc = urllib.parse.quote(user, safe="")
+            p_enc = urllib.parse.quote(pw, safe="")
+            return f"http://{u_enc}:{p_enc}@{host}:{port}"
+        return f"http://{s}"
+    return s
+
+
+def parse_proxy_config(raw: str) -> Optional[Dict[str, Any]]:
+    """Parse normalized proxy URL into {scheme, host, port, username, password, url}."""
+    norm = normalize_proxy_url(raw)
+    if not norm:
+        return None
+    scheme_sep = norm.find("://")
+    if scheme_sep <= 0:
+        raise ValueError(f"无效的代理格式: {raw}")
+    scheme = norm[:scheme_sep].lower()
+    if scheme == "socks":
+        scheme = "socks5"
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        raise ValueError(f"不支持的代理协议 '{scheme}' (支持 http / https / socks5 / socks5h)")
+
+    rest = norm[scheme_sep + 3 :].strip().rstrip("/")
+    username: Optional[str] = None
+    password: Optional[str] = None
+    if "@" in rest:
+        auth_part, host_part = rest.rsplit("@", 1)
+        if ":" in auth_part:
+            u_raw, p_raw = auth_part.split(":", 1)
+            username = urllib.parse.unquote(u_raw)
+            password = urllib.parse.unquote(p_raw)
+        else:
+            username = urllib.parse.unquote(auth_part)
+            password = ""
+    else:
+        host_part = rest
+
+    parsed = urllib.parse.urlsplit(f"{scheme}://{host_part}")
+    host = parsed.hostname
+    port = parsed.port
+    if not host or not port:
+        raise ValueError(f"代理缺少主机或端口: {raw}")
+    return {
+        "scheme": scheme,
+        "host": host,
+        "port": int(port),
+        "username": username,
+        "password": password,
+        "url": norm,
+    }
+
+
+def redact_proxy_url(raw: str) -> str:
+    """Return display-safe proxy URL with password masked."""
+    try:
+        cfg = parse_proxy_config(raw)
+    except ValueError:
+        return "***"
+    if not cfg:
+        return ""
+    host_fmt = f"[{cfg['host']}]" if ":" in cfg["host"] else cfg["host"]
+    if cfg["username"] is not None:
+        u_disp = cfg["username"][:2] + "**" if len(cfg["username"]) > 2 else "**"
+        return f"{cfg['scheme']}://{u_disp}:****@{host_fmt}:{cfg['port']}"
+    return f"{cfg['scheme']}://{host_fmt}:{cfg['port']}"
+
+
+def parse_proxy_list(raw: str) -> List[str]:
+    """Split multi-line / comma / semicolon proxy list into normalized URLs."""
+    if not raw:
+        return []
+    out: List[str] = []
+    for line in re.split(r"[\r\n,;]+", str(raw)):
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith("#"):
+            continue
+        norm = normalize_proxy_url(cleaned)
+        if norm and norm not in out:
+            out.append(norm)
+    return out
+
+
+def redact_proxy_list_text(raw: str) -> str:
+    """Redact credentials across all proxies in a multi-line/comma proxy config string."""
+    items = parse_proxy_list(raw)
+    return "\n".join(redact_proxy_url(x) for x in items)
+
+
+class ProxyRotator:
+    """Thread-safe round-robin proxy selector with temporary failure cooldown."""
+
+    def __init__(self, cooldown_seconds: float = 30.0):
+        self._lock = threading.Lock()
+        self._cursor: int = 0
+        self._cooldown_seconds = cooldown_seconds
+        self._cooldown_until: Dict[str, float] = {}
+
+    def pick(self, raw_proxies: str, exclude: Optional[set] = None) -> str:
+        candidates = parse_proxy_list(raw_proxies)
+        if not candidates:
+            return ""
+        excluded = exclude or set()
+        pool = [p for p in candidates if p not in excluded]
+        if not pool:
+            return ""
+        now = time.monotonic()
+        with self._lock:
+            n = len(pool)
+            healthy = []
+            for offset in range(n):
+                idx = (self._cursor + offset) % n
+                cand = pool[idx]
+                if self._cooldown_until.get(cand, 0.0) <= now:
+                    healthy.append((idx, cand))
+            if healthy:
+                chosen_idx, chosen = healthy[0]
+                self._cursor = (chosen_idx + 1) % n
+                return chosen
+            # All candidates in cooldown: pick the one expiring soonest
+            soonest = min(pool, key=lambda p: self._cooldown_until.get(p, 0.0))
+            self._cursor = (pool.index(soonest) + 1) % n
+            return soonest
+
+    def mark_failed(self, proxy_url: str) -> None:
+        norm = normalize_proxy_url(proxy_url)
+        if not norm:
+            return
+        with self._lock:
+            self._cooldown_until[norm] = time.monotonic() + self._cooldown_seconds
+
+    def mark_ok(self, proxy_url: str) -> None:
+        norm = normalize_proxy_url(proxy_url)
+        if not norm:
+            return
+        with self._lock:
+            self._cooldown_until.pop(norm, None)
+
+
+def _recv_exact(sock: socket.socket, length: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < length:
+        chunk = sock.recv(length - len(buf))
+        if not chunk:
+            raise OSError("代理连接在握手阶段意外断开")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _connect_socks5_socket(
+    proxy_cfg: Dict[str, Any],
+    target_host: str,
+    target_port: int,
+    timeout: float,
+) -> socket.socket:
+    """Establish a TCP connection to (target_host, target_port) via SOCKS5/SOCKS5H (RFC 1928 + RFC 1929)."""
+    sock = socket.create_connection((proxy_cfg["host"], proxy_cfg["port"]), timeout=timeout)
+    try:
+        username = proxy_cfg.get("username")
+        password = proxy_cfg.get("password") or ""
+        if username is not None:
+            sock.sendall(b"\x05\x02\x00\x02")
+        else:
+            sock.sendall(b"\x05\x01\x00")
+        ver, method = _recv_exact(sock, 2)
+        if ver != 5:
+            raise OVHAPIError(f"SOCKS5 代理协议版本异常 (ver={ver})", status_code=0)
+        if method == 0x02:
+            if username is None:
+                raise OVHAPIError("SOCKS5 代理要求账号密码认证", status_code=0)
+            u_bytes = username.encode("utf-8")
+            p_bytes = password.encode("utf-8")
+            if len(u_bytes) > 255 or len(p_bytes) > 255:
+                raise OVHAPIError("SOCKS5 账号或密码长度超出限制", status_code=0)
+            sock.sendall(b"\x01" + bytes([len(u_bytes)]) + u_bytes + bytes([len(p_bytes)]) + p_bytes)
+            _, auth_status = _recv_exact(sock, 2)
+            if auth_status != 0x00:
+                raise OVHAPIError("SOCKS5 代理认证失败（用户名或密码错误）", status_code=0)
+        elif method != 0x00:
+            raise OVHAPIError("SOCKS5 代理不支持可用的认证方式", status_code=0)
+
+        # Build CONNECT request (remote DNS via ATYP=0x03 for domain names, avoiding local DNS pollution)
+        try:
+            ip_obj = ipaddress.ip_address(target_host)
+            if ip_obj.version == 4:
+                addr_part = b"\x01" + ip_obj.packed
+            else:
+                addr_part = b"\x04" + ip_obj.packed
+        except ValueError:
+            host_bytes = target_host.encode("idna")
+            if len(host_bytes) > 255:
+                raise OVHAPIError("目标域名过长", status_code=0)
+            addr_part = b"\x03" + bytes([len(host_bytes)]) + host_bytes
+
+        req = b"\x05\x01\x00" + addr_part + int(target_port).to_bytes(2, "big")
+        sock.sendall(req)
+        r_ver, rep, _, bnd_atyp = _recv_exact(sock, 4)
+        if r_ver != 5 or rep != 0x00:
+            raise OVHAPIError(f"SOCKS5 代理无法连接目标服务器 (错误码={rep})", status_code=0)
+        if bnd_atyp == 0x01:
+            _recv_exact(sock, 6)
+        elif bnd_atyp == 0x04:
+            _recv_exact(sock, 18)
+        elif bnd_atyp == 0x03:
+            dlen = _recv_exact(sock, 1)[0]
+            _recv_exact(sock, dlen + 2)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
+
+
+class _PreconnectedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection wrapper around an already-connected (plain or TLS-wrapped) socket."""
+
+    def __init__(self, host: str, port: int, pre_sock: socket.socket, timeout: float):
+        super().__init__(host, port, timeout=timeout)
+        self._pre_sock = pre_sock
+
+    def connect(self) -> None:
+        self.sock = self._pre_sock
+
+
 class OVHClient:
     """Lightweight, fast OVH API client with keep-alive pooling & automatic time sync."""
 
@@ -150,10 +391,11 @@ class OVHClient:
         self.app_key = (app_key or "").strip()
         self.app_secret = (app_secret or "").strip()
         self.consumer_key = (consumer_key or "").strip()
-        self.proxy_url = (proxy_url or "").strip()
+        self.proxy_url = normalize_proxy_url(proxy_url)
         self.timeout = float(timeout)
         self.max_retries = max(1, int(max_retries))
-        self.rate_limiter = get_endpoint_rate_limiter(self.api_base, qps=qps)
+        rate_key = f"{self.api_base}|{self.proxy_url or 'direct'}"
+        self.rate_limiter = get_endpoint_rate_limiter(rate_key, qps=qps)
 
         # Telemetry
         self.total_requests = 0
@@ -204,29 +446,106 @@ class OVHClient:
             req_headers.setdefault("Content-Type", "application/json; charset=utf-8")
 
         if self.proxy_url:
-            return self._request_via_urllib(method, full_url, req_headers, body_bytes)
+            return self._request_via_proxy(method, full_url, req_headers, body_bytes)
         return self._request_via_pool(method, full_url, req_headers, body_bytes, allow_resend=allow_resend)
 
-    def _request_via_urllib(
+    def _request_via_proxy(
         self,
         method: str,
         full_url: str,
         headers: Dict[str, str],
         body_bytes: Optional[bytes],
     ) -> Any:
-        handlers = [urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})]
-        opener = urllib.request.build_opener(*handlers)
-        req = urllib.request.Request(full_url, data=body_bytes, headers=headers, method=method)
         try:
-            with opener.open(req, timeout=self.timeout) as resp:
-                status = resp.status
-                raw = resp.read()
-                return self._decode_response(status, raw, dict(resp.headers))
-        except urllib.error.HTTPError as err:
-            raw = err.read()
-            self._raise_http_error(err.code, raw, dict(err.headers))
-        except urllib.error.URLError as err:
-            raise OVHAPIError(f"网络/代理连接失败: {err.reason}", status_code=0) from err
+            proxy_cfg = parse_proxy_config(self.proxy_url)
+        except ValueError as exc:
+            raise OVHAPIError(str(exc), status_code=0) from exc
+        if not proxy_cfg:
+            return self._request_via_pool(method, full_url, headers, body_bytes, allow_resend=False)
+
+        parsed = urllib.parse.urlsplit(full_url)
+        scheme = parsed.scheme.lower()
+        target_host = parsed.hostname or ""
+        target_port = parsed.port or (443 if scheme == "https" else 80)
+        path_with_query = parsed.path or "/"
+        if parsed.query:
+            path_with_query += "?" + parsed.query
+
+        pscheme = proxy_cfg["scheme"]
+        proxy_disp = redact_proxy_url(self.proxy_url)
+        ssl_ctx = _GLOBAL_POOL._ssl_context
+
+        conn: Optional[http.client.HTTPConnection] = None
+        try:
+            if pscheme in ("socks5", "socks5h"):
+                raw_sock = _connect_socks5_socket(proxy_cfg, target_host, target_port, timeout=self.timeout)
+                if scheme == "https":
+                    raw_sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=target_host)
+                conn = _PreconnectedHTTPConnection(target_host, target_port, raw_sock, timeout=self.timeout)
+                conn.request(method, path_with_query, body=body_bytes, headers=headers)
+            else:
+                proxy_headers: Dict[str, str] = {}
+                if proxy_cfg.get("username") is not None:
+                    cred = f"{proxy_cfg['username']}:{proxy_cfg.get('password') or ''}".encode("utf-8")
+                    proxy_headers["Proxy-Authorization"] = "Basic " + base64.b64encode(cred).decode("ascii")
+
+                if scheme == "https":
+                    if pscheme == "https":
+                        outer_sock = socket.create_connection((proxy_cfg["host"], proxy_cfg["port"]), timeout=self.timeout)
+                        tls_proxy_sock = ssl_ctx.wrap_socket(outer_sock, server_hostname=proxy_cfg["host"])
+                        connect_lines = [
+                            f"CONNECT {target_host}:{target_port} HTTP/1.1",
+                            f"Host: {target_host}:{target_port}",
+                        ]
+                        for hk, hv in proxy_headers.items():
+                            connect_lines.append(f"{hk}: {hv}")
+                        tls_proxy_sock.sendall(("\r\n".join(connect_lines) + "\r\n\r\n").encode("utf-8"))
+                        resp_buf = bytearray()
+                        while b"\r\n\r\n" not in resp_buf and len(resp_buf) < 16384:
+                            ch = tls_proxy_sock.recv(1024)
+                            if not ch:
+                                break
+                            resp_buf.extend(ch)
+                        first_line = resp_buf.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
+                        if " 200" not in first_line:
+                            tls_proxy_sock.close()
+                            raise OVHAPIError(f"HTTPS 代理隧道握手失败 ({proxy_disp}): {first_line}", status_code=0)
+                        inner_tls = ssl_ctx.wrap_socket(tls_proxy_sock, server_hostname=target_host)
+                        conn = _PreconnectedHTTPConnection(target_host, target_port, inner_tls, timeout=self.timeout)
+                    else:
+                        conn = http.client.HTTPSConnection(
+                            proxy_cfg["host"], proxy_cfg["port"], timeout=self.timeout, context=ssl_ctx
+                        )
+                        conn.set_tunnel(target_host, target_port, headers=proxy_headers or None)
+                    conn.request(method, path_with_query, body=body_bytes, headers=headers)
+                else:
+                    if pscheme == "https":
+                        conn = http.client.HTTPSConnection(
+                            proxy_cfg["host"], proxy_cfg["port"], timeout=self.timeout, context=ssl_ctx
+                        )
+                    else:
+                        conn = http.client.HTTPConnection(proxy_cfg["host"], proxy_cfg["port"], timeout=self.timeout)
+                    merged_headers = dict(headers)
+                    merged_headers.update(proxy_headers)
+                    conn.request(method, full_url, body=body_bytes, headers=merged_headers)
+
+            resp = conn.getresponse()
+            raw = resp.read()
+            resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+            status = resp.status
+            if 200 <= status < 300:
+                return self._decode_response(status, raw, resp_headers)
+            self._raise_http_error(status, raw, resp_headers)
+        except OVHAPIError:
+            raise
+        except Exception as exc:
+            raise OVHAPIError(f"代理请求失败 ({proxy_disp}): {exc}", status_code=0) from exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _request_via_pool(
         self,

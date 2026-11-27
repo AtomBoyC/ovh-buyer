@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .config import DATA_DIR, DB_PATH, get_data_dir, get_db_path
+from .ovh_client import redact_proxy_list_text
 
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -90,6 +91,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "vps_poll_interval": 15,
     "bulk_availability_threshold": 3,
     "http_proxy": "",
+    "monitor_proxies": "",
+    "monitor_proxy_fallback_direct": True,
+    "order_use_proxy": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "telegram_topic_id": "",
@@ -328,11 +332,16 @@ class Database:
         self._ensure_column("orders", "spec_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("orders", "notified_events", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("orders", "next_check_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("accounts", "proxy_url", "TEXT DEFAULT ''")
+        self._ensure_column("sniper_tasks", "proxy_url", "TEXT DEFAULT ''")
+        self._ensure_column("radar_rules", "proxy_url", "TEXT DEFAULT ''")
+        self._ensure_column("vps_watches", "proxy_url", "TEXT DEFAULT ''")
         self._conn.commit()
 
     def _seed_default_settings(self) -> None:
         env_overrides = {
             "http_proxy": os.environ.get("OVH_HTTP_PROXY", ""),
+            "monitor_proxies": os.environ.get("OVH_MONITOR_PROXIES", ""),
             "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
             "telegram_topic_id": os.environ.get("TELEGRAM_TOPIC_ID", ""),
@@ -504,8 +513,8 @@ class Database:
                 """
                 INSERT INTO accounts (
                     id, name, endpoint, subsidiary, app_key, app_secret, consumer_key,
-                    is_default, nichandle, currency, last_verified_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_default, nichandle, currency, proxy_url, last_verified_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     acc_id,
@@ -518,6 +527,7 @@ class Database:
                     is_default,
                     data.get("nichandle", ""),
                     data.get("currency", "EUR"),
+                    str(data.get("proxy_url", "") or "").strip(),
                     data.get("last_verified_at", ""),
                     now,
                     now,
@@ -545,6 +555,7 @@ class Database:
         currency = patch.get("currency", existing["currency"])
         last_verified_at = patch.get("last_verified_at", existing["last_verified_at"])
         default_payment_type = patch.get("default_payment_type", existing.get("default_payment_type", ""))
+        proxy_url = str(patch.get("proxy_url", existing.get("proxy_url", "")) or "").strip()
 
         with self._lock:
             cur = self._conn.cursor()
@@ -556,7 +567,7 @@ class Database:
                     name = ?, endpoint = ?, subsidiary = ?, app_key = ?,
                     app_secret = ?, consumer_key = ?, is_default = ?,
                     nichandle = ?, currency = ?, default_payment_type = ?,
-                    last_verified_at = ?, updated_at = ?
+                    proxy_url = ?, last_verified_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -570,6 +581,7 @@ class Database:
                     nichandle,
                     currency,
                     default_payment_type or "",
+                    proxy_url,
                     last_verified_at,
                     now,
                     account_id,
@@ -662,11 +674,11 @@ class Database:
                     os_code, coupons, max_price, price_includes_tax, quantity,
                     max_orders, ordered_count, auto_pay, waive_retractation,
                     dry_run, mode, only_instant, fast_lane, allow_non_default,
-                    poll_interval, priority, status,
+                    poll_interval, priority, proxy_url, status,
                     attempts, last_check_at, last_status_msg, last_availability,
                     source, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '{}', ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '{}', ?, ?, ?
                 )
                 """,
                 (
@@ -696,6 +708,7 @@ class Database:
                     1 if data.get("allow_non_default", True) else 0,
                     max(2, int(data.get("poll_interval") or self.get_setting("default_poll_interval", 5))),
                     int(data.get("priority") or 10),
+                    str(data.get("proxy_url", "") or "").strip(),
                     str(data.get("status", "running")).strip().lower() or "running",
                     str(data.get("source", "manual")),
                     now,
@@ -744,7 +757,7 @@ class Database:
                     max_orders = ?, ordered_count = ?, auto_pay = ?,
                     waive_retractation = ?, dry_run = ?, mode = ?, only_instant = ?,
                     fast_lane = ?, allow_non_default = ?,
-                    poll_interval = ?, priority = ?, status = ?, attempts = ?,
+                    poll_interval = ?, priority = ?, proxy_url = ?, status = ?, attempts = ?,
                     last_check_at = ?, last_status_msg = ?, last_availability = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -776,6 +789,7 @@ class Database:
                     1 if merged.get("allow_non_default", True) else 0,
                     max(2, int(merged.get("poll_interval") or 5)),
                     int(merged.get("priority") or 10),
+                    str(merged.get("proxy_url", "") or "").strip(),
                     str(merged.get("status", "running")).strip().lower(),
                     max(0, int(merged.get("attempts") or 0)),
                     str(merged.get("last_check_at", "")),
@@ -853,9 +867,9 @@ class Database:
                 INSERT INTO radar_rules (
                     id, name, rule_type, account_id, endpoint, subsidiary,
                     keyword_pattern, memory_pattern, storage_pattern, datacenters,
-                    max_price, auto_snipe, auto_pay, dry_run, enabled,
+                    max_price, auto_snipe, auto_pay, dry_run, enabled, proxy_url,
                     known_plan_codes, matched_plan_codes, last_check_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                 """,
                 (
                     rule_id,
@@ -873,6 +887,7 @@ class Database:
                     1 if data.get("auto_pay") else 0,
                     1 if data.get("dry_run", True) else 0,
                     1 if data.get("enabled", True) else 0,
+                    str(data.get("proxy_url", "") or "").strip(),
                     json.dumps(known, ensure_ascii=False),
                     json.dumps(matched, ensure_ascii=False),
                     now,
@@ -899,7 +914,7 @@ class Database:
                     name = ?, rule_type = ?, account_id = ?, endpoint = ?, subsidiary = ?,
                     keyword_pattern = ?, memory_pattern = ?, storage_pattern = ?,
                     datacenters = ?, max_price = ?, auto_snipe = ?, auto_pay = ?,
-                    dry_run = ?, enabled = ?, known_plan_codes = ?, matched_plan_codes = ?,
+                    dry_run = ?, enabled = ?, proxy_url = ?, known_plan_codes = ?, matched_plan_codes = ?,
                     last_check_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -918,6 +933,7 @@ class Database:
                     1 if merged.get("auto_pay") else 0,
                     1 if merged.get("dry_run") else 0,
                     1 if merged.get("enabled", True) else 0,
+                    str(merged.get("proxy_url", "") or "").strip(),
                     json.dumps(merged.get("known_plan_codes") or [], ensure_ascii=False),
                     json.dumps(merged.get("matched_plan_codes") or [], ensure_ascii=False),
                     str(merged.get("last_check_at", "")),
@@ -969,8 +985,8 @@ class Database:
                 INSERT INTO vps_watches (
                     id, plan_code, account_id, endpoint, subsidiary, datacenters,
                     auto_order, auto_pay, dry_run, max_orders, ordered_count,
-                    enabled, last_state, last_check_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '{}', '', ?, ?)
+                    enabled, proxy_url, last_state, last_check_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '{}', '', ?, ?)
                 """,
                 (
                     wid,
@@ -984,6 +1000,7 @@ class Database:
                     1 if data.get("dry_run", True) else 0,
                     max(1, int(data.get("max_orders") or 1)),
                     1 if data.get("enabled", True) else 0,
+                    str(data.get("proxy_url", "") or "").strip(),
                     now,
                     now,
                 ),
@@ -1014,7 +1031,7 @@ class Database:
                 UPDATE vps_watches SET
                     plan_code = ?, account_id = ?, endpoint = ?, subsidiary = ?,
                     datacenters = ?, auto_order = ?, auto_pay = ?, dry_run = ?,
-                    max_orders = ?, ordered_count = ?, enabled = ?,
+                    max_orders = ?, ordered_count = ?, enabled = ?, proxy_url = ?,
                     last_state = ?, last_check_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -1030,6 +1047,7 @@ class Database:
                     max(1, int(merged.get("max_orders") or 1)),
                     max(0, int(merged.get("ordered_count") or 0)),
                     1 if merged.get("enabled", True) else 0,
+                    str(merged.get("proxy_url", "") or "").strip(),
                     json.dumps(merged.get("last_state") or {}, ensure_ascii=False),
                     str(merged.get("last_check_at", "")),
                     now,
@@ -1264,17 +1282,28 @@ class Database:
         settings = dict(self.get_settings())
         settings.pop("panel_password_hash", None)
         settings.pop("panel_signing_secret", None)
+        accounts = self.list_accounts(mask=not include_secrets)
+        tasks = self.list_tasks()
+        radar_rules = self.list_radar_rules()
+        vps_watches = self.list_vps_watches()
         if not include_secrets:
             for sk in EXPORT_SECRET_SETTING_KEYS:
                 val = str(settings.get(sk) or "")
                 settings[sk] = mask_secret(val) if val else ""
+            for pk in ("http_proxy", "monitor_proxies", "telegram_proxy"):
+                if settings.get(pk):
+                    settings[pk] = redact_proxy_list_text(str(settings[pk]))
+            for collection in (accounts, tasks, radar_rules, vps_watches):
+                for item in collection:
+                    if item.get("proxy_url"):
+                        item["proxy_url"] = redact_proxy_list_text(str(item["proxy_url"]))
         return {
             "exported_at": now_iso(),
             "settings": settings,
-            "accounts": self.list_accounts(mask=not include_secrets),
-            "tasks": self.list_tasks(),
-            "radar_rules": self.list_radar_rules(),
-            "vps_watches": self.list_vps_watches(),
+            "accounts": accounts,
+            "tasks": tasks,
+            "radar_rules": radar_rules,
+            "vps_watches": vps_watches,
         }
 
     def seed_from_env_or_file(self, seed_file: Optional[Path] = None) -> None:

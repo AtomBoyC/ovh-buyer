@@ -309,9 +309,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             product_line = q1("product_line", "eco").lower()
             search = q1("search", "").strip().lower()
             force = q1("refresh", "0") in ("1", "true", "yes")
-            client = self.ctx.engine.build_client(account=None, endpoint=endpoint)
-            plans = self.ctx.catalog_manager.get_catalog_plans(
-                client, subsidiary=subsidiary, product_line=product_line, force_refresh=force
+            plans = self.ctx.engine.run_monitor_call(
+                endpoint,
+                lambda cli: self.ctx.catalog_manager.get_catalog_plans(
+                    cli, subsidiary=subsidiary, product_line=product_line, force_refresh=force
+                ),
             )
             if search:
                 plans = [
@@ -606,12 +608,21 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if plan_code:
                 endpoint = str(body.get("endpoint") or "ovh-eu")
                 subsidiary = str(body.get("subsidiary") or "IE").upper()
-                client = self.ctx.engine.build_client(account=None, endpoint=endpoint)
-                data = client.get_vps_datacenter_availability(plan_code, subsidiary=subsidiary)
+                data = self.ctx.engine.run_monitor_call(
+                    endpoint,
+                    lambda cli: cli.get_vps_datacenter_availability(plan_code, subsidiary=subsidiary),
+                )
                 self._send_json({"ok": True, "plan_code": plan_code, "data": data})
             else:
                 cnt = self.ctx.engine.run_vps_tick()
                 self._send_json({"ok": True, "checked": cnt})
+            return
+
+        if path == "/api/proxy/test":
+            raw_proxies = str(body.get("proxies") or "")
+            endpoint = str(body.get("endpoint") or "ovh-eu")
+            res = self.ctx.engine.test_proxies(raw_proxies=raw_proxies, endpoint=endpoint)
+            self._send_json(res, status=200 if res.get("results") else 400)
             return
 
         if path == "/api/notifications/test":

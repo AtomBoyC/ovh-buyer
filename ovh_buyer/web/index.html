@@ -162,7 +162,10 @@
         <div class="card">
           <div class="card-header">
             <h3><svg class="ic"><use href="#i-search"/></svg>秒查任意型号实时库存</h3>
-            <span class="muted">公开接口，无需 API Key</span>
+            <div class="toolbar">
+              <span class="muted">公开接口，无需 API Key</span>
+              <button type="button" class="btn btn-sm js-open-proxy-modal">🌐 配置监控代理</button>
+            </div>
           </div>
           <form id="quick-check-form" class="inline-form">
             <input type="text" id="quick-check-code" placeholder="输入 planCode，如 26skleb01 / 27skle01-v1 / 24rise01" required />
@@ -221,6 +224,7 @@
               <input type="text" id="cat-search" placeholder="筛选：skle / ks / nvme / rise" />
               <button class="btn btn-primary btn-sm" id="btn-load-catalog">查询目录</button>
               <button class="btn btn-sm" id="btn-refresh-catalog" title="忽略缓存强制刷新"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+              <button type="button" class="btn btn-sm js-open-proxy-modal">🌐 监控代理</button>
             </div>
           </div>
           <div id="catalog-meta" class="muted mb-12">点击「查询目录」实时拉取 OVH 商品目录与基础月付价格（含人民币估价）</div>
@@ -248,7 +252,10 @@
         <div class="card">
           <div class="card-header">
             <h3><svg class="ic"><use href="#i-target"/></svg>抢购任务队列</h3>
-            <button class="btn btn-primary btn-sm" id="btn-open-task-modal"><svg class="ic"><use href="#i-plus"/></svg>新建任务</button>
+            <div class="toolbar">
+              <button type="button" class="btn btn-sm js-open-proxy-modal">🌐 监控代理</button>
+              <button class="btn btn-primary btn-sm" id="btn-open-task-modal"><svg class="ic"><use href="#i-plus"/></svg>新建任务</button>
+            </div>
           </div>
           <div class="table-wrap">
             <table class="table">
@@ -274,6 +281,7 @@
           <div class="card-header">
             <h3><svg class="ic"><use href="#i-radar"/></svg>黑五新品 &amp; 配置指纹雷达</h3>
             <div class="toolbar">
+              <button type="button" class="btn btn-sm js-open-proxy-modal">🌐 监控代理</button>
               <button class="btn btn-sm" id="btn-radar-scan"><svg class="ic"><use href="#i-refresh"/></svg>立即扫描</button>
               <button class="btn btn-primary btn-sm" id="btn-open-radar-modal"><svg class="ic"><use href="#i-plus"/></svg>新建规则</button>
             </div>
@@ -305,6 +313,7 @@
           <div class="card-header">
             <h3><svg class="ic"><use href="#i-cloud"/></svg>OVH VPS 补货监控</h3>
             <div class="toolbar">
+              <button type="button" class="btn btn-sm js-open-proxy-modal">🌐 监控代理</button>
               <button class="btn btn-sm" id="btn-vps-scan"><svg class="ic"><use href="#i-refresh"/></svg>刷新全部</button>
               <button class="btn btn-primary btn-sm" id="btn-open-vps-modal"><svg class="ic"><use href="#i-plus"/></svg>添加监控</button>
             </div>
@@ -508,9 +517,21 @@
                   <input type="number" min="2" max="20" name="bulk_availability_threshold" />
                 </div>
                 <div class="field">
-                  <label>全局 HTTP/HTTPS 代理</label>
+                  <label>兜底全局代理（通知 / 未配监控代理时使用）</label>
                   <input type="text" name="http_proxy" placeholder="http://127.0.0.1:7890" />
                 </div>
+              </div>
+              <div class="form-section">监控专用代理池（查库存 / 雷达 / VPS 监控）</div>
+              <div class="field">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                  <label style="margin:0">监控代理列表（一行一个，自动轮询与故障切换，支持 HTTP / HTTPS / SOCKS5）</label>
+                  <button type="button" class="btn btn-sm" id="btn-test-settings-proxy">⚡ 测速验证代理</button>
+                </div>
+                <textarea name="monitor_proxies" rows="3" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass"></textarea>
+              </div>
+              <div class="field checkbox-row">
+                <label><input type="checkbox" name="monitor_proxy_fallback_direct" /><span><b>监控代理全部不可用时允许回退本机直连</b><small>关闭则严格仅通过代理请求监控接口，绝不暴露本机 IP</small></span></label>
+                <label><input type="checkbox" name="order_use_proxy" /><span><b>下单与账号请求也走监控代理池</b><small>默认关闭：仅高频监控走代理防 429 封 IP，账号建车与结账默认直连（也可在账号里绑定独立固定代理）</small></span></label>
               </div>
               <div class="form-section">功能开关</div>
               <div class="field checkbox-row">
@@ -569,6 +590,7 @@
                 <option value="vps">vps</option>
                 <option value="notify">notify</option>
                 <option value="telegram">telegram</option>
+                <option value="proxy">proxy</option>
               </select>
               <label class="toggle"><input type="checkbox" id="log-autoscroll" class="vh" checked /><span class="tr"></span>自动滚底</label>
               <button class="btn btn-danger btn-sm" id="btn-clear-logs"><svg class="ic"><use href="#i-trash"/></svg>清空</button>
@@ -684,6 +706,10 @@
             <input type="text" name="coupons" placeholder="黑五折扣码（如有）" />
           </div>
         </div>
+        <div class="field">
+          <label>独立监控代理（可选，留空自动使用全局监控代理池；支持 http / socks5 / 多代理逗号分隔）</label>
+          <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080（留空走全局监控代理池）" />
+        </div>
         <div class="checkbox-grid">
           <label><input type="checkbox" name="dry_run" /><span><b>演练模式</b><small>校验购物车与实时价格，不提交订单</small></span></label>
           <label><input type="checkbox" name="fast_lane" /><span><b>快速通道</b><small>提前建车，有货 1 次请求秒结账</small></span></label>
@@ -740,6 +766,10 @@
           <label>Consumer Key</label>
           <input type="password" name="consumer_key" placeholder="编辑时留空则保留原密钥" autocomplete="off" />
         </div>
+        <div class="field">
+          <label>账号绑定固定代理（可选，该账号建车/结账/查独服固定走此 IP，留空默认直连）</label>
+          <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080 或 http://..." />
+        </div>
         <div class="field checkbox-row">
           <label><input type="checkbox" name="is_default" /><span>设为默认账号</span></label>
         </div>
@@ -755,10 +785,11 @@
   <div id="radar-modal" class="overlay hidden">
     <div class="modal">
       <div class="modal-header">
-        <h3>新建雷达规则</h3>
+        <h3 id="radar-modal-title">新建雷达规则</h3>
         <button class="icon-btn" onclick="closeModal('radar-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <form id="radar-form">
+        <input type="hidden" name="id" />
         <div class="field">
           <label>规则名称</label>
           <input type="text" name="name" placeholder="例如：2026 黑五 KS-LE 新品狙击" required />
@@ -814,6 +845,10 @@
             <input type="number" step="0.01" min="0" name="max_price" value="25" />
           </div>
         </div>
+        <div class="field">
+          <label>独立监控代理（可选，留空走全局监控代理池）</label>
+          <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080" />
+        </div>
         <div class="checkbox-row">
           <label><input type="checkbox" name="auto_snipe" /><span><b>命中后自动创建任务并开抢</b></span></label>
           <label><input type="checkbox" name="dry_run" checked /><span><b>自动任务使用演练模式</b><small>推荐先演练确认</small></span></label>
@@ -831,10 +866,11 @@
   <div id="vps-modal" class="overlay hidden">
     <div class="modal modal-sm">
       <div class="modal-header">
-        <h3>添加 VPS 监控</h3>
+        <h3 id="vps-modal-title">添加 VPS 监控</h3>
         <button class="icon-btn" onclick="closeModal('vps-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <form id="vps-form">
+        <input type="hidden" name="id" />
         <div class="field">
           <label>VPS Plan Code</label>
           <input type="text" name="plan_code" list="vps-presets" placeholder="vps-2025-model1" required />
@@ -871,6 +907,10 @@
           <label>下单账号（自动下单时使用）</label>
           <select name="account_id" id="vps-account-select"></select>
         </div>
+        <div class="field">
+          <label>独立监控代理（可选，留空走全局监控代理池）</label>
+          <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080" />
+        </div>
         <div class="checkbox-row">
           <label><input type="checkbox" name="auto_order" /><span>有货时自动下单</span></label>
           <label><input type="checkbox" name="dry_run" checked /><span>演练模式</span></label>
@@ -892,6 +932,42 @@
         <button class="icon-btn" onclick="closeModal('avail-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <div id="avail-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Modal: Monitor Proxy Pool -->
+  <div id="proxy-modal" class="overlay hidden">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3>🌐 监控代理与代理池配置</h3>
+        <button class="icon-btn" onclick="closeModal('proxy-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+      </div>
+      <form id="proxy-modal-form">
+        <p class="card-desc" style="margin-bottom:12px">
+          用于 <b>抢购任务库存轮询、黑五雷达、VPS 补货监控、目录与秒查库存</b>。支持单代理或多行代理池自动轮询与故障切换，高频监控不怕本机 IP 被 OVH 限流（429 / WAF）。
+        </p>
+        <div class="field">
+          <label>监控代理列表（每行一条或逗号分隔；支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code> 及 <code>ip:port:user:pass</code>）</label>
+          <textarea name="monitor_proxies" id="proxy-modal-textarea" rows="5" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass&#10;http://127.0.0.1:7890"></textarea>
+        </div>
+        <div class="field checkbox-row">
+          <label><input type="checkbox" name="monitor_proxy_fallback_direct" id="proxy-modal-fallback" checked /><span><b>所有监控代理均失败时允许临时回退本机直连</b><small>若要强制隐藏本机 IP，请取消勾选</small></span></label>
+          <label><input type="checkbox" name="order_use_proxy" id="proxy-modal-order-use" /><span><b>下单与账号请求也走监控代理池</b><small>默认关闭：仅监控查货走代理，账号建车与结账保持直连防风控（也可在「OVH 账号」为单账号绑固定代理）</small></span></label>
+        </div>
+        <div class="inline-form" style="margin:10px 0">
+          <select id="proxy-test-endpoint" style="max-width:190px">
+            <option value="ovh-eu">测试目标: OVH EU (欧洲)</option>
+            <option value="ovh-ca">测试目标: OVH CA (加/亚太)</option>
+            <option value="ovh-us">测试目标: OVH US (美国)</option>
+          </select>
+          <button type="button" class="btn" id="btn-run-proxy-test">⚡ 一键测速验证 OVH 连通性</button>
+        </div>
+        <div id="proxy-test-results" class="list-stack" style="max-height:180px;overflow:auto"></div>
+        <div class="modal-footer">
+          <button type="button" class="btn" onclick="closeModal('proxy-modal')">取消</button>
+          <button type="submit" class="btn btn-primary">保存代理配置</button>
+        </div>
+      </form>
     </div>
   </div>
 

@@ -177,6 +177,11 @@ function renderStatus() {
   document.getElementById("toggle-radar").checked = !!st.radar_enabled;
   document.getElementById("toggle-vps").checked = !!st.vps_monitor_enabled;
 
+  const pCount = st.monitor_proxy_count || 0;
+  document.querySelectorAll(".js-open-proxy-modal").forEach((btn) => {
+    btn.textContent = pCount > 0 ? `🌐 监控代理 (${pCount})` : "🌐 配置监控代理";
+  });
+
   const pill = document.getElementById("sidebar-engine-pill");
   const txt = document.getElementById("sidebar-engine-text");
   if (st.running && st.sniper_enabled) {
@@ -401,6 +406,7 @@ function renderTasks() {
         t.allow_non_default === false ? `<span class="pill pill-gray">仅标配</span>` : "",
         t.mode === "notify_only" ? `<span class="pill pill-gray">仅通知</span>` : "",
         t.max_price > 0 ? `<span class="pill pill-gray">≤${t.max_price}</span>` : "",
+        t.proxy_url ? `<span class="pill pill-blue" title="使用独立监控代理">🌐代理</span>` : "",
       ].join(" ");
       const stPill =
         t.status === "running"
@@ -491,6 +497,7 @@ function openTaskModal(prefill = {}) {
   form.elements.poll_interval.value = prefill.poll_interval || 5;
   form.elements.os_code.value = prefill.os_code || "none_64.en";
   form.elements.coupons.value = (prefill.coupons || []).join(",");
+  if (form.elements.proxy_url) form.elements.proxy_url.value = prefill.proxy_url || "";
   form.elements.fast_lane.checked = !!prefill.fast_lane;
   form.elements.allow_non_default.checked = prefill.allow_non_default !== false;
   form.elements.dry_run.checked = !!prefill.dry_run;
@@ -562,14 +569,16 @@ function renderRadar() {
       ]
         .filter(Boolean)
         .join(" | ");
+      const proxyTag = r.proxy_url ? ` <span class="pill pill-blue" title="已配独立监控代理">🌐代理</span>` : "";
       return `<tr>
-        <td><b>${esc(r.name)}</b><div class="mt-6">${typeLabel} ${r.enabled ? '<span class="pill pill-green">启用</span>' : '<span class="pill pill-gray">停用</span>'}</div></td>
+        <td><b>${esc(r.name)}</b><div class="mt-6">${typeLabel} ${r.enabled ? '<span class="pill pill-green">启用</span>' : '<span class="pill pill-gray">停用</span>'}${proxyTag}</div></td>
         <td><div>${esc(r.endpoint)} / ${esc(r.subsidiary)}</div><div class="muted">${esc(conds || "全部新品")}</div></td>
         <td><div>上限: ${r.max_price > 0 ? r.max_price : "不限"}</div><div class="muted">${r.auto_snipe ? (r.dry_run ? "自动演练抢购" : "自动实单抢购") : "仅推送提醒"}</div></td>
         <td><div>基线 ${r.known_plan_codes.length} · 命中 ${r.matched_plan_codes.length}</div><div class="muted">${esc(r.matched_plan_codes.slice(-3).join(", ") || r.last_check_at || "未扫描")}</div></td>
         <td>
           <div class="toolbar">
             <button class="btn btn-ghost btn-sm" onclick="toggleRadar('${esc(r.id)}', ${!r.enabled})">${r.enabled ? "停用" : "启用"}</button>
+            <button class="btn btn-ghost btn-sm" onclick="editRadar('${esc(r.id)}')">编辑</button>
             <button class="btn btn-danger btn-sm" onclick="deleteRadar('${esc(r.id)}')">删</button>
           </div>
         </td>
@@ -588,6 +597,30 @@ async function deleteRadar(id) {
   await api(`/api/radar/${id}`, { method: "DELETE" });
   toast("雷达规则已删除", "ok");
   refreshAll();
+}
+
+function editRadar(id) {
+  const r = state.radar.find((x) => x.id === id);
+  if (!r) return;
+  const f = document.getElementById("radar-form");
+  f.reset();
+  document.getElementById("radar-modal-title").textContent = "编辑雷达规则";
+  f.elements.id.value = r.id;
+  f.elements.name.value = r.name || "";
+  f.elements.rule_type.value = r.rule_type || "new_sku";
+  f.elements.account_id.value = r.account_id || "";
+  f.elements.endpoint.value = r.endpoint || "ovh-eu";
+  f.elements.subsidiary.value = r.subsidiary || "IE";
+  f.elements.keyword_pattern.value = r.keyword_pattern || "";
+  f.elements.memory_pattern.value = r.memory_pattern || "";
+  f.elements.storage_pattern.value = r.storage_pattern || "";
+  f.elements.datacenters.value = (r.datacenters || []).join(",");
+  f.elements.max_price.value = r.max_price ?? 0;
+  if (f.elements.proxy_url) f.elements.proxy_url.value = r.proxy_url || "";
+  f.elements.auto_snipe.checked = !!r.auto_snipe;
+  f.elements.dry_run.checked = !!r.dry_run;
+  f.elements.auto_pay.checked = !!r.auto_pay;
+  openModal("radar-modal");
 }
 
 // ---------- VPS ----------
@@ -613,10 +646,12 @@ function renderVps() {
             <code class="mono">${esc(w.plan_code)}</code>
             <span class="muted">(${esc(w.endpoint)} / ${esc(w.subsidiary)})</span>
             ${w.auto_order ? `<span class="pill ${w.dry_run ? "pill-blue" : "pill-amber"}">${w.dry_run ? "自动演练" : "自动下单"}</span>` : `<span class="pill pill-gray">仅监控</span>`}
+            ${w.proxy_url ? `<span class="pill pill-blue" title="已配独立监控代理">🌐代理</span>` : ""}
           </div>
           <div class="toolbar">
             <span class="muted">${esc(w.last_check_at || "尚未检测")}</span>
             <button class="btn btn-ghost btn-sm" onclick="toggleVps('${esc(w.id)}', ${!w.enabled})">${w.enabled ? "暂停" : "启用"}</button>
+            <button class="btn btn-ghost btn-sm" onclick="editVps('${esc(w.id)}')">编辑</button>
             <button class="btn btn-danger btn-sm" onclick="deleteVps('${esc(w.id)}')">删除</button>
           </div>
         </div>
@@ -635,6 +670,25 @@ async function deleteVps(id) {
   if (!confirm("确定删除该 VPS 监控？")) return;
   await api(`/api/vps/${id}`, { method: "DELETE" });
   refreshAll();
+}
+
+function editVps(id) {
+  const w = state.vps.find((x) => x.id === id);
+  if (!w) return;
+  const f = document.getElementById("vps-form");
+  f.reset();
+  document.getElementById("vps-modal-title").textContent = "编辑 VPS 监控";
+  f.elements.id.value = w.id;
+  f.elements.plan_code.value = w.plan_code || "";
+  f.elements.endpoint.value = w.endpoint || "ovh-eu";
+  f.elements.subsidiary.value = w.subsidiary || "IE";
+  f.elements.datacenters.value = (w.datacenters || []).join(",");
+  f.elements.account_id.value = w.account_id || "";
+  if (f.elements.proxy_url) f.elements.proxy_url.value = w.proxy_url || "";
+  f.elements.auto_order.checked = !!w.auto_order;
+  f.elements.dry_run.checked = !!w.dry_run;
+  f.elements.auto_pay.checked = !!w.auto_pay;
+  openModal("vps-modal");
 }
 
 // ---------- Orders ----------
@@ -799,8 +853,9 @@ function renderAccounts() {
       const ver = a.nichandle
         ? `<div><span class="pill pill-green">${esc(a.nichandle)} (${esc(a.currency)})</span>${payBadge}</div><div class="muted mt-6">${esc(a.last_verified_at)}</div>`
         : `<span class="muted">未验证</span>`;
+      const pTag = a.proxy_url ? ` <span class="pill pill-blue" title="已绑定专属固定代理">🌐代理</span>` : "";
       return `<tr>
-        <td><b>${esc(a.name)}</b> ${def}</td>
+        <td><b>${esc(a.name)}</b> ${def}${pTag}</td>
         <td><code>${esc(a.endpoint)}</code> / <b>${esc(a.subsidiary)}</b></td>
         <td class="mono">${esc(a.app_key)}</td>
         <td>${ver}</td>
@@ -843,6 +898,7 @@ function editAccount(id) {
   form.elements.app_key.value = a.app_key;
   form.elements.app_secret.value = "";
   form.elements.consumer_key.value = "";
+  if (form.elements.proxy_url) form.elements.proxy_url.value = a.proxy_url || "";
   form.elements.is_default.checked = !!a.is_default;
   openModal("account-modal");
 }
@@ -1033,6 +1089,7 @@ function bindEvents() {
       poll_interval: parseInt(f.elements.poll_interval.value || "5", 10) || 5,
       os_code: f.elements.os_code.value.trim() || "none_64.en",
       coupons: f.elements.coupons.value,
+      proxy_url: f.elements.proxy_url ? f.elements.proxy_url.value.trim() : "",
       fast_lane: f.elements.fast_lane.checked,
       allow_non_default: f.elements.allow_non_default.checked,
       dry_run: f.elements.dry_run.checked,
@@ -1072,6 +1129,7 @@ function bindEvents() {
       app_key: f.elements.app_key.value.trim(),
       app_secret: f.elements.app_secret.value.trim(),
       consumer_key: f.elements.consumer_key.value.trim(),
+      proxy_url: f.elements.proxy_url ? f.elements.proxy_url.value.trim() : "",
       is_default: f.elements.is_default.checked,
     };
     try {
@@ -1087,33 +1145,37 @@ function bindEvents() {
 
   // Radar Modal & Scan
   document.getElementById("btn-open-radar-modal").addEventListener("click", () => {
-    document.getElementById("radar-form").reset();
+    const f = document.getElementById("radar-form");
+    f.reset();
+    f.elements.id.value = "";
+    document.getElementById("radar-modal-title").textContent = "新建雷达规则";
     openModal("radar-modal");
   });
   document.getElementById("radar-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = e.target;
+    const id = f.elements.id.value;
+    const body = {
+      name: f.elements.name.value.trim(),
+      rule_type: f.elements.rule_type.value,
+      account_id: f.elements.account_id.value,
+      endpoint: f.elements.endpoint.value,
+      subsidiary: f.elements.subsidiary.value.trim().toUpperCase(),
+      keyword_pattern: f.elements.keyword_pattern.value.trim(),
+      memory_pattern: f.elements.memory_pattern.value.trim(),
+      storage_pattern: f.elements.storage_pattern.value.trim(),
+      datacenters: f.elements.datacenters.value,
+      max_price: parseFloat(f.elements.max_price.value || "0") || 0,
+      proxy_url: f.elements.proxy_url ? f.elements.proxy_url.value.trim() : "",
+      auto_snipe: f.elements.auto_snipe.checked,
+      dry_run: f.elements.dry_run.checked,
+      auto_pay: f.elements.auto_pay.checked,
+    };
     try {
-      await api("/api/radar", {
-        method: "POST",
-        body: {
-          name: f.elements.name.value.trim(),
-          rule_type: f.elements.rule_type.value,
-          account_id: f.elements.account_id.value,
-          endpoint: f.elements.endpoint.value,
-          subsidiary: f.elements.subsidiary.value.trim().toUpperCase(),
-          keyword_pattern: f.elements.keyword_pattern.value.trim(),
-          memory_pattern: f.elements.memory_pattern.value.trim(),
-          storage_pattern: f.elements.storage_pattern.value.trim(),
-          datacenters: f.elements.datacenters.value,
-          max_price: parseFloat(f.elements.max_price.value || "0") || 0,
-          auto_snipe: f.elements.auto_snipe.checked,
-          dry_run: f.elements.dry_run.checked,
-          auto_pay: f.elements.auto_pay.checked,
-        },
-      });
+      if (id) await api(`/api/radar/${id}`, { method: "PUT", body });
+      else await api("/api/radar", { method: "POST", body });
       closeModal("radar-modal");
-      toast("黑五雷达规则已创建", "ok");
+      toast(id ? "黑五雷达规则已更新" : "黑五雷达规则已创建", "ok");
       refreshAll();
     } catch (err) {
       toast(err.message, "err");
@@ -1132,28 +1194,32 @@ function bindEvents() {
 
   // VPS Modal & Scan
   document.getElementById("btn-open-vps-modal").addEventListener("click", () => {
-    document.getElementById("vps-form").reset();
+    const f = document.getElementById("vps-form");
+    f.reset();
+    f.elements.id.value = "";
+    document.getElementById("vps-modal-title").textContent = "添加 VPS 监控";
     openModal("vps-modal");
   });
   document.getElementById("vps-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = e.target;
+    const id = f.elements.id.value;
+    const body = {
+      plan_code: f.elements.plan_code.value.trim(),
+      endpoint: f.elements.endpoint.value,
+      subsidiary: f.elements.subsidiary.value.trim().toUpperCase(),
+      datacenters: f.elements.datacenters.value,
+      account_id: f.elements.account_id.value,
+      proxy_url: f.elements.proxy_url ? f.elements.proxy_url.value.trim() : "",
+      auto_order: f.elements.auto_order.checked,
+      dry_run: f.elements.dry_run.checked,
+      auto_pay: f.elements.auto_pay.checked,
+    };
     try {
-      await api("/api/vps", {
-        method: "POST",
-        body: {
-          plan_code: f.elements.plan_code.value.trim(),
-          endpoint: f.elements.endpoint.value,
-          subsidiary: f.elements.subsidiary.value.trim().toUpperCase(),
-          datacenters: f.elements.datacenters.value,
-          account_id: f.elements.account_id.value,
-          auto_order: f.elements.auto_order.checked,
-          dry_run: f.elements.dry_run.checked,
-          auto_pay: f.elements.auto_pay.checked,
-        },
-      });
+      if (id) await api(`/api/vps/${id}`, { method: "PUT", body });
+      else await api("/api/vps", { method: "POST", body });
       closeModal("vps-modal");
-      toast("VPS 监控已添加", "ok");
+      toast(id ? "VPS 监控已更新" : "VPS 监控已添加", "ok");
       refreshAll();
     } catch (err) {
       toast(err.message, "err");
@@ -1317,6 +1383,85 @@ function bindEvents() {
     }
   });
 
+  // Monitor Proxy Modal & Tester
+  document.querySelectorAll(".js-open-proxy-modal").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        const s = await api("/api/settings");
+        document.getElementById("proxy-modal-textarea").value = s.monitor_proxies || s.http_proxy || "";
+        document.getElementById("proxy-modal-fallback").checked = s.monitor_proxy_fallback_direct !== false;
+        document.getElementById("proxy-modal-order-use").checked = !!s.order_use_proxy;
+        document.getElementById("proxy-test-results").innerHTML = "";
+        openModal("proxy-modal");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+  });
+
+  async function runProxyTest(rawText, endpoint = "ovh-eu", targetBox = null) {
+    if (!rawText || !rawText.trim()) {
+      toast("请先填写至少一条代理地址再测速", "err");
+      return;
+    }
+    toast("正在测试代理连接 OVH API...", "info");
+    if (targetBox) targetBox.innerHTML = `<div class="muted">⏳ 正在并发测试连接 ${esc(endpoint)} ...</div>`;
+    try {
+      const res = await api("/api/proxy/test", { method: "POST", body: { proxies: rawText, endpoint } });
+      const items = res.results || [];
+      if (targetBox) {
+        targetBox.innerHTML = items
+          .map((r) =>
+            r.ok
+              ? `<div class="list-row"><span>✅ <code class="mono">${esc(r.proxy)}</code></span><span class="pill pill-green">${r.latency_ms} ms</span></div>`
+              : `<div class="list-row"><div>❌ <code class="mono">${esc(r.proxy)}</code><div class="error-text" style="margin:4px 0 0">${esc(r.error)}</div></div><span class="pill pill-red">失败</span></div>`
+          )
+          .join("");
+      }
+      if (res.passed === res.total) toast(`全部 ${res.total} 条代理测速通过!`, "ok");
+      else if (res.passed > 0) toast(`测速完成: ${res.passed}/${res.total} 条代理可用`, "info");
+      else toast(`全部 ${res.total} 条代理连接失败，请检查协议/账号密码/防火墙`, "err");
+    } catch (err) {
+      if (targetBox) targetBox.innerHTML = `<div class="error-text">${esc(err.message)}</div>`;
+      toast(`代理测试失败: ${err.message}`, "err");
+    }
+  }
+
+  document.getElementById("btn-run-proxy-test").addEventListener("click", () => {
+    const raw = document.getElementById("proxy-modal-textarea").value;
+    const ep = document.getElementById("proxy-test-endpoint").value;
+    runProxyTest(raw, ep, document.getElementById("proxy-test-results"));
+  });
+
+  const settingsProxyTestBtn = document.getElementById("btn-test-settings-proxy");
+  if (settingsProxyTestBtn) {
+    settingsProxyTestBtn.addEventListener("click", () => {
+      const f = document.getElementById("settings-form");
+      const raw = (f.elements.monitor_proxies && f.elements.monitor_proxies.value.trim()) || f.elements.http_proxy.value.trim();
+      runProxyTest(raw, "ovh-eu", null);
+    });
+  }
+
+  document.getElementById("proxy-modal-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/api/settings", {
+        method: "PUT",
+        body: {
+          monitor_proxies: document.getElementById("proxy-modal-textarea").value.trim(),
+          monitor_proxy_fallback_direct: document.getElementById("proxy-modal-fallback").checked,
+          order_use_proxy: document.getElementById("proxy-modal-order-use").checked,
+        },
+      });
+      closeModal("proxy-modal");
+      toast("监控代理配置已保存并立即生效!", "ok");
+      if (state.activeTab === "settings") loadSettings();
+      refreshAll();
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  });
+
   // Logs
   document.getElementById("log-filter-level").addEventListener("change", loadLogs);
   document.getElementById("log-filter-source").addEventListener("change", loadLogs);
@@ -1373,8 +1518,10 @@ window.runTaskNow = runTaskNow;
 window.editTask = editTask;
 window.deleteTask = deleteTask;
 window.toggleRadar = toggleRadar;
+window.editRadar = editRadar;
 window.deleteRadar = deleteRadar;
 window.toggleVps = toggleVps;
+window.editVps = editVps;
 window.deleteVps = deleteVps;
 window.testAccount = testAccount;
 window.editAccount = editAccount;

@@ -1,11 +1,12 @@
 """Background Sniper v2.0, Prebuilt Cart Fast Lane, Delivery Tracker, BF Radar, and VPS Monitor."""
 
+import concurrent.futures
 import os
 import re
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .catalog import (
     CatalogManager,
@@ -26,7 +27,7 @@ from .config import (
 from .database import Database, now_iso
 from .notifier import Notifier
 from .order_engine import CartSlotPool, OrderEngine, safe_delete_cart
-from .ovh_client import OVHClient
+from .ovh_client import OVHAPIError, OVHClient, ProxyRotator, parse_proxy_list, redact_proxy_url
 from .specs import GLOBAL_FX
 from .tracker import OrderTracker
 
@@ -47,6 +48,7 @@ class SniperEngine:
         self.order_engine = order_engine
         self.notifier = notifier
         self._custom_client_factory = client_factory
+        self.proxy_rotator = ProxyRotator(cooldown_seconds=30.0)
 
         self.slot_pool = CartSlotPool(order_engine, log_fn=db.add_log)
         self.tracker = OrderTracker(
@@ -96,18 +98,55 @@ class SniperEngine:
             }
         )
 
-    # ---------- Client Construction ----------
+    # ---------- Client & Proxy Construction ----------
 
-    def build_client(self, account: Optional[Dict[str, Any]] = None, endpoint: str = "ovh-eu") -> OVHClient:
-        settings = self.db.get_settings()
-        qps = float(settings.get("global_qps") or 4.0)
-        proxy = str(
+    def _select_proxy(
+        self,
+        settings: Dict[str, Any],
+        account: Optional[Dict[str, Any]] = None,
+        proxy_override: str = "",
+        exclude: Optional[set] = None,
+    ) -> Tuple[str, str]:
+        """Return (chosen_proxy_url, raw_pool_source) for monitoring vs authenticated ordering."""
+        fallback_global = str(
             settings.get("http_proxy")
             or os.environ.get("OVH_HTTP_PROXY")
             or os.environ.get("HTTPS_PROXY")
             or os.environ.get("HTTP_PROXY")
             or ""
         ).strip()
+        monitor_raw = str(settings.get("monitor_proxies") or os.environ.get("OVH_MONITOR_PROXIES") or "").strip()
+
+        if account is None:
+            pool_src = proxy_override.strip() or monitor_raw or fallback_global
+            return self.proxy_rotator.pick(pool_src, exclude=exclude), pool_src
+
+        if proxy_override.strip():
+            pool_src = proxy_override.strip()
+            return self.proxy_rotator.pick(pool_src, exclude=exclude), pool_src
+
+        acc_proxy = str(account.get("proxy_url") or "").strip()
+        if acc_proxy:
+            return self.proxy_rotator.pick(acc_proxy, exclude=exclude), acc_proxy
+
+        if settings.get("order_use_proxy", False) and monitor_raw:
+            return self.proxy_rotator.pick(monitor_raw, exclude=exclude), monitor_raw
+
+        return self.proxy_rotator.pick(fallback_global, exclude=exclude), fallback_global
+
+    def build_client(
+        self,
+        account: Optional[Dict[str, Any]] = None,
+        endpoint: str = "ovh-eu",
+        proxy_override: str = "",
+        explicit_proxy: Optional[str] = None,
+    ) -> OVHClient:
+        settings = self.db.get_settings()
+        qps = float(settings.get("global_qps") or 4.0)
+        if explicit_proxy is not None:
+            proxy = explicit_proxy
+        else:
+            proxy, _ = self._select_proxy(settings, account=account, proxy_override=proxy_override)
         if self._custom_client_factory:
             return self._custom_client_factory(account=account, endpoint=endpoint, qps=qps, proxy=proxy)
         if account:
@@ -120,6 +159,107 @@ class SniperEngine:
                 qps=qps,
             )
         return OVHClient(endpoint=endpoint, proxy_url=proxy, qps=qps)
+
+    def run_monitor_call(
+        self,
+        endpoint: str,
+        fn: Callable[[OVHClient], Any],
+        proxy_override: str = "",
+    ) -> Any:
+        """Execute a public monitoring request with automatic proxy rotation & optional direct fallback."""
+        if self._custom_client_factory:
+            return fn(self.build_client(account=None, endpoint=endpoint, proxy_override=proxy_override))
+
+        settings = self.db.get_settings()
+        first_proxy, pool_src = self._select_proxy(settings, account=None, proxy_override=proxy_override)
+        if not first_proxy:
+            return fn(self.build_client(account=None, endpoint=endpoint, explicit_proxy=""))
+
+        pool_items = parse_proxy_list(pool_src)
+        max_proxy_tries = max(1, min(3, len(pool_items)))
+        tried: set = set()
+        last_err: Optional[Exception] = None
+        cand = first_proxy
+
+        for _ in range(max_proxy_tries):
+            if not cand:
+                break
+            tried.add(cand)
+            client = self.build_client(account=None, endpoint=endpoint, explicit_proxy=cand)
+            try:
+                res = fn(client)
+                self.proxy_rotator.mark_ok(cand)
+                return res
+            except OVHAPIError as exc:
+                last_err = exc
+                if exc.status_code in (0, 403, 407, 429, 502, 503, 504):
+                    self.proxy_rotator.mark_failed(cand)
+                    cand, _ = self._select_proxy(settings, account=None, proxy_override=proxy_override, exclude=tried)
+                    continue
+                raise
+            except Exception as exc:
+                last_err = exc
+                self.proxy_rotator.mark_failed(cand)
+                cand, _ = self._select_proxy(settings, account=None, proxy_override=proxy_override, exclude=tried)
+
+        # Optional direct fallback when all configured monitoring proxies fail
+        if settings.get("monitor_proxy_fallback_direct", True) and not proxy_override.strip():
+            self.db.add_log(
+                "WARNING",
+                f"监控代理全部请求失败 ({redact_proxy_url(first_proxy)}: {last_err})，本次自动回退本机直连",
+                "proxy",
+            )
+            return fn(self.build_client(account=None, endpoint=endpoint, explicit_proxy=""))
+
+        if last_err:
+            raise last_err
+        return fn(self.build_client(account=None, endpoint=endpoint, explicit_proxy=""))
+
+    def test_proxies(self, raw_proxies: str = "", endpoint: str = "ovh-eu") -> Dict[str, Any]:
+        """Test connectivity & latency (ms) of configured proxies against OVH API."""
+        settings = self.db.get_settings()
+        src = raw_proxies.strip() if raw_proxies and raw_proxies.strip() else str(
+            settings.get("monitor_proxies") or settings.get("http_proxy") or ""
+        ).strip()
+        proxies = parse_proxy_list(src)[:15]
+        if not proxies:
+            return {"ok": False, "error": "请先输入至少一条代理地址（如 http://127.0.0.1:7890 或 socks5://user:pass@ip:port）", "results": []}
+
+        ep = endpoint if endpoint in ("ovh-eu", "ovh-ca", "ovh-us") else "ovh-eu"
+
+        def _probe(p_url: str) -> Dict[str, Any]:
+            t0 = time.monotonic()
+            cli = OVHClient(endpoint=ep, proxy_url=p_url, qps=20.0, timeout=8.0, max_retries=1)
+            try:
+                srv_ts = cli._raw_request("GET", f"{cli.api_base}/auth/time")
+                ms = int((time.monotonic() - t0) * 1000)
+                return {
+                    "proxy": redact_proxy_url(p_url),
+                    "ok": True,
+                    "latency_ms": ms,
+                    "server_time": srv_ts,
+                    "error": "",
+                }
+            except Exception as exc:
+                ms = int((time.monotonic() - t0) * 1000)
+                return {
+                    "proxy": redact_proxy_url(p_url),
+                    "ok": False,
+                    "latency_ms": ms,
+                    "server_time": None,
+                    "error": str(exc),
+                }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(proxies))) as pool:
+            results = list(pool.map(_probe, proxies))
+        passed = sum(1 for r in results if r["ok"])
+        return {
+            "ok": passed > 0,
+            "endpoint": ep,
+            "total": len(results),
+            "passed": passed,
+            "results": results,
+        }
 
     def get_account_for_id(self, account_id: str) -> Optional[Dict[str, Any]]:
         """Resolve an account. Falls back to the default account ONLY when no account was specified,
@@ -195,6 +335,7 @@ class SniperEngine:
     def get_status(self) -> Dict[str, Any]:
         settings = self.db.get_settings()
         uptime = int(time.time() - self.started_at) if self.started_at else 0
+        proxy_list = parse_proxy_list(str(settings.get("monitor_proxies") or settings.get("http_proxy") or ""))
         return {
             "running": not self._stop_event.is_set() and any(t.is_alive() for t in self._threads),
             "sniper_enabled": bool(settings.get("sniper_enabled", True)),
@@ -202,6 +343,8 @@ class SniperEngine:
             "tracker_enabled": bool(settings.get("tracker_enabled", True)),
             "radar_enabled": bool(settings.get("radar_enabled", False)),
             "vps_monitor_enabled": bool(settings.get("vps_monitor_enabled", False)),
+            "monitor_proxy_count": len(proxy_list),
+            "order_use_proxy": bool(settings.get("order_use_proxy", False)),
             "uptime_seconds": uptime,
             "total_polls": self.total_polls,
             "stock_hits": self.stock_hits,
@@ -322,24 +465,24 @@ class SniperEngine:
         if not due_tasks:
             return 0
 
-        by_endpoint: Dict[str, List[Dict[str, Any]]] = {}
+        by_group: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for task in due_tasks:
             acc = self.get_account_for_id(task["account_id"])
             ep = (acc or {}).get("endpoint") or "ovh-eu"
-            by_endpoint.setdefault(ep, []).append(task)
+            p_ovr = str(task.get("proxy_url") or "").strip()
+            by_group.setdefault((ep, p_ovr), []).append(task)
 
         settings = self.db.get_settings()
         bulk_threshold = int(settings.get("bulk_availability_threshold") or 3)
         processed = 0
 
-        for ep, ep_tasks in by_endpoint.items():
+        for (ep, p_ovr), ep_tasks in by_group.items():
             unique_plans = sorted({t["plan_code"] for t in ep_tasks if t["plan_code"]})
             avail_by_plan: Dict[str, List[Dict[str, Any]]] = {}
-            pub_client = self.build_client(account=None, endpoint=ep)
 
             if len(unique_plans) >= bulk_threshold:
                 try:
-                    bulk_list = pub_client.get_availabilities("")
+                    bulk_list = self.run_monitor_call(ep, lambda cli: cli.get_availabilities(""), proxy_override=p_ovr)
                     self.total_polls += 1
                     plan_set = set(unique_plans)
                     for item in bulk_list:
@@ -352,7 +495,9 @@ class SniperEngine:
             for pc in unique_plans:
                 if pc not in avail_by_plan:
                     try:
-                        avail_by_plan[pc] = pub_client.get_availabilities(pc)
+                        avail_by_plan[pc] = self.run_monitor_call(
+                            ep, lambda cli, code=pc: cli.get_availabilities(code), proxy_override=p_ovr
+                        )
                         self.total_polls += 1
                     except Exception as exc:
                         self.db.add_log("WARNING", f"查询 {pc} 库存失败: {exc}", "sniper")
@@ -399,9 +544,13 @@ class SniperEngine:
         subsidiary = (acc or {}).get("subsidiary") or "IE"
         plan_summary = None
         try:
-            pub_client = self.build_client(account=None, endpoint=endpoint)
-            plan_summary = self.catalog_manager.find_plan(
-                pub_client, plan_code, subsidiary=subsidiary, product_line=task["product_line"]
+            p_ovr = str(task.get("proxy_url") or "").strip()
+            plan_summary = self.run_monitor_call(
+                endpoint,
+                lambda cli: self.catalog_manager.find_plan(
+                    cli, plan_code, subsidiary=subsidiary, product_line=task["product_line"]
+                ),
+                proxy_override=p_ovr,
             )
         except Exception:
             plan_summary = None
@@ -870,15 +1019,21 @@ class SniperEngine:
         rules = [r for r in self.db.list_radar_rules() if r["enabled"]]
         if not rules:
             return 0
-        by_market: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        by_market: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
         for rule in rules:
-            by_market.setdefault((rule["endpoint"], rule["subsidiary"]), []).append(rule)
+            p_ovr = str(rule.get("proxy_url") or "").strip()
+            by_market.setdefault((rule["endpoint"], rule["subsidiary"], p_ovr), []).append(rule)
 
         triggered = 0
-        for (ep, sub), market_rules in by_market.items():
+        for (ep, sub, p_ovr), market_rules in by_market.items():
             try:
-                client = self.build_client(account=None, endpoint=ep)
-                plans = self.catalog_manager.get_catalog_plans(client, subsidiary=sub, product_line="eco", force_refresh=True)
+                plans = self.run_monitor_call(
+                    ep,
+                    lambda cli, s=sub: self.catalog_manager.get_catalog_plans(
+                        cli, subsidiary=s, product_line="eco", force_refresh=True
+                    ),
+                    proxy_override=p_ovr,
+                )
             except Exception as exc:
                 self.db.add_log("WARNING", f"雷达拉取目录失败({ep}/{sub}): {exc}", "radar")
                 continue
@@ -972,6 +1127,7 @@ class SniperEngine:
                         "mode": "buy",
                         "priority": 50,
                         "poll_interval": 3,
+                        "proxy_url": rule.get("proxy_url", ""),
                         "source": f"radar:{rule['id']}",
                     }
                 )
@@ -1020,8 +1176,14 @@ class SniperEngine:
         checked = 0
         for w in watches:
             try:
-                pub_client = self.build_client(account=None, endpoint=w["endpoint"])
-                data = pub_client.get_vps_datacenter_availability(w["plan_code"], subsidiary=w["subsidiary"])
+                p_ovr = str(w.get("proxy_url") or "").strip()
+                data = self.run_monitor_call(
+                    w["endpoint"],
+                    lambda cli, pc=w["plan_code"], sb=w["subsidiary"]: cli.get_vps_datacenter_availability(
+                        pc, subsidiary=sb
+                    ),
+                    proxy_override=p_ovr,
+                )
                 dcs_raw = data.get("datacenters") or []
                 target_dcs = [d.upper() for d in (w.get("datacenters") or [])]
                 prev_state = w.get("last_state") or {}
@@ -1103,11 +1265,13 @@ class SniperEngine:
 
     def check_plan_live(self, plan_code: str, endpoint: str = "ovh-eu", subsidiary: str = "IE") -> List[Dict[str, Any]]:
         """Query live datacenter availabilities + phantom-stock status + Express URLs for a planCode."""
-        client = self.build_client(account=None, endpoint=endpoint)
-        items = client.get_availabilities(plan_code)
+        items = self.run_monitor_call(endpoint, lambda cli: cli.get_availabilities(plan_code))
         plan_summary = None
         try:
-            plan_summary = self.catalog_manager.find_plan(client, plan_code, subsidiary=subsidiary, product_line="eco")
+            plan_summary = self.run_monitor_call(
+                endpoint,
+                lambda cli: self.catalog_manager.find_plan(cli, plan_code, subsidiary=subsidiary, product_line="eco"),
+            )
         except Exception:
             plan_summary = None
         out = []
@@ -1219,7 +1383,11 @@ class SniperEngine:
         if not self._try_acquire_task(task_id):
             return {"success": False, "error": "该任务正在检测/下单中，请稍后再试"}
         try:
-            avail = client.get_availabilities(task["plan_code"])
+            avail = self.run_monitor_call(
+                acc["endpoint"],
+                lambda cli: cli.get_availabilities(task["plan_code"]),
+                proxy_override=str(task.get("proxy_url") or ""),
+            )
             self._task_last_poll[task["id"]] = time.time()
             self._evaluate_task_availability(task, acc["endpoint"], avail)
         finally:

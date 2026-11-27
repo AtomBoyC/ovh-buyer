@@ -82,7 +82,7 @@
 | **💱 人民币估价** | ECB 汇率（离线兜底），目录、订单、短链预览、推送都附 `≈ ¥xxx`。 |
 | **📣 Telegram Bot** | 零域名 Long Polling；HTML 补货卡片 + API 抢购按钮 + OVH Express 直达按钮，售罄自动划删除线；`/order` 短链下单、`/servers` 查独服。 |
 | **🔗 `@ovheco` 短链下单** | 本地解码 `/o/<region>/<token>`，建车报实时含税价，二次确认生成未付款订单（防双击）。 |
-| **📡 黑五雷达 & VPS 监控** | 新品上线雷达（`new_sku`）+ 配置指纹狙击（`config_match`，如 `>=32g` + `nvme`）；VPS 多机房补货监控。 |
+| **📡 黑五雷达 & VPS 监控** | 新品上线雷达（`new_sku`）+ 配置指纹狙击（`config_match`，如 `>=32g` + `nvme`）；VPS 多机房补货监控；**支持 HTTP / HTTPS / SOCKS5 监控专用代理池自动轮询与故障切换**。 |
 | **🔑 多账号 & 最小权限** | EU / CA / US 多账号，凭据可静态加密；内置最小权限 Token 申请链接；测试连通时检查默认支付方式。 |
 | **🎨 Web 控制台** | 浅色 / 深色主题，密码 / API-Key 门禁，SSE 实时日志，适配手机；另有无头模式与 CLI 工具。 |
 
@@ -356,7 +356,8 @@ location / {
 | `OVH_DATA_DIR` | `./data` | 数据库与缓存目录 |
 | `PUID` / `PGID` | `1000` / `1000` | Docker 容器运行与修正 `/app/data` 归属的目标 UID / GID |
 | `HEADLESS` | `false` | `true` 时只运行后台引擎与 Telegram Bot |
-| `OVH_HTTP_PROXY` / `HTTPS_PROXY` | 空 | 全局代理，如 `http://127.0.0.1:7890` |
+| `OVH_MONITOR_PROXIES` | 空 | 监控专用代理 / 代理池（支持多条轮询，`http://`、`https://`、`socks5://` 及 `ip:port:user:pass`） |
+| `OVH_HTTP_PROXY` / `HTTPS_PROXY` | 空 | 兜底全局代理，如 `http://127.0.0.1:7890` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 空 | Telegram 机器人与推送目标（支持 `-100xxx/话题ID` 或 `https://t.me/c/xxx/话题ID`） |
 | `TELEGRAM_TOPIC_ID` / `TELEGRAM_ADMIN_IDS` | 空 | 可选，默认群组话题 `message_thread_id` 与群内按钮授权个人 ID 列表 |
 | `OVH_ENDPOINT` / `OVH_SUBSIDIARY` / `OVH_APP_KEY` / `OVH_APP_SECRET` / `OVH_CONSUMER_KEY` | 空 | 可选，首次启动自动导入的默认账号 |
@@ -410,9 +411,9 @@ OVH 查价接口临时不可用。v2.1 起为安全起见不会盲下，接口�
 
 | 分支 / 标签 | 内容 |
 | :--- | :--- |
-| `main` | 最新版 **v2.1.x**（新界面 + 安全与 Docker/反代/Topic 修复），镜像 `:latest` / `:2.1.2` |
+| `main` | 最新版 **v2.1.x**（新界面 + 安全 + Docker/反代/Topic/监控代理池），镜像 `:latest` / `:2.1.3` |
 | [`legacy-v2.0`](https://github.com/AtomBoyC/ovh-buyer/tree/legacy-v2.0) | v2.0.0 旧界面版本，仅存档、不再更新；镜像 `:2.0.0` |
-| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` / `v2.1.2` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
+| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` / `v2.1.2` / `v2.1.3` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
 
 想继续用旧界面：
 

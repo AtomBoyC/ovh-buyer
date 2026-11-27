@@ -5,6 +5,7 @@ import hashlib
 import http.server
 import json
 import os
+import socket
 import socketserver
 import sqlite3
 import tempfile
@@ -45,7 +46,14 @@ from ovh_buyer.config import (
 from ovh_buyer.database import Database, protect_secret, reveal_secret
 from ovh_buyer.notifier import Notifier, parse_telegram_target, render_telegram_stock_card
 from ovh_buyer.order_engine import OrderEngine
-from ovh_buyer.ovh_client import OVHClient
+from ovh_buyer.ovh_client import (
+    OVHClient,
+    ProxyRotator,
+    normalize_proxy_url,
+    parse_proxy_config,
+    parse_proxy_list,
+    redact_proxy_url,
+)
 from ovh_buyer.sniper import SniperEngine
 from ovh_buyer.specs import FXConverter, compare_specs, parse_actual_hardware, parse_official_spec
 from ovh_buyer.web_server import AppContext, create_http_server
@@ -1219,6 +1227,169 @@ class TestOVHSniper(unittest.TestCase):
             self.notifier._authorized_user_ids(settings),
             {"111222333", "555666777"},
         )
+
+    def test_monitoring_proxies_http_and_socks5_and_failover(self):
+        # 1. Format parsing & credential redaction
+        norm_shorthand = normalize_proxy_url("192.0.2.10:8080:myuser:p@ss:123")
+        cfg_shorthand = parse_proxy_config(norm_shorthand)
+        self.assertIsNotNone(cfg_shorthand)
+        self.assertEqual(cfg_shorthand["scheme"], "http")
+        self.assertEqual(cfg_shorthand["host"], "192.0.2.10")
+        self.assertEqual(cfg_shorthand["port"], 8080)
+        self.assertEqual(cfg_shorthand["username"], "myuser")
+        self.assertEqual(cfg_shorthand["password"], "p@ss:123")
+        self.assertIn("****@192.0.2.10:8080", redact_proxy_url(norm_shorthand))
+
+        rot = ProxyRotator(cooldown_seconds=60.0)
+        raw_pool = "socks5://u:p@127.0.0.1:1081\nhttp://127.0.0.1:1082"
+        self.assertEqual(len(parse_proxy_list(raw_pool)), 2)
+        p1 = rot.pick(raw_pool)
+        p2 = rot.pick(raw_pool)
+        self.assertNotEqual(p1, p2)
+        rot.mark_failed(p1)
+        self.assertEqual(rot.pick(raw_pool), p2)
+
+        # 2. Spin up a real local SOCKS5 proxy (with RFC 1929 user/pass auth) forwarding to our mock OVH server
+        socks_hits = {"count": 0}
+        socks_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        socks_srv.bind(("127.0.0.1", 0))
+        socks_srv.listen(8)
+        socks_port = socks_srv.getsockname()[1]
+
+        def _relay_duplex(a: socket.socket, b: socket.socket):
+            def _pipe(src: socket.socket, dst: socket.socket):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except Exception:
+                        pass
+
+            t1 = threading.Thread(target=_pipe, args=(a, b), daemon=True)
+            t2 = threading.Thread(target=_pipe, args=(b, a), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            a.close()
+            b.close()
+
+        def _socks_worker():
+            while True:
+                try:
+                    cli_sock, _ = socks_srv.accept()
+                except OSError:
+                    break
+                try:
+                    hdr = cli_sock.recv(2)
+                    nmethods = hdr[1]
+                    methods = cli_sock.recv(nmethods)
+                    self.assertIn(0x02, methods)
+                    cli_sock.sendall(b"\x05\x02")
+                    ver = cli_sock.recv(1)[0]
+                    ulen = cli_sock.recv(1)[0]
+                    uname = cli_sock.recv(ulen).decode("utf-8")
+                    plen = cli_sock.recv(1)[0]
+                    upass = cli_sock.recv(plen).decode("utf-8")
+                    if ver != 1 or uname != "ovhuser" or upass != "ovhpass":
+                        cli_sock.sendall(b"\x01\x01")
+                        cli_sock.close()
+                        continue
+                    cli_sock.sendall(b"\x01\x00")
+                    req_hdr = cli_sock.recv(4)
+                    atyp = req_hdr[3]
+                    if atyp == 0x01:
+                        dst_host = socket.inet_ntoa(cli_sock.recv(4))
+                    elif atyp == 0x03:
+                        dlen = cli_sock.recv(1)[0]
+                        dst_host = cli_sock.recv(dlen).decode("utf-8")
+                    else:
+                        cli_sock.close()
+                        continue
+                    dst_port = int.from_bytes(cli_sock.recv(2), "big")
+                    upstream = socket.create_connection((dst_host, dst_port), timeout=5.0)
+                    socks_hits["count"] += 1
+                    cli_sock.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+                    threading.Thread(target=_relay_duplex, args=(cli_sock, upstream), daemon=True).start()
+                except Exception:
+                    try:
+                        cli_sock.close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_socks_worker, daemon=True).start()
+
+        # 3. Spin up a real local HTTP proxy (with Basic Auth) forwarding plain HTTP to mock OVH server
+        http_proxy_hits = {"count": 0}
+        expected_auth = "Basic " + base64.b64encode(b"huser:hpass").decode("ascii")
+
+        class _MockHTTPProxyHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):
+                if self.headers.get("Proxy-Authorization") != expected_auth:
+                    self.send_response(407)
+                    self.end_headers()
+                    return
+                http_proxy_hits["count"] += 1
+                direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with direct_opener.open(self.path, timeout=5.0) as up:
+                    body = up.read()
+                    self.send_response(up.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        http_proxy_srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _MockHTTPProxyHandler)
+        http_proxy_port = http_proxy_srv.server_address[1]
+        threading.Thread(target=http_proxy_srv.serve_forever, daemon=True).start()
+
+        try:
+            socks_url = f"socks5://ovhuser:ovhpass@127.0.0.1:{socks_port}"
+            http_p_url = f"127.0.0.1:{http_proxy_port}:huser:hpass"
+
+            c_socks = OVHClient(
+                endpoint="ovh-eu",
+                proxy_url=socks_url,
+                qps=50.0,
+                base_url_override=self.mock_base,
+                v1_url_override=self.mock_v1,
+            )
+            av1 = c_socks.get_availabilities("26skleb01")
+            self.assertEqual(len(av1), 1)
+            self.assertGreaterEqual(socks_hits["count"], 1)
+
+            c_http = OVHClient(
+                endpoint="ovh-eu",
+                proxy_url=http_p_url,
+                qps=50.0,
+                base_url_override=self.mock_base,
+                v1_url_override=self.mock_v1,
+            )
+            av2 = c_http.get_availabilities("26skleb01")
+            self.assertEqual(len(av2), 1)
+            self.assertGreaterEqual(http_proxy_hits["count"], 1)
+
+            # Verify monitor_proxies vs account direct isolation in SniperEngine._select_proxy
+            self.db.update_settings({"monitor_proxies": f"{socks_url}\n{http_p_url}", "order_use_proxy": False})
+            s_now = self.db.get_settings()
+            mon_p, _ = self.engine._select_proxy(s_now, account=None)
+            self.assertTrue(mon_p in (normalize_proxy_url(socks_url), normalize_proxy_url(http_p_url)))
+            ord_p, _ = self.engine._select_proxy(s_now, account={"id": "a1", "proxy_url": ""})
+            self.assertEqual(ord_p, "")
+        finally:
+            socks_srv.close()
+            http_proxy_srv.shutdown()
+            http_proxy_srv.server_close()
 
 
 if __name__ == "__main__":
