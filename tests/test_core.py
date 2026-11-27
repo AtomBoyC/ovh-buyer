@@ -1229,7 +1229,7 @@ class TestOVHSniper(unittest.TestCase):
         )
 
     def test_monitoring_proxies_http_and_socks5_and_failover(self):
-        # 1. Format parsing & credential redaction
+        # 1. Format parsing & credential redaction (bare & scheme-prefixed shorthand, passwords with @/,/;)
         norm_shorthand = normalize_proxy_url("192.0.2.10:8080:myuser:p@ss:123")
         cfg_shorthand = parse_proxy_config(norm_shorthand)
         self.assertIsNotNone(cfg_shorthand)
@@ -1239,6 +1239,27 @@ class TestOVHSniper(unittest.TestCase):
         self.assertEqual(cfg_shorthand["username"], "myuser")
         self.assertEqual(cfg_shorthand["password"], "p@ss:123")
         self.assertIn("****@192.0.2.10:8080", redact_proxy_url(norm_shorthand))
+
+        cfg_socks_short = parse_proxy_config("socks5://192.0.2.10:1080:suser:s@p:99")
+        self.assertIsNotNone(cfg_socks_short)
+        self.assertEqual(cfg_socks_short["scheme"], "socks5")
+        self.assertEqual(cfg_socks_short["host"], "192.0.2.10")
+        self.assertEqual(cfg_socks_short["port"], 1080)
+        self.assertEqual(cfg_socks_short["username"], "suser")
+        self.assertEqual(cfg_socks_short["password"], "s@p:99")
+
+        # Standard URL whose password starts with digits + ':' must NOT be misparsed as shorthand
+        cfg_std = parse_proxy_config("http://myuser:12345:foo@192.0.2.20:8080")
+        self.assertIsNotNone(cfg_std)
+        self.assertEqual(cfg_std["host"], "192.0.2.20")
+        self.assertEqual(cfg_std["port"], 8080)
+        self.assertEqual(cfg_std["username"], "myuser")
+        self.assertEqual(cfg_std["password"], "12345:foo")
+
+        # Commas/semicolons inside passwords stay intact while inline multi-proxy lists still split
+        parsed_comma = parse_proxy_list("192.0.2.10:8080:u:p,a;b\nhttp://127.0.0.1:8081,socks5://127.0.0.1:1080")
+        self.assertEqual(len(parsed_comma), 3)
+        self.assertEqual(parse_proxy_config(parsed_comma[0])["password"], "p,a;b")
 
         rot = ProxyRotator(cooldown_seconds=60.0)
         raw_pool = "socks5://u:p@127.0.0.1:1081\nhttp://127.0.0.1:1082"

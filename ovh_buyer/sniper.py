@@ -221,7 +221,8 @@ class SniperEngine:
         src = raw_proxies.strip() if raw_proxies and raw_proxies.strip() else str(
             settings.get("monitor_proxies") or settings.get("http_proxy") or ""
         ).strip()
-        proxies = parse_proxy_list(src)[:15]
+        all_proxies = parse_proxy_list(src)
+        proxies = all_proxies[:20]
         if not proxies:
             return {"ok": False, "error": "请先输入至少一条代理地址（如 http://127.0.0.1:7890 或 socks5://user:pass@ip:port）", "results": []}
 
@@ -257,6 +258,7 @@ class SniperEngine:
             "ok": passed > 0,
             "endpoint": ep,
             "total": len(results),
+            "configured_total": len(all_proxies),
             "passed": passed,
             "results": results,
         }

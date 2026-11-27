@@ -129,23 +129,42 @@ def get_endpoint_rate_limiter(endpoint: str, qps: float = 4.0) -> RateLimiter:
         return limiter
 
 
+def _try_shorthand_to_url(scheme: str, body: str) -> Optional[str]:
+    """Convert host:port:user:pass shorthand to scheme://user:pass@host:port when unambiguous."""
+    s = body.strip()
+    if not s or s.startswith("["):
+        return None
+    parts = s.split(":")
+    if len(parts) < 4 or not parts[1].isdigit() or "@" in parts[0] or "@" in parts[1]:
+        return None
+    port_num = int(parts[1])
+    if not (1 <= port_num <= 65535):
+        return None
+    # When '@' appears later in the string, disambiguate host:port:user:p@ss from user:12345:foo@host:port:
+    # a proxy host is an IP or domain (contains '.' or is 'localhost').
+    if "@" in s and "." not in parts[0] and parts[0].lower() != "localhost":
+        return None
+    host, port, user = parts[0], parts[1], parts[2]
+    pw = ":".join(parts[3:])
+    u_enc = urllib.parse.quote(user, safe="")
+    p_enc = urllib.parse.quote(pw, safe="")
+    return f"{scheme}://{u_enc}:{p_enc}@{host}:{port}"
+
+
 def normalize_proxy_url(raw: str) -> str:
-    """Normalize proxy string into standard URL (supports http/https/socks5/socks5h & host:port:user:pass)."""
+    """Normalize proxy string into standard URL (supports http/https/socks5/socks5h & [scheme://]host:port:user:pass)."""
     s = str(raw or "").strip()
     if not s or s.lower() in ("direct", "none", "off"):
         return ""
     if "://" not in s:
-        parts = s.split(":")
-        # Commercial shorthand: host:port:user:pass (check BEFORE '@' so '@' inside password works)
-        if len(parts) >= 4 and parts[1].isdigit() and "@" not in parts[0] and "@" not in parts[1]:
-            host, port, user = parts[0], parts[1], parts[2]
-            pw = ":".join(parts[3:])
-            u_enc = urllib.parse.quote(user, safe="")
-            p_enc = urllib.parse.quote(pw, safe="")
-            return f"http://{u_enc}:{p_enc}@{host}:{port}"
-        if "@" in s:
-            return f"http://{s}"
+        shorthand = _try_shorthand_to_url("http", s)
+        if shorthand:
+            return shorthand
         return f"http://{s}"
+    scheme, rest = s.split("://", 1)
+    shorthand = _try_shorthand_to_url(scheme.lower(), rest)
+    if shorthand:
+        return shorthand
     return s
 
 
@@ -208,18 +227,27 @@ def redact_proxy_url(raw: str) -> str:
     return f"{cfg['scheme']}://{host_fmt}:{cfg['port']}"
 
 
+_PROXY_INLINE_SEP_RE = re.compile(
+    r"[,;]+(?=\s*(?:(?:https?|socks5?h?|socks)://|[A-Za-z0-9._-]+:\d{2,5}(?:\b|:)|\[[0-9a-fA-F:]+\]:\d+))"
+)
+
+
 def parse_proxy_list(raw: str) -> List[str]:
-    """Split multi-line / comma / semicolon proxy list into normalized URLs."""
+    """Split multi-line / comma / semicolon proxy list into normalized URLs without splitting passwords."""
     if not raw:
         return []
     out: List[str] = []
-    for line in re.split(r"[\r\n,;]+", str(raw)):
-        cleaned = line.strip()
-        if not cleaned or cleaned.startswith("#"):
+    for raw_line in str(raw).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
-        norm = normalize_proxy_url(cleaned)
-        if norm and norm not in out:
-            out.append(norm)
+        for token in _PROXY_INLINE_SEP_RE.split(line):
+            cleaned = token.strip()
+            if not cleaned or cleaned.startswith("#"):
+                continue
+            norm = normalize_proxy_url(cleaned)
+            if norm and norm not in out:
+                out.append(norm)
     return out
 
 
@@ -358,7 +386,8 @@ def _connect_socks5_socket(
 class _PreconnectedHTTPConnection(http.client.HTTPConnection):
     """HTTPConnection wrapper around an already-connected (plain or TLS-wrapped) socket."""
 
-    def __init__(self, host: str, port: int, pre_sock: socket.socket, timeout: float):
+    def __init__(self, host: str, port: int, pre_sock: socket.socket, timeout: float, is_https: bool = False):
+        self.default_port = 443 if is_https else 80
         super().__init__(host, port, timeout=timeout)
         self._pre_sock = pre_sock
 
@@ -481,7 +510,9 @@ class OVHClient:
                 raw_sock = _connect_socks5_socket(proxy_cfg, target_host, target_port, timeout=self.timeout)
                 if scheme == "https":
                     raw_sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=target_host)
-                conn = _PreconnectedHTTPConnection(target_host, target_port, raw_sock, timeout=self.timeout)
+                conn = _PreconnectedHTTPConnection(
+                    target_host, target_port, raw_sock, timeout=self.timeout, is_https=(scheme == "https")
+                )
                 conn.request(method, path_with_query, body=body_bytes, headers=headers)
             else:
                 proxy_headers: Dict[str, str] = {}
@@ -511,7 +542,9 @@ class OVHClient:
                             tls_proxy_sock.close()
                             raise OVHAPIError(f"HTTPS 代理隧道握手失败 ({proxy_disp}): {first_line}", status_code=0)
                         inner_tls = ssl_ctx.wrap_socket(tls_proxy_sock, server_hostname=target_host)
-                        conn = _PreconnectedHTTPConnection(target_host, target_port, inner_tls, timeout=self.timeout)
+                        conn = _PreconnectedHTTPConnection(
+                            target_host, target_port, inner_tls, timeout=self.timeout, is_https=True
+                        )
                     else:
                         conn = http.client.HTTPSConnection(
                             proxy_cfg["host"], proxy_cfg["port"], timeout=self.timeout, context=ssl_ctx

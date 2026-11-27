@@ -1399,38 +1399,56 @@ function bindEvents() {
     });
   });
 
-  async function runProxyTest(rawText, endpoint = "ovh-eu", targetBox = null) {
+  async function runProxyTest(rawText, endpoint = "ovh-eu", targetBox = null, triggerBtn = null) {
     if (!rawText || !rawText.trim()) {
       toast("请先填写至少一条代理地址再测速", "err");
+      if (targetBox) targetBox.innerHTML = `<div class="error-text" style="margin:0">请先填写至少一条代理地址再测速</div>`;
       return;
+    }
+    const origLabel = triggerBtn ? triggerBtn.textContent : "";
+    if (triggerBtn) {
+      triggerBtn.disabled = true;
+      triggerBtn.textContent = "⏳ 测速中...";
     }
     toast("正在测试代理连接 OVH API...", "info");
     if (targetBox) targetBox.innerHTML = `<div class="muted">⏳ 正在并发测试连接 ${esc(endpoint)} ...</div>`;
     try {
       const res = await api("/api/proxy/test", { method: "POST", body: { proxies: rawText, endpoint } });
       const items = res.results || [];
+      const capNote =
+        res.configured_total && res.configured_total > res.total
+          ? `<div class="muted">提示：共配置 ${res.configured_total} 条代理，单次测速显示前 ${res.total} 条。</div>`
+          : "";
       if (targetBox) {
-        targetBox.innerHTML = items
-          .map((r) =>
-            r.ok
-              ? `<div class="list-row"><span>✅ <code class="mono">${esc(r.proxy)}</code></span><span class="pill pill-green">${r.latency_ms} ms</span></div>`
-              : `<div class="list-row"><div>❌ <code class="mono">${esc(r.proxy)}</code><div class="error-text" style="margin:4px 0 0">${esc(r.error)}</div></div><span class="pill pill-red">失败</span></div>`
-          )
-          .join("");
+        targetBox.innerHTML =
+          capNote +
+          items
+            .map((r) =>
+              r.ok
+                ? `<div class="list-row"><span>✅ <code class="mono">${esc(r.proxy)}</code></span><span class="pill pill-green">${r.latency_ms} ms</span></div>`
+                : `<div class="list-row"><div>❌ <code class="mono">${esc(r.proxy)}</code><div class="error-text" style="margin:4px 0 0">${esc(r.error)}</div></div><span class="pill pill-red">失败</span></div>`
+            )
+            .join("");
       }
       if (res.passed === res.total) toast(`全部 ${res.total} 条代理测速通过!`, "ok");
       else if (res.passed > 0) toast(`测速完成: ${res.passed}/${res.total} 条代理可用`, "info");
       else toast(`全部 ${res.total} 条代理连接失败，请检查协议/账号密码/防火墙`, "err");
     } catch (err) {
-      if (targetBox) targetBox.innerHTML = `<div class="error-text">${esc(err.message)}</div>`;
+      if (targetBox) targetBox.innerHTML = `<div class="error-text" style="margin:0">${esc(err.message)}</div>`;
       toast(`代理测试失败: ${err.message}`, "err");
+    } finally {
+      if (triggerBtn) {
+        triggerBtn.disabled = false;
+        triggerBtn.textContent = origLabel;
+      }
     }
   }
 
-  document.getElementById("btn-run-proxy-test").addEventListener("click", () => {
+  const modalProxyTestBtn = document.getElementById("btn-run-proxy-test");
+  modalProxyTestBtn.addEventListener("click", () => {
     const raw = document.getElementById("proxy-modal-textarea").value;
     const ep = document.getElementById("proxy-test-endpoint").value;
-    runProxyTest(raw, ep, document.getElementById("proxy-test-results"));
+    runProxyTest(raw, ep, document.getElementById("proxy-test-results"), modalProxyTestBtn);
   });
 
   const settingsProxyTestBtn = document.getElementById("btn-test-settings-proxy");
@@ -1438,7 +1456,9 @@ function bindEvents() {
     settingsProxyTestBtn.addEventListener("click", () => {
       const f = document.getElementById("settings-form");
       const raw = (f.elements.monitor_proxies && f.elements.monitor_proxies.value.trim()) || f.elements.http_proxy.value.trim();
-      runProxyTest(raw, "ovh-eu", null);
+      const epEl = document.getElementById("settings-proxy-test-endpoint");
+      const ep = (epEl && epEl.value) || "ovh-eu";
+      runProxyTest(raw, ep, document.getElementById("settings-proxy-test-results"), settingsProxyTestBtn);
     });
   }
 

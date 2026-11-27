@@ -523,11 +523,19 @@
               </div>
               <div class="form-section">监控专用代理池（查库存 / 雷达 / VPS 监控）</div>
               <div class="field">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
                   <label style="margin:0">监控代理列表（一行一个，自动轮询与故障切换，支持 HTTP / HTTPS / SOCKS5）</label>
-                  <button type="button" class="btn btn-sm" id="btn-test-settings-proxy">⚡ 测速验证代理</button>
+                  <div class="toolbar" style="gap:6px">
+                    <select id="settings-proxy-test-endpoint" style="height:28px;min-width:110px;font-size:12.5px">
+                      <option value="ovh-eu">OVH EU</option>
+                      <option value="ovh-ca">OVH CA</option>
+                      <option value="ovh-us">OVH US</option>
+                    </select>
+                    <button type="button" class="btn btn-sm" id="btn-test-settings-proxy">⚡ 测速验证代理</button>
+                  </div>
                 </div>
                 <textarea name="monitor_proxies" rows="3" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass"></textarea>
+                <div id="settings-proxy-test-results" class="list-stack mt-8" style="max-height:200px;overflow:auto"></div>
               </div>
               <div class="field checkbox-row">
                 <label><input type="checkbox" name="monitor_proxy_fallback_direct" /><span><b>监控代理全部不可用时允许回退本机直连</b><small>关闭则严格仅通过代理请求监控接口，绝不暴露本机 IP</small></span></label>
