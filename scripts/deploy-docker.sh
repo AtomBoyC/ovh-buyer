@@ -37,8 +37,11 @@ if [ ! -f .env ]; then
   echo "   (可随时编辑 .env 修改端口、密码或通知参数)"
 fi
 
-mkdir -p data
-chmod 755 data
+mkdir -p data/cache
+chmod 755 data data/cache
+if [ "$(id -u)" = "0" ]; then
+  chown -R "${PUID:-1000}:${PGID:-1000}" data 2>/dev/null || true
+fi
 
 if [ "$BUILD_LOCAL" -eq 1 ]; then
   echo "🐳 正在从本地源码构建并启动 OVH Sniper 容器..."

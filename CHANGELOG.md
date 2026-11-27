@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0
 
 ---
 
+## [2.1.1] - 2026-11-27
+
+### Fixed
+
+- **修复 Docker 挂载 `./data:/app/data` 启动报 `sqlite3.OperationalError: unable to open database file` 无限重启的问题**：
+  - 原因：旧版 `Dockerfile` 在构建期静态切换到系统用户 `USER appuser`（UID 100），而宿主机首次自动创建的 `./data` 目录归属为 `root:root (0755)`，挂载后覆盖镜像内目录权限导致容器无写入权限。
+  - 修复：引入 `scripts/docker-entrypoint.sh` + `su-exec`，容器启动时自动创建并修正 `/app/data` 目录归属（支持通过 `PUID` / `PGID` 自定义宿主机 UID/GID，默认 `1000:1000`），实测可写后再降权运行主进程；若挂载在禁止 `chown` 的特殊文件系统上则自动回退保证正常启动。
+- **修复 `HEADLESS=true` 模式下 Docker 健康检查误判 `unhealthy` 的问题**，并支持自定义容器内 `PORT`。
+- **修复 `.env` 中配置 `OVH_DATA_DIR` 加载顺序问题**，并在 SQLite 打开失败时输出包含路径、UID/GID 与修复命令的明确诊断提示；在不支持共享内存锁的 NFS/SMB 挂载上自动回退 `journal_mode=DELETE`；`CatalogManager` 在缓存目录只读时自动回退纯内存缓存。
+- **CI 新增宿主机 `root:root (0755)` Bind Mount 冒烟测试**，确保挂载卷读写与非 root 降权行为在每次构建中自动验证。
+- **加固 Cloudflare Tunnel (`cloudflared`) 与反向代理兼容性，并补充完整排障文档**：
+  - 当请求来自本机回环或内网反代时自动识别 `CF-Connecting-IP` / `X-Forwarded-For` 真实访客 IP，防止外部暴力试密把反代网关 IP（如 `127.0.0.1`）误锁死；
+  - 登录与登出 Cookie 同时兼容 `X-Forwarded-Proto: https` 与 Cloudflare `CF-Visitor` 头；
+  - `/api/logs/stream` SSE 实时日志流新增 `Cache-Control: no-cache, no-transform`、`X-Accel-Buffering: no` 与标准流式连接关闭语义，避免 Cloudflare 边缘压缩缓冲导致日志流卡顿；
+  - 在 `README.md` 补充 Cloudflare Tunnel 部署范例以及 `Error 1033`（隧道离线 / UDP 7844 受限加 `--protocol http2` / 旧 DNS CNAME 残留）、`502 Bad Gateway`（Docker 容器内 `127.0.0.1` 网络隔离）与 `403 WAF 拦截` 的排查方案。
+
+---
+
 ## [2.1.0] - 2026-11-24
 
 > 界面全新设计 + 一批涉及真实扣款的安全修复，**强烈建议所有用户升级**。数据库结构不变，直接 `docker compose pull && docker compose up -d` 即可。

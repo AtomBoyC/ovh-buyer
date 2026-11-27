@@ -11,9 +11,27 @@ from typing import Any, Dict, List, Optional
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("OVH_DATA_DIR", str(BASE_DIR / "data"))).resolve()
-DB_PATH = DATA_DIR / "ovh_buyer.db"
-CACHE_DIR = DATA_DIR / "cache"
+
+
+def get_data_dir() -> Path:
+    """Resolve active data directory from OVH_DATA_DIR (falling back to <BASE_DIR>/data)."""
+    raw = os.environ.get("OVH_DATA_DIR", "").strip()
+    return Path(raw).expanduser().resolve() if raw else (BASE_DIR / "data").resolve()
+
+
+def get_db_path() -> Path:
+    return get_data_dir() / "ovh_buyer.db"
+
+
+def get_cache_dir() -> Path:
+    return get_data_dir() / "cache"
+
+
+def _refresh_path_globals() -> None:
+    global DATA_DIR, DB_PATH, CACHE_DIR
+    DATA_DIR = get_data_dir()
+    DB_PATH = DATA_DIR / "ovh_buyer.db"
+    CACHE_DIR = DATA_DIR / "cache"
 
 
 def load_dotenv_file(env_path: Optional[Path] = None) -> None:
@@ -36,8 +54,12 @@ def load_dotenv_file(env_path: Optional[Path] = None) -> None:
                     os.environ[key] = value
     except OSError:
         pass
+    _refresh_path_globals()
 
 
+DATA_DIR = get_data_dir()
+DB_PATH = DATA_DIR / "ovh_buyer.db"
+CACHE_DIR = DATA_DIR / "cache"
 load_dotenv_file()
 
 

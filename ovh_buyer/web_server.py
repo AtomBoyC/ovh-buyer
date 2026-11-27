@@ -1,6 +1,7 @@
 """Zero-dependency HTTP REST API, SSE live log stream, and embedded Web UI server."""
 
 import http.server
+import ipaddress
 import json
 import mimetypes
 import queue
@@ -144,11 +145,31 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _client_ip(self) -> str:
-        return str(self.client_address[0] if self.client_address else "?")
+        peer = str(self.client_address[0] if self.client_address else "?")
+        try:
+            ip_obj = ipaddress.ip_address(peer)
+            trusted_proxy = ip_obj.is_loopback or ip_obj.is_private
+        except ValueError:
+            trusted_proxy = False
+        if trusted_proxy:
+            cf_ip = str(self.headers.get("CF-Connecting-IP") or "").strip()
+            if cf_ip:
+                return cf_ip
+            xff = str(self.headers.get("X-Forwarded-For") or "").strip()
+            if xff:
+                return xff.split(",")[0].strip() or peer
+        return peer
+
+    def _is_https_request(self) -> bool:
+        if str(self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+            return True
+        if '"https"' in str(self.headers.get("CF-Visitor") or "").lower():
+            return True
+        return False
 
     def _session_cookie(self) -> str:
         token = self.ctx.auth.create_session_token()
-        secure = "; Secure" if str(self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else ""
+        secure = "; Secure" if self._is_https_request() else ""
         return f"{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{secure}"
 
     def _check_auth(self, path: str) -> bool:
@@ -365,10 +386,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"error": "Not Found"}, status=404)
 
     def _handle_sse_logs(self) -> None:
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
         self.end_headers()
 
         q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=200)
@@ -423,7 +446,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/auth/logout":
-            cookie = f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+            secure = "; Secure" if self._is_https_request() else ""
+            cookie = f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
             self._send_json({"ok": True}, extra_headers={"Set-Cookie": cookie})
             return
 

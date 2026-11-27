@@ -213,7 +213,25 @@ docker compose down                           # 停止并移除
 > [!WARNING]
 > 不设置 `PANEL_PASSWORD` 时面板**完全开放**，任何人都能下单、改密码。部署到公网服务器务必设置强密码。
 
-推荐把端口改成 `127.0.0.1:8888:8888`，前置 Caddy / Nginx 提供 HTTPS（反代传 `X-Forwarded-Proto: https` 时会话 Cookie 自动加 `Secure`）：
+推荐把端口改成 `127.0.0.1:8888:8888`，前置 **Cloudflare Tunnel (`cloudflared`)** 或 **Caddy / Nginx** 提供 HTTPS（反代传 `X-Forwarded-Proto: https` 或 `CF-Visitor` 时会话 Cookie 自动加 `Secure`，且自动从 `CF-Connecting-IP` / `X-Forwarded-For` 识别真实访客 IP）：
+
+#### 方案 1：Cloudflare Tunnel 零公网端口穿透（推荐）
+
+1. 将 `docker-compose.yml` 中的 `ports` 改为仅监听本机回环：`"127.0.0.1:8888:8888"`。
+2. 在宿主机启动 `cloudflared`（**关键：若用 Docker 运行 `cloudflared`，务必加 `--network host`（否则容器内 `127.0.0.1` 指向 `cloudflared` 自己会报 `502`），并建议加 `--protocol http2` 避免部分 VPS 出站 UDP 7844 不通报 `Error 1033`**）：
+
+```bash
+docker run -d \
+  --name cloudflared \
+  --restart unless-stopped \
+  --network host \
+  cloudflare/cloudflared:latest \
+  tunnel --no-autoupdate --protocol http2 run --token <你的Tunnel_Token>
+```
+
+3. 在 Cloudflare Zero Trust → **Networks → Tunnels → Published applications** 添加域名并指向 `http://127.0.0.1:8888`（若不加 `--network host`，则将两个容器放进同一 Docker 网络并填 `http://ovh-sniper:8888`，或填宿主机网桥 IP `http://172.17.0.1:8888`）。
+
+#### 方案 2：Nginx / Caddy 反向代理
 
 ```nginx
 location / {
@@ -326,6 +344,7 @@ location / {
 | `PANEL_PASSWORD` | 空 | 面板密码（也可用 `X-API-Key` 请求头调用 API）。**公网务必设置** |
 | `DATA_ENCRYPTION_KEY` | 空 | 可选，OVH 凭据静态加密密钥 |
 | `OVH_DATA_DIR` | `./data` | 数据库与缓存目录 |
+| `PUID` / `PGID` | `1000` / `1000` | Docker 容器运行与修正 `/app/data` 归属的目标 UID / GID |
 | `HEADLESS` | `false` | `true` 时只运行后台引擎与 Telegram Bot |
 | `OVH_HTTP_PROXY` / `HTTPS_PROXY` | 空 | 全局代理，如 `http://127.0.0.1:7890` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 空 | Telegram 机器人与授权 ID 列表 |
@@ -365,15 +384,24 @@ OVH 查价接口临时不可用。v2.1 起为安全起见不会盲下，接口�
 **Q：升级会丢数据吗？**
 不会。数据都在 `./data`，启动时自动迁移结构。
 
+**Q：旧版镜像启动报 `sqlite3.OperationalError: unable to open database file`？**
+这是 v2.1.0 镜像在宿主机 `./data` 为 `root:root (755)` 时的挂载权限问题，已在 **v2.1.1+** 修复。直接执行 `docker compose pull && docker compose up -d` 升级最新镜像即可（若暂不拉取新镜像，在宿主机执行 `chmod 777 ./data` 或 `chown -R 100:101 ./data` 也可立即恢复）。
+
+**Q：裸连 `IP:8888` 正常，但用 Cloudflare Tunnel (`cloudflared`) 反代打不开？**
+按浏览器报错代码对应排查：
+- **报 `Error 1033 (Cloudflare Tunnel error)`**：说明 Cloudflare 边缘节点连不上你的 `cloudflared` 客户端（与 8888 端口无关）。① 检查 Zero Trust → Tunnels 状态是否为绿色 `HEALTHY`；② 很多 VPS 出站 UDP 7844 (QUIC) 被限流/丢包，给 `cloudflared` 启动参数加上 `--protocol http2` 强制走 TCP 即可秒通；③ 若隧道已是 `HEALTHY` 仍报 `1033`，去域名 **DNS → 记录** 检查该子域名的 `CNAME`（`<UUID>.cfargotunnel.com`）是否残留了以前删掉的旧隧道 UUID，改成当前隧道的 UUID 即可。
+- **报 `502 Bad Gateway`**：通常是因为 `cloudflared` 也跑在 Docker 容器里（默认桥接网络），此时填 `http://127.0.0.1:8888` 访问的是 `cloudflared` 容器自己。给 `cloudflared` 容器加 `--network host`，或把 CF 后台地址改成宿主机 Docker 网桥 IP（如 `http://172.17.0.1:8888`）或同网络容器名 `http://ovh-sniper:8888`。
+- **报 `403 Forbidden (Sorry, you have been blocked)`**：域名开启了高强度 WAF / Bot Fight Mode 拦截了面板 API 请求。在 Cloudflare **安全性 → WAF → 自定义规则** 为该子域名添加一条 **跳过 (Skip)** 规则（推荐改用 Cloudflare Zero Trust **Access** 邮箱验证码保护后台）。
+
 ---
 
 ## 🌿 版本与分支
 
 | 分支 / 标签 | 内容 |
 | :--- | :--- |
-| `main` | 最新版 **v2.1.x**（新界面 + 安全修复），镜像 `:latest` / `:2.1.0` |
+| `main` | 最新版 **v2.1.x**（新界面 + 安全与 Docker/反代修复），镜像 `:latest` / `:2.1.1` |
 | [`legacy-v2.0`](https://github.com/AtomBoyC/ovh-buyer/tree/legacy-v2.0) | v2.0.0 旧界面版本，仅存档、不再更新；镜像 `:2.0.0` |
-| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
+| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
 
 想继续用旧界面：
 

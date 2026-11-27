@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .config import CACHE_DIR, NON_HARDWARE_OPTION_TERMS
+from .config import CACHE_DIR, NON_HARDWARE_OPTION_TERMS, get_cache_dir
 from .ovh_client import OVHClient
 
 
@@ -600,10 +600,13 @@ class CatalogManager:
 
     def __init__(self, ttl_seconds: int = 900, cache_dir: Optional[Path] = None):
         self.ttl_seconds = ttl_seconds
-        self.cache_dir = Path(cache_dir or CACHE_DIR)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else get_cache_dir()
         self._lock = threading.RLock()
         self._memory_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any], List[Dict[str, Any]]]] = {}
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
     def _disk_path(self, endpoint: str, subsidiary: str, product_line: str) -> Path:
         safe = f"catalog_{endpoint}_{subsidiary.upper()}_{product_line.lower()}.json"
@@ -677,7 +680,11 @@ class CatalogManager:
     def clear(self) -> None:
         with self._lock:
             self._memory_cache.clear()
-        for f in self.cache_dir.glob("catalog_*.json"):
+        try:
+            files = list(self.cache_dir.glob("catalog_*.json"))
+        except OSError:
+            files = []
+        for f in files:
             try:
                 f.unlink()
             except OSError:

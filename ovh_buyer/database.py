@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .config import DATA_DIR, DB_PATH
+from .config import DATA_DIR, DB_PATH, get_data_dir, get_db_path
 
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -120,14 +120,26 @@ class Database:
     """Thread-safe SQLite database with WAL mode and atomic helpers."""
 
     def __init__(self, db_path: Optional[Path] = None, encryption_key: Optional[str] = None):
-        self.db_path = Path(db_path or DB_PATH)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = Path(db_path) if db_path is not None else get_db_path()
         self.encryption_key = (
             encryption_key if encryption_key is not None else os.environ.get("DATA_ENCRYPTION_KEY", "")
         )
         self._lock = threading.RLock()
         self._log_listeners: List[Callable[[Dict[str, Any]], None]] = []
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
+        except (OSError, sqlite3.OperationalError) as exc:
+            uid = getattr(os, "getuid", lambda: "N/A")()
+            gid = getattr(os, "getgid", lambda: "N/A")()
+            parent = self.db_path.parent
+            writable = os.access(str(parent), os.W_OK) if parent.exists() else False
+            raise sqlite3.OperationalError(
+                f"无法打开或创建数据库文件 '{self.db_path}' (原始错误: {exc}; "
+                f"当前进程 UID:GID={uid}:{gid}, 数据目录 '{parent}' 可写={writable})。"
+                f"若使用 Docker 挂载宿主机目录，请确保宿主机 ./data 目录可写 "
+                f"(例如执行: chown -R 1000:1000 ./data 或更新至最新镜像)。"
+            ) from exc
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
         try:
@@ -142,7 +154,11 @@ class Database:
     def _init_schema(self) -> None:
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
+            try:
+                cur.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                # Fallback for network/virtual filesystems (NFS/SMB) where WAL shared-memory mmap fails
+                cur.execute("PRAGMA journal_mode=DELETE;")
             cur.execute("PRAGMA synchronous=NORMAL;")
             cur.execute("PRAGMA foreign_keys=ON;")
             cur.executescript(
@@ -1282,7 +1298,7 @@ class Database:
         candidates = []
         if seed_file:
             candidates.append(seed_file)
-        candidates.extend([DATA_DIR / "config.json", Path(os.environ.get("OVH_CONFIG_FILE", ""))])
+        candidates.extend([get_data_dir() / "config.json", Path(os.environ.get("OVH_CONFIG_FILE", ""))])
         for path in candidates:
             if not path or not str(path) or not path.is_file():
                 continue

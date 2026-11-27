@@ -4,6 +4,7 @@ import base64
 import hashlib
 import http.server
 import json
+import os
 import socketserver
 import sqlite3
 import tempfile
@@ -17,6 +18,7 @@ import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ovh_buyer import __version__
 from ovh_buyer.auth import PanelAuth
 from ovh_buyer.catalog import (
     CatalogManager,
@@ -29,11 +31,15 @@ from ovh_buyer.catalog import (
     standardize_config,
 )
 from ovh_buyer.config import (
+    _refresh_path_globals,
     build_express_order_url,
     create_token_url,
     decode_short_order_url,
+    get_data_dir,
+    get_db_path,
     infer_region_for_datacenter,
     is_availability_orderable,
+    load_dotenv_file,
     normalize_datacenter,
 )
 from ovh_buyer.database import Database, protect_secret, reveal_secret
@@ -1048,11 +1054,11 @@ class TestOVHSniper(unittest.TestCase):
         try:
             base = f"http://127.0.0.1:{port}"
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            # 1. Health endpoint is public and reports v2.0.0
+            # 1. Health endpoint is public and reports current version
             with opener.open(f"{base}/api/health", timeout=5) as r:
                 health = json.loads(r.read())
                 self.assertEqual(health["ok"], True)
-                self.assertEqual(health["version"], "2.1.0")
+                self.assertEqual(health["version"], __version__)
 
             # 2. Protected endpoint returns 401 without auth
             with self.assertRaises(urllib.error.HTTPError) as ctx_err:
@@ -1156,6 +1162,31 @@ class TestOVHSniper(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_dynamic_data_dir_and_unwritable_resilience(self):
+        old_val = os.environ.pop("OVH_DATA_DIR", None)
+        try:
+            custom_dir = Path(self.tmpdir.name) / "custom_env_data"
+            env_file = Path(self.tmpdir.name) / "custom.env"
+            env_file.write_text(f"OVH_DATA_DIR={custom_dir}\n", encoding="utf-8")
+            load_dotenv_file(env_file)
+            self.assertEqual(get_data_dir(), custom_dir.resolve())
+            self.assertEqual(get_db_path(), (custom_dir / "ovh_buyer.db").resolve())
+        finally:
+            if old_val is None:
+                os.environ.pop("OVH_DATA_DIR", None)
+            else:
+                os.environ["OVH_DATA_DIR"] = old_val
+            _refresh_path_globals()
+
+        blocker = Path(self.tmpdir.name) / "not_a_dir"
+        blocker.write_text("file", encoding="utf-8")
+        with self.assertRaises(sqlite3.OperationalError) as ctx_err:
+            Database(db_path=blocker / "sub" / "ovh_buyer.db")
+        self.assertIn("无法打开或创建数据库文件", str(ctx_err.exception))
+
+        cm = CatalogManager(ttl_seconds=60, cache_dir=blocker / "cache")
+        cm.clear()
 
 
 if __name__ == "__main__":
