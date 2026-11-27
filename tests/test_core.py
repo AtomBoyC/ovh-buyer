@@ -1361,8 +1361,8 @@ class TestOVHSniper(unittest.TestCase):
                 endpoint="ovh-eu",
                 proxy_url=socks_url,
                 qps=50.0,
-                base_url_override=self.mock_base,
-                v1_url_override=self.mock_v1,
+                base_url_override=self.api_base,
+                v1_url_override=self.v1_base,
             )
             av1 = c_socks.get_availabilities("26skleb01")
             self.assertEqual(len(av1), 1)
@@ -1372,8 +1372,8 @@ class TestOVHSniper(unittest.TestCase):
                 endpoint="ovh-eu",
                 proxy_url=http_p_url,
                 qps=50.0,
-                base_url_override=self.mock_base,
-                v1_url_override=self.mock_v1,
+                base_url_override=self.api_base,
+                v1_url_override=self.v1_base,
             )
             av2 = c_http.get_availabilities("26skleb01")
             self.assertEqual(len(av2), 1)
