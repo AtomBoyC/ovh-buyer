@@ -1,5 +1,6 @@
 """Zero-dependency HTTP REST API, SSE live log stream, and embedded Web UI server."""
 
+import hashlib
 import http.server
 import ipaddress
 import json
@@ -137,10 +138,20 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
         mime, _ = mimetypes.guess_type(str(target))
         data = target.read_bytes()
+        if target.name == "index.html":
+            # Auto-inject content-hash cache-busting query params on /style.css & /app.js
+            css_p = WEB_ROOT / "style.css"
+            js_p = WEB_ROOT / "app.js"
+            css_v = hashlib.sha1(css_p.read_bytes()).hexdigest()[:8] if css_p.is_file() else __version__
+            js_v = hashlib.sha1(js_p.read_bytes()).hexdigest()[:8] if js_p.is_file() else __version__
+            html_str = data.decode("utf-8", errors="replace")
+            html_str = html_str.replace('href="/style.css"', f'href="/style.css?v={__version__}-{css_v}"')
+            html_str = html_str.replace('src="/app.js"', f'src="/app.js?v={__version__}-{js_v}"')
+            data = html_str.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", f"{mime or 'application/octet-stream'}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
         self.wfile.write(data)
 
@@ -630,7 +641,15 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/proxy/pool/probe":
-            snap = self.ctx.engine.trigger_proxy_pool_probe(force_all=bool(body.get("force_all", True)))
+            snap = self.ctx.engine.trigger_proxy_pool_probe(
+                force_all=bool(body.get("force_all", True)),
+                restart=bool(body.get("restart", True)),
+            )
+            self._send_json({"ok": True, "pool": snap})
+            return
+
+        if path == "/api/proxy/pool/stop":
+            snap = self.ctx.engine.stop_proxy_pool_probe()
             self._send_json({"ok": True, "pool": snap})
             return
 

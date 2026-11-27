@@ -1001,6 +1001,30 @@ function renderProxyPoolBoard(snap) {
     sumEl.textContent = `活跃 ${snap.active_count} / ${snap.max_active} · 健康候补 ${snap.healthy_standby_count} · 冷却 ${snap.cooldown_count}（总池 ${snap.master_count} 条）`;
   }
 
+  const startBtn = document.getElementById("btn-start-pool-probe");
+  const stopBtn = document.getElementById("btn-stop-pool-probe");
+  const progBox = document.getElementById("pool-probe-progress-box");
+  if (startBtn) {
+    startBtn.textContent = snap.probing
+      ? `🔄 重新从头测速 (${snap.probe_done}/${snap.probe_total})`
+      : "⚡ 逐条测速并重排活跃池";
+  }
+  if (stopBtn) {
+    stopBtn.classList.toggle("hidden", !snap.probing);
+  }
+  if (progBox) {
+    progBox.classList.toggle("hidden", !snap.probing);
+    if (snap.probing) {
+      const pct = snap.probe_total > 0 ? Math.min(100, Math.round((snap.probe_done / snap.probe_total) * 100)) : 0;
+      document.getElementById("pool-probe-progress-title").textContent = `⏳ 正在逐条串行测速 ${snap.probe_done} / ${snap.probe_total} (${pct}%)`;
+      document.getElementById("pool-probe-current-node").textContent = snap.current_probe_proxy
+        ? `当前检测: ${snap.current_probe_proxy}（每条随机间隔 1.5~4s）`
+        : "随机间隔等待下一条...";
+      document.getElementById("pool-probe-last-result").textContent = snap.last_probe_summary || "";
+      document.getElementById("pool-probe-bar-fill").style.width = `${pct}%`;
+    }
+  }
+
   const actBox = document.getElementById("active-pool-board");
   if (actBox) {
     const act = snap.active || [];
@@ -1058,13 +1082,13 @@ function renderProxyPoolBoard(snap) {
       : `<div class="muted">暂无候补节点</div>`;
   }
 
-  // Fast-poll every 1.8s while staggered probing is active on the Network tab
+  // Fast-poll every 1.2s while staggered probing is active on the Network tab
   if (snap.probing && state.activeTab === "network") {
     if (!_poolFastTimer) {
       _poolFastTimer = setTimeout(() => {
         _poolFastTimer = null;
         if (state.activeTab === "network") loadProxyPoolStatus();
-      }, 1800);
+      }, 1200);
     }
   }
 }
@@ -1555,16 +1579,33 @@ function bindEvents() {
         return;
       }
       startPoolProbeBtn.disabled = true;
+      startPoolProbeBtn.textContent = "⏳ 正在启动...";
       try {
         await api("/api/settings", { method: "PUT", body });
-        const res = await api("/api/proxy/pool/probe", { method: "POST", body: { force_all: true } });
-        toast("已启动后台逐条随机间隔测速，活跃池将按最低延迟实时更新", "ok");
+        const res = await api("/api/proxy/pool/probe", { method: "POST", body: { force_all: true, restart: true } });
+        toast("已从第 1 条开始重新逐条随机间隔测速!", "ok");
         if (res.pool) renderProxyPoolBoard(res.pool);
         refreshAll();
       } catch (err) {
         toast(err.message, "err");
       } finally {
         startPoolProbeBtn.disabled = false;
+      }
+    });
+  }
+  const stopPoolProbeBtn = document.getElementById("btn-stop-pool-probe");
+  if (stopPoolProbeBtn) {
+    stopPoolProbeBtn.addEventListener("click", async () => {
+      stopPoolProbeBtn.disabled = true;
+      try {
+        const res = await api("/api/proxy/pool/stop", { method: "POST", body: {} });
+        toast("已停止后台逐条测速", "info");
+        if (res.pool) renderProxyPoolBoard(res.pool);
+        refreshAll();
+      } catch (err) {
+        toast(err.message, "err");
+      } finally {
+        stopPoolProbeBtn.disabled = false;
       }
     });
   }

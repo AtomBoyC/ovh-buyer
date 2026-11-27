@@ -451,7 +451,7 @@
                   <input type="text" name="telegram_proxy" placeholder="http://127.0.0.1:7890" />
                 </div>
               </div>
-              <div class="field checkbox-row" style="margin-bottom:0">
+              <div class="field ovh-opt-stack" style="margin-bottom:0">
                 <label><input type="checkbox" name="telegram_polling_enabled" /><span><b>启用 Bot 交互指令与一键下单按钮</b><small>无需公网 HTTPS 域名，支持 /status /check /order /servers 等</small></span></label>
               </div>
             </div>
@@ -503,7 +503,7 @@
               <h3><svg class="ic"><use href="#i-check"/></svg>推送事件</h3>
               <span class="muted">勾选需要触发消息推送的事件类型</span>
             </div>
-            <div class="field checkbox-grid">
+            <div class="field ovh-opt-grid">
               <label><input type="checkbox" name="notify_on_stock" /><span><b>发现补货</b><small>监控命中可订库存时推送补货卡片</small></span></label>
               <label><input type="checkbox" name="notify_on_order" /><span><b>下单成功 / 演练完成</b><small>抢购出单或演练校验通过时推送</small></span></label>
               <label><input type="checkbox" name="notify_on_paid" /><span><b>订单已付款</b><small>跟踪到订单完成支付进入核查/交付时推送</small></span></label>
@@ -562,7 +562,7 @@
               <div class="card-header">
                 <h3><svg class="ic"><use href="#i-shield"/></svg>代理隔离与回退策略</h3>
               </div>
-              <div class="field checkbox-row">
+              <div class="field ovh-opt-stack">
                 <label><input type="checkbox" name="monitor_proxy_fallback_direct" /><span><b>监控代理全部不可用时允许回退本机直连</b><small>关闭则严格仅通过活跃代理请求监控接口，哪怕代理全挂也绝不暴露本机 IP</small></span></label>
                 <label><input type="checkbox" name="order_use_proxy" /><span><b>下单与账号请求也走监控代理池</b><small>默认关闭：仅高频监控走代理防 429 封 IP，账号建车与结账默认直连（也可在账号里绑定独立固定代理）</small></span></label>
               </div>
@@ -576,7 +576,7 @@
               <span class="pill pill-gray" id="pool-probe-badge">手动模式</span>
             </div>
 
-            <div class="field checkbox-row">
+            <div class="field ovh-opt-stack">
               <label><input type="checkbox" name="proxy_auto_pool" id="chk-proxy-auto-pool" /><span><b>启用自动配置活跃代理池（延迟优选 + 故障热替补）</b><small>后台逐条串行测速（随机间隔 1.5~4s 避免并发特征），自动将延迟最低的 Top-N 放入活跃池；连接失败自动移出冷却并秒换最快候补</small></span></label>
             </div>
 
@@ -628,7 +628,18 @@
               <div class="form-section" style="margin-top:4px">当前活跃代理池</div>
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
                 <span class="muted" id="active-pool-summary">活跃 0 / 5 · 健康候补 0 · 冷却 0</span>
-                <button type="button" class="btn btn-sm" id="btn-start-pool-probe">⚡ 逐条测速并重排活跃池</button>
+                <div class="toolbar" style="gap:6px">
+                  <button type="button" class="btn btn-danger btn-sm hidden" id="btn-stop-pool-probe">⏹ 停止测速</button>
+                  <button type="button" class="btn btn-sm" id="btn-start-pool-probe">⚡ 逐条测速并重排活跃池</button>
+                </div>
+              </div>
+              <div id="pool-probe-progress-box" class="probe-progress-box hidden">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+                  <b id="pool-probe-progress-title">⏳ 正在逐条测速 (0/0)</b>
+                  <span class="muted" id="pool-probe-last-result"></span>
+                </div>
+                <div class="muted mt-6" id="pool-probe-current-node">准备开始...</div>
+                <div class="probe-bar-track"><div class="probe-bar-fill" id="pool-probe-bar-fill" style="width:0%"></div></div>
               </div>
               <div id="active-pool-board" class="list-stack" style="max-height:220px;overflow:auto"></div>
 
@@ -668,7 +679,7 @@
               <h3><svg class="ic"><use href="#i-zap"/></svg>核心引擎与监控模块</h3>
               <span class="muted">与顶部快捷拨动开关实时同步</span>
             </div>
-            <div class="field checkbox-row" style="margin-bottom:0">
+            <div class="field ovh-opt-stack" style="margin-bottom:0">
               <label><input type="checkbox" name="sniper_enabled" /><span><b>全局抢购引擎</b><small>开启后后台自动轮询所有「运行中」的独服 / Eco 抢购任务</small></span></label>
               <label><input type="checkbox" name="fast_lane_enabled" /><span><b>预建购物车快速通道</b><small>为开启快速通道的任务提前建好购物车并自动续期，有货 1 次请求秒结账</small></span></label>
               <label><input type="checkbox" name="radar_enabled" /><span><b>黑五新品与配置雷达</b><small>定期扫描官方商品目录，发现新品上架或匹配硬件规格时自动告警/入队</small></span></label>
@@ -680,7 +691,7 @@
             <div class="card-header">
               <h3><svg class="ic"><use href="#i-sliders"/></svg>交付跟踪与交互增强</h3>
             </div>
-            <div class="field checkbox-row">
+            <div class="field ovh-opt-stack">
               <label><input type="checkbox" name="tracker_enabled" /><span><b>订单交付与硬件中奖跟踪</b><small>自动查询未付款 → 已交付进度，交付后读取实机硬件并比对是否免费升级（中奖）</small></span></label>
               <label><input type="checkbox" name="edit_sold_out_telegram" /><span><b>售罄自动划线 Telegram 卡片</b><small>已发送的 Telegram 补货卡片在后续检测售罄后自动编辑划上删除线并标记「已被抢完」</small></span></label>
             </div>
@@ -862,7 +873,7 @@
           <label>独立监控代理（可选，留空自动使用全局监控代理池；支持 http / socks5 / 多代理逗号分隔）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080（留空走全局监控代理池）" />
         </div>
-        <div class="checkbox-grid">
+        <div class="ovh-opt-grid">
           <label><input type="checkbox" name="dry_run" /><span><b>演练模式</b><small>校验购物车与实时价格，不提交订单</small></span></label>
           <label><input type="checkbox" name="fast_lane" /><span><b>快速通道</b><small>提前建车，有货 1 次请求秒结账</small></span></label>
           <label class="danger"><input type="checkbox" name="auto_pay" /><span><b>自动扣款</b><small>使用默认支付方式 / 余额直接支付</small></span></label>
@@ -922,7 +933,7 @@
           <label>账号绑定固定代理（可选，该账号建车/结账/查独服固定走此 IP，留空默认直连）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080 或 http://..." />
         </div>
-        <div class="field checkbox-row">
+        <div class="field ovh-opt-stack">
           <label><input type="checkbox" name="is_default" /><span>设为默认账号</span></label>
         </div>
         <div class="modal-footer">
@@ -1001,7 +1012,7 @@
           <label>独立监控代理（可选，留空走全局监控代理池）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080" />
         </div>
-        <div class="checkbox-row">
+        <div class="ovh-opt-stack">
           <label><input type="checkbox" name="auto_snipe" /><span><b>命中后自动创建任务并开抢</b></span></label>
           <label><input type="checkbox" name="dry_run" checked /><span><b>自动任务使用演练模式</b><small>推荐先演练确认</small></span></label>
           <label class="danger"><input type="checkbox" name="auto_pay" /><span><b>自动扣款</b></span></label>
@@ -1063,7 +1074,7 @@
           <label>独立监控代理（可选，留空走全局监控代理池）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080" />
         </div>
-        <div class="checkbox-row">
+        <div class="ovh-opt-stack">
           <label><input type="checkbox" name="auto_order" /><span>有货时自动下单</span></label>
           <label><input type="checkbox" name="dry_run" checked /><span>演练模式</span></label>
           <label class="danger"><input type="checkbox" name="auto_pay" /><span>自动扣款</span></label>
@@ -1098,7 +1109,7 @@
         <p class="card-desc" style="margin-bottom:12px">
           用于 <b>抢购任务库存轮询、黑五雷达、VPS 补货监控、目录与秒查库存</b>。支持手动固定池或开启「自动优选活跃池」（更多高级参数可在左侧「网络设置」调整）。
         </p>
-        <div class="field checkbox-row">
+        <div class="field ovh-opt-stack">
           <label><input type="checkbox" id="proxy-modal-auto" /><span><b>启用自动配置活跃代理池（从总池自动优选最低延迟 Top-N 并故障热替补）</b></span></label>
         </div>
         <div class="field hidden" id="proxy-modal-max-wrap">
@@ -1109,7 +1120,7 @@
           <label id="proxy-modal-textarea-label">监控代理列表（每行一条或逗号分隔；支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code> 及 <code>ip:port:user:pass</code>）</label>
           <textarea name="monitor_proxies" id="proxy-modal-textarea" rows="5" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass&#10;http://127.0.0.1:7890"></textarea>
         </div>
-        <div class="field checkbox-row">
+        <div class="field ovh-opt-stack">
           <label><input type="checkbox" name="monitor_proxy_fallback_direct" id="proxy-modal-fallback" checked /><span><b>所有监控代理均失败时允许临时回退本机直连</b><small>若要强制隐藏本机 IP，请取消勾选</small></span></label>
           <label><input type="checkbox" name="order_use_proxy" id="proxy-modal-order-use" /><span><b>下单与账号请求也走监控代理池</b><small>默认关闭：仅监控查货走代理，账号建车与结账保持直连防风控（也可在「OVH 账号」为单账号绑固定代理）</small></span></label>
         </div>

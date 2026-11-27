@@ -353,9 +353,12 @@ class ProxyPoolManager:
         self._cursor: int = 0
 
         # Background staggered probe telemetry
+        self._cancel_probe = threading.Event()
         self._probing: bool = False
         self._probe_done: int = 0
         self._probe_total: int = 0
+        self._current_probe_proxy: str = ""
+        self._last_probe_summary: str = ""
         self.last_pass_at: float = 0.0
 
     def _ensure_entry_locked(self, norm_url: str) -> Dict[str, Any]:
@@ -612,6 +615,14 @@ class ProxyPoolManager:
         cli._raw_request("GET", f"{cli.api_base}/auth/time")
         return max(1, int((time.monotonic() - t0) * 1000))
 
+    def stop_probe(self, wait_seconds: float = 0.0) -> None:
+        """Signal any running staggered probe pass to abort immediately."""
+        self._cancel_probe.set()
+        if wait_seconds > 0:
+            deadline = time.monotonic() + wait_seconds
+            while self._probing and time.monotonic() < deadline:
+                time.sleep(0.03)
+
     def run_staggered_probe_pass(
         self,
         stop_event: Optional[threading.Event] = None,
@@ -622,6 +633,7 @@ class ProxyPoolManager:
             return {"started": False, "reason": "already_probing"}
 
         try:
+            self._cancel_probe.clear()
             now = time.time()
             with self._lock:
                 ep = self.test_endpoint
@@ -629,23 +641,29 @@ class ProxyPoolManager:
                 cd_sec = self.cooldown_sec
                 master_snap = list(self._master)
                 active_set = set(self._active)
-                untested = []
-                standby_ready = []
-                active_list = []
-                for u in master_snap:
-                    ent = self._ensure_entry_locked(u)
-                    if not force_all and ent["cooldown_until"] > now and u not in active_set:
-                        continue
-                    if ent["ok"] is None:
-                        untested.append(u)
-                    elif u not in active_set:
-                        standby_ready.append(u)
-                    else:
-                        active_list.append(u)
-                queue = untested + standby_ready + active_list
+                if force_all:
+                    # Manual full re-probe: test every node in Master Pool in order from 1..N
+                    queue = list(master_snap)
+                else:
+                    untested = []
+                    standby_ready = []
+                    active_list = []
+                    for u in master_snap:
+                        ent = self._ensure_entry_locked(u)
+                        if ent["cooldown_until"] > now and u not in active_set:
+                            continue
+                        if ent["ok"] is None:
+                            untested.append(u)
+                        elif u not in active_set:
+                            standby_ready.append(u)
+                        else:
+                            active_list.append(u)
+                    queue = untested + standby_ready + active_list
                 self._probing = True
                 self._probe_done = 0
                 self._probe_total = len(queue)
+                self._current_probe_proxy = ""
+                self._last_probe_summary = ""
 
             if not queue:
                 return {"started": True, "probed": 0, "passed": 0}
@@ -655,12 +673,13 @@ class ProxyPoolManager:
             passed_cnt = 0
 
             for idx, p_url in enumerate(queue):
-                if stop_event and stop_event.is_set():
+                if (stop_event and stop_event.is_set()) or self._cancel_probe.is_set():
                     break
                 with self._lock:
                     if p_url not in self._master:
                         self._probe_done = idx + 1
                         continue
+                    self._current_probe_proxy = redact_proxy_url(p_url)
 
                 probe_ok = False
                 ms: Optional[int] = None
@@ -674,8 +693,12 @@ class ProxyPoolManager:
                 except Exception as exc:
                     err_msg = str(exc)
 
+                if self._cancel_probe.is_set() or (stop_event and stop_event.is_set()):
+                    break
+
                 probed_cnt += 1
                 ts_now = time.time()
+                disp_p = redact_proxy_url(p_url)
                 with self._lock:
                     if p_url in self._entries:
                         ent = self._entries[p_url]
@@ -688,6 +711,7 @@ class ProxyPoolManager:
                             ent["last_error"] = ""
                             ent["ok_count"] += 1
                             passed_cnt += 1
+                            self._last_probe_summary = f"✅ {disp_p} ({ms} ms)"
                         else:
                             ent["ok"] = False
                             ent["latency_ms"] = ms if probe_ok else None
@@ -695,6 +719,9 @@ class ProxyPoolManager:
                             ent["cooldown_until"] = ts_now + cd_sec
                             ent["last_error"] = (
                                 f"延迟超上限 ({ms}ms > {self.max_latency_ms}ms)" if probe_ok else err_msg[:240]
+                            )
+                            self._last_probe_summary = (
+                                f"⚠️ {disp_p} 超上限 ({ms}ms)" if probe_ok else f"❌ {disp_p} 失败"
                             )
                         prev_act, new_act = self._rebalance_locked(ts_now)
                     else:
@@ -704,15 +731,20 @@ class ProxyPoolManager:
                 if prev_act != new_act:
                     self._notify_if_changed(prev_act, new_act)
 
-                # Staggered random delay before probing the next proxy (never burst!)
+                # Staggered random delay before probing the next proxy (interruptible by stop or cancel!)
                 if idx + 1 < len(queue) and self.delay_max > 0:
                     delay = random.uniform(self.delay_min, self.delay_max)
-                    if stop_event is not None:
-                        if stop_event.wait(delay):
+                    end_wait = time.monotonic() + delay
+                    while time.monotonic() < end_wait:
+                        if self._cancel_probe.is_set() or (stop_event and stop_event.is_set()):
                             break
-                    else:
-                        time.sleep(delay)
+                        rem = min(0.1, end_wait - time.monotonic())
+                        if rem > 0:
+                            time.sleep(rem)
+                    if self._cancel_probe.is_set() or (stop_event and stop_event.is_set()):
+                        break
 
+            cancelled = self._cancel_probe.is_set()
             with self._lock:
                 act_cnt = len(self._active)
                 top_lat = (
@@ -720,17 +752,18 @@ class ProxyPoolManager:
                     if self._active and self._active[0] in self._entries
                     else None
                 )
-            if probed_cnt > 0:
+            if probed_cnt > 0 and not cancelled:
                 best_str = f"，最快 {top_lat}ms" if top_lat is not None else ""
                 self._log(
                     "INFO",
                     f"🌐 [代理池巡检完成] 逐条测速 {probed_cnt} 条，达标 {passed_cnt} 条，当前活跃池 {act_cnt}/{self.max_active} 条{best_str}",
                     "proxy",
                 )
-            return {"started": True, "probed": probed_cnt, "passed": passed_cnt}
+            return {"started": True, "probed": probed_cnt, "passed": passed_cnt, "cancelled": cancelled}
         finally:
             with self._lock:
                 self._probing = False
+                self._current_probe_proxy = ""
                 self.last_pass_at = time.time()
             self._probe_lock.release()
 
@@ -781,6 +814,8 @@ class ProxyPoolManager:
                 "probing": self._probing,
                 "probe_done": self._probe_done,
                 "probe_total": self._probe_total,
+                "current_probe_proxy": self._current_probe_proxy,
+                "last_probe_summary": self._last_probe_summary,
                 "master_count": len(self._master),
                 "active_count": len(active_items),
                 "healthy_standby_count": healthy_standby,

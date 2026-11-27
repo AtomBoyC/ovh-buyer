@@ -129,9 +129,11 @@ class SniperEngine:
         if trigger_probe and needs_probe:
             self.trigger_proxy_pool_probe(force_all=False)
 
-    def trigger_proxy_pool_probe(self, force_all: bool = True) -> Dict[str, Any]:
-        """Wake background staggered 1-by-1 prober (spawns a oneshot thread if engine loop isn't running)."""
+    def trigger_proxy_pool_probe(self, force_all: bool = True, restart: bool = False) -> Dict[str, Any]:
+        """Wake background staggered 1-by-1 prober; preempt & restart from 0 if `restart=True`."""
         self.on_settings_updated(trigger_probe=False)
+        if restart and self.proxy_pool.get_snapshot().get("probing"):
+            self.proxy_pool.stop_probe(wait_seconds=1.2)
         if force_all:
             self._proxy_probe_force_all = True
         self._proxy_probe_wake.set()
@@ -148,6 +150,14 @@ class SniperEngine:
                 self._oneshot_threads = [t for t in self._oneshot_threads if t.is_alive()]
                 self._oneshot_threads.append(th)
             th.start()
+        # Brief yield so background loop enters probing=True before snapshot returns to UI
+        time.sleep(0.05)
+        return self.proxy_pool.get_snapshot()
+
+    def stop_proxy_pool_probe(self) -> Dict[str, Any]:
+        self._proxy_probe_wake.clear()
+        self.proxy_pool.stop_probe(wait_seconds=0.8)
+        self.db.add_log("INFO", "⏹ 已手动停止代理池后台逐条测速", "proxy")
         return self.proxy_pool.get_snapshot()
 
     def get_proxy_pool_status(self) -> Dict[str, Any]:

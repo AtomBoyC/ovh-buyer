@@ -201,6 +201,8 @@ input:focus-visible + .tr { box-shadow: 0 0 0 3px var(--ring); }
   padding: var(--s5);
   margin-bottom: var(--s4);
   box-shadow: var(--shadow-sm);
+  min-width: 0;
+  max-width: 100%;
 }
 .card-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -300,28 +302,58 @@ input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(
 .form-section { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .02em; margin: var(--s2) 0 var(--s3); display: flex; align-items: center; gap: var(--s2); }
 .form-section::after { content: ""; flex: 1; height: 1px; background: var(--divider); }
 
-/* option cards: checkbox rows become selectable cards */
-.checkbox-row, .checkbox-grid { display: grid; gap: var(--s2); }
-.checkbox-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.checkbox-row label, .checkbox-grid label {
-  display: flex; align-items: flex-start; gap: 10px;
+/* option cards: checkbox rows become selectable cards (namespaced against browser extension CSS collisions) */
+.ovh-opt-stack, .ovh-opt-grid, .checkbox-row, .checkbox-grid { display: grid !important; gap: var(--s2); width: 100%; min-width: 0; }
+.ovh-opt-stack, .checkbox-row { grid-template-columns: minmax(0, 1fr) !important; }
+.ovh-opt-grid, .checkbox-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+.ovh-opt-stack > label, .ovh-opt-grid > label, .checkbox-row > label, .checkbox-grid > label {
+  display: flex !important; flex-direction: row !important; align-items: flex-start !important; gap: 10px;
+  width: 100%; min-width: 0; max-width: 100%;
   padding: 10px 12px; margin: 0;
   border: 1px solid var(--border); border-radius: var(--r);
   background: var(--surface);
   font-size: 13px; font-weight: 400; color: var(--fg2); line-height: 18px;
+  white-space: normal !important;
   cursor: pointer;
   transition: border-color .14s, background .14s;
 }
-.checkbox-row label input, .checkbox-grid label input { margin-top: 1px; }
-.checkbox-row label:hover, .checkbox-grid label:hover { border-color: var(--border-strong); }
+.ovh-opt-stack > label > span, .ovh-opt-grid > label > span, .checkbox-row > label > span, .checkbox-grid > label > span {
+  flex: 1 1 0%; min-width: 0; white-space: normal !important; overflow-wrap: anywhere;
+}
+.ovh-opt-stack label input[type="checkbox"], .ovh-opt-grid label input[type="checkbox"],
+.checkbox-row label input[type="checkbox"], .checkbox-grid label input[type="checkbox"] {
+  appearance: none !important; -webkit-appearance: none !important;
+  margin-top: 1px; background-color: var(--surface) !important; border: 1.5px solid var(--border-strong) !important;
+}
+.ovh-opt-stack label input[type="checkbox"]:checked, .ovh-opt-grid label input[type="checkbox"]:checked,
+.checkbox-row label input[type="checkbox"]:checked, .checkbox-grid label input[type="checkbox"]:checked {
+  background-color: var(--accent) !important; border-color: var(--accent) !important;
+}
+.ovh-opt-stack label:hover, .ovh-opt-grid label:hover, .checkbox-row label:hover, .checkbox-grid label:hover { border-color: var(--border-strong); }
+.ovh-opt-stack label:has(input:checked), .ovh-opt-grid label:has(input:checked),
 .checkbox-row label:has(input:checked), .checkbox-grid label:has(input:checked) {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
   color: var(--fg);
 }
-.checkbox-grid label.danger:has(input:checked) { border-color: var(--red-bd); background: var(--red-bg); }
-.checkbox-row label b, .checkbox-grid label b { display: block; font-weight: 600; color: var(--fg); }
-.checkbox-row label small, .checkbox-grid label small { display: block; color: var(--muted); font-size: 12px; margin-top: 1px; }
+.ovh-opt-grid label.danger:has(input:checked), .checkbox-grid label.danger:has(input:checked) { border-color: var(--red-bd); background: var(--red-bg); }
+.ovh-opt-stack label b, .ovh-opt-grid label b, .checkbox-row label b, .checkbox-grid label b { display: block; font-weight: 600; color: var(--fg); white-space: normal !important; }
+.ovh-opt-stack label small, .ovh-opt-grid label small, .checkbox-row label small, .checkbox-grid label small { display: block; color: var(--muted); font-size: 12px; margin-top: 1px; white-space: normal !important; overflow-wrap: anywhere; }
+
+/* Probe progress banner */
+.probe-progress-box {
+  padding: 10px 12px; margin-bottom: var(--s2);
+  border: 1px solid var(--blue-bd); border-radius: var(--r);
+  background: var(--blue-bg); font-size: 12.5px;
+}
+.probe-bar-track {
+  height: 6px; width: 100%; margin-top: 6px;
+  border-radius: 99px; background: var(--border); overflow: hidden;
+}
+.probe-bar-fill {
+  height: 100%; border-radius: 99px; background: var(--accent);
+  transition: width .25s var(--ease);
+}
 
 /* DC picker */
 .dc-picker { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -534,7 +566,7 @@ input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(
   .sidebar-footer { margin: 0; flex: none; flex-direction: row; align-items: center; border: 0; padding: 0; }
   .sidebar-footer .status-pill span:last-child, .version-tag { display: none; }
   .main { padding: var(--s5) var(--s4) var(--s8); }
-  .two-col, .form-row, .form-row-3, .checkbox-grid { grid-template-columns: 1fr; }
+  .two-col, .form-row, .form-row-3, .ovh-opt-grid, .checkbox-grid { grid-template-columns: 1fr !important; }
 }
 @media (max-width: 640px) {
   .inline-form input, .inline-form select { min-width: 0; flex: 1 1 100%; }
