@@ -411,9 +411,9 @@ OVH 查价接口临时不可用。v2.1 起为安全起见不会盲下，接口�
 
 | 分支 / 标签 | 内容 |
 | :--- | :--- |
-| `main` | 最新版 **v2.1.x**（新界面 + 安全 + Docker/反代/Topic/监控代理池），镜像 `:latest` / `:2.1.3` |
+| `main` | 最新版 **v2.1.x**（新界面 + 安全 + Docker/反代/Topic/两级自动优选代理池），镜像 `:latest` / `:2.1.4` |
 | [`legacy-v2.0`](https://github.com/AtomBoyC/ovh-buyer/tree/legacy-v2.0) | v2.0.0 旧界面版本，仅存档、不再更新；镜像 `:2.0.0` |
-| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` / `v2.1.2` / `v2.1.3` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
+| 标签 `v1.0.0` / `v2.0.0` / `v2.1.0` / `v2.1.1` / `v2.1.2` / `v2.1.3` / `v2.1.4` | 对应各 [Release](https://github.com/AtomBoyC/ovh-buyer/releases) |
 
 想继续用旧界面：
 

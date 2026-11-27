@@ -368,6 +368,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(safe)
             return
 
+        if path == "/api/proxy/pool":
+            self._send_json(self.ctx.engine.get_proxy_pool_status())
+            return
+
         if path == "/api/logs":
             limit = _safe_int(q1("limit", "200"), 200, 1, 2000)
             level = q1("level", "")
@@ -625,6 +629,20 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(res, status=200 if res.get("results") else 400)
             return
 
+        if path == "/api/proxy/pool/probe":
+            snap = self.ctx.engine.trigger_proxy_pool_probe(force_all=bool(body.get("force_all", True)))
+            self._send_json({"ok": True, "pool": snap})
+            return
+
+        if path == "/api/proxy/pool/evict":
+            proxy_id = str(body.get("proxy_id") or "").strip()
+            if not proxy_id:
+                self._send_json({"error": "缺少 proxy_id"}, status=400)
+                return
+            res = self.ctx.engine.evict_active_proxy(proxy_id)
+            self._send_json(res, status=200 if res.get("ok") else 404)
+            return
+
         if path == "/api/notifications/test":
             res = self.ctx.notifier.notify(
                 title="🔔 OVH Sniper 测试通知",
@@ -686,6 +704,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 if sk in patch and isinstance(patch[sk], str) and "****" in patch[sk]:
                     patch[sk] = existing.get(sk, "")
             self.ctx.db.update_settings(patch)
+            if patch.get("fast_lane_enabled") is False:
+                self.ctx.engine.slot_pool.cleanup_all()
+            self.ctx.engine.on_settings_updated(trigger_probe=True)
             self.ctx.db.add_log("INFO", "系统与通知设置已保存", "settings")
             self._send_json({"ok": True})
             return

@@ -47,7 +47,9 @@ from ovh_buyer.database import Database, protect_secret, reveal_secret
 from ovh_buyer.notifier import Notifier, parse_telegram_target, render_telegram_stock_card
 from ovh_buyer.order_engine import OrderEngine
 from ovh_buyer.ovh_client import (
+    OVHAPIError,
     OVHClient,
+    ProxyPoolManager,
     ProxyRotator,
     normalize_proxy_url,
     parse_proxy_config,
@@ -1096,6 +1098,8 @@ class TestOVHSniper(unittest.TestCase):
                 html = r.read().decode("utf-8")
                 self.assertIn("OVH Sniper", html)
                 self.assertIn("short-link-form", html)
+                for tab_id in ("tab-notify", "tab-network", "tab-features", "tab-security"):
+                    self.assertIn(tab_id, html)
 
             # 6. Meta has least-privilege token URL & FX endpoint responds
             meta_req = urllib.request.Request(f"{base}/api/meta", headers={"Cookie": cookie})
@@ -1411,6 +1415,110 @@ class TestOVHSniper(unittest.TestCase):
             socks_srv.close()
             http_proxy_srv.shutdown()
             http_proxy_srv.server_close()
+
+    def test_auto_proxy_pool_staggered_probe_hotswap_and_strict_no_leak(self):
+        # Simulated latencies: p3 (45ms), p1 (95ms), p4 (160ms), p2 (3500ms > ceiling), p5 (dead)
+        simulated = {
+            "http://198.51.100.1:8080": 95,
+            "http://198.51.100.2:8080": 3500,
+            "http://198.51.100.3:8080": 45,
+            "http://198.51.100.4:8080": 160,
+            "http://198.51.100.5:8080": -1,
+        }
+        probe_timestamps = []
+
+        def fake_probe(url: str, _ep: str, _timeout: float) -> int:
+            probe_timestamps.append((url, time.monotonic()))
+            val = simulated.get(url, -1)
+            if val < 0:
+                raise OVHAPIError("Connection refused", status_code=0)
+            return val
+
+        persisted_active = []
+        mgr = ProxyPoolManager(
+            on_active_changed=lambda urls: persisted_active.append(list(urls)),
+            probe_fn=fake_probe,
+            delay_range=(0.015, 0.025),  # Fast staggered sequential delay for unit test
+        )
+        master_text = "\n".join(simulated.keys())
+        _, needs_probe = mgr.sync_from_settings(
+            {
+                "proxy_auto_pool": True,
+                "monitor_proxies_pool": master_text,
+                "proxy_max_active": 2,
+                "proxy_fail_threshold": 2,
+                "proxy_cooldown_sec": 120,
+                "proxy_max_latency_ms": 1000,
+                "proxy_recheck_interval": 600,
+                "proxy_test_endpoint": "ovh-eu",
+            }
+        )
+        self.assertTrue(needs_probe)
+
+        # 1. Staggered 1-by-1 probe selects the 2 lowest-latency proxies (p3=45ms, p1=95ms) and spaces probes sequentially
+        res = mgr.run_staggered_probe_pass()
+        self.assertEqual(res["probed"], 5)
+        self.assertEqual(res["passed"], 3)  # p3, p1, p4 pass; p2 exceeds 1000ms; p5 fails
+        self.assertEqual(mgr.get_active_urls(), ["http://198.51.100.3:8080", "http://198.51.100.1:8080"])
+        self.assertEqual(persisted_active[-1], ["http://198.51.100.3:8080", "http://198.51.100.1:8080"])
+        # Verify strictly sequential spacing (>= 12ms gap between consecutive probes)
+        self.assertEqual(len(probe_timestamps), 5)
+        for i in range(1, len(probe_timestamps)):
+            self.assertGreaterEqual(probe_timestamps[i][1] - probe_timestamps[i - 1][1], 0.01)
+
+        # 2. Failure threshold: 1st transient error on p3 keeps it; 2nd consecutive error evicts p3 and hot-swaps p4 (160ms)!
+        prom1 = mgr.report_failure("http://198.51.100.3:8080", status_code=0, error="timeout 1")
+        self.assertIsNone(prom1)
+        self.assertIn("http://198.51.100.3:8080", mgr.get_active_urls())
+
+        prom2 = mgr.report_failure("http://198.51.100.3:8080", status_code=0, error="timeout 2")
+        self.assertEqual(prom2, "http://198.51.100.4:8080")
+        self.assertEqual(mgr.get_active_urls(), ["http://198.51.100.1:8080", "http://198.51.100.4:8080"])
+
+        # 3. HTTP 429 rate-limit triggers immediate eviction even on 1st failure
+        mgr.report_failure("http://198.51.100.1:8080", status_code=429, error="Too many requests")
+        self.assertEqual(mgr.get_active_urls(), ["http://198.51.100.4:8080"])
+
+        # 4. Manual evict via short ID quarantines last active node; snapshot reports cooldowns accurately
+        snap = mgr.get_snapshot()
+        self.assertEqual(snap["active_count"], 1)
+        last_id = snap["active"][0]["id"]
+        ev_res = mgr.evict_by_id(last_id)
+        self.assertTrue(ev_res["ok"])
+        self.assertEqual(mgr.get_active_urls(), [])
+        self.assertEqual(mgr.get_snapshot()["cooldown_count"], 5)
+
+        # 5. Cooldown expiry allows fastest proxy p3 (45ms) to resurrect on next staggered pass
+        mgr._entries["http://198.51.100.3:8080"]["cooldown_until"] = time.time() - 1
+        mgr.run_staggered_probe_pass(force_all=False)
+        self.assertEqual(mgr.get_active_urls(), ["http://198.51.100.3:8080"])
+
+        # 6. Strict no-local-IP-leak in SniperEngine.run_monitor_call when all pool nodes are in cooldown & fallback=False
+        real_engine = SniperEngine(
+            db=self.db,
+            catalog_manager=self.catalog_mgr,
+            order_engine=self.order_engine,
+            notifier=self.notifier,
+            client_factory=None,
+        )
+        self.db.update_settings(
+            {
+                "proxy_auto_pool": True,
+                "monitor_proxies_pool": "http://u:secretpass@198.51.100.99:8080",
+                "monitor_proxy_fallback_direct": False,
+            }
+        )
+        real_engine.on_settings_updated(trigger_probe=False)
+        real_engine.proxy_pool.report_failure("http://u:secretpass@198.51.100.99:8080", status_code=429, error="429")
+        self.assertEqual(real_engine.proxy_pool.get_active_urls(), [])
+        direct_called = {"hit": False}
+        with self.assertRaises(OVHAPIError):
+            real_engine.run_monitor_call("ovh-eu", lambda _cli: direct_called.update(hit=True))
+        self.assertFalse(direct_called["hit"])
+
+        # Export redacts credentials in monitor_proxies_pool too
+        exported = self.db.export_config(include_secrets=False)
+        self.assertNotIn("secretpass", json.dumps(exported, ensure_ascii=False))
 
 
 if __name__ == "__main__":

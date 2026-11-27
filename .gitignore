@@ -7,3 +7,4 @@ __pycache__/
 *.db-shm
 .DS_Store
 .pytest_cache/
+.idea/

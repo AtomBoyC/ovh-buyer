@@ -27,7 +27,7 @@ from .config import (
 from .database import Database, now_iso
 from .notifier import Notifier
 from .order_engine import CartSlotPool, OrderEngine, safe_delete_cart
-from .ovh_client import OVHAPIError, OVHClient, ProxyRotator, parse_proxy_list, redact_proxy_url
+from .ovh_client import OVHAPIError, OVHClient, ProxyPoolManager, ProxyRotator, parse_proxy_list, redact_proxy_url
 from .specs import GLOBAL_FX
 from .tracker import OrderTracker
 
@@ -49,6 +49,12 @@ class SniperEngine:
         self.notifier = notifier
         self._custom_client_factory = client_factory
         self.proxy_rotator = ProxyRotator(cooldown_seconds=30.0)
+        self._proxy_probe_wake = threading.Event()
+        self._proxy_probe_force_all = False
+        self.proxy_pool = ProxyPoolManager(
+            on_active_changed=self._persist_active_proxies,
+            log_fn=db.add_log,
+        )
 
         self.slot_pool = CartSlotPool(order_engine, log_fn=db.add_log)
         self.tracker = OrderTracker(
@@ -97,8 +103,61 @@ class SniperEngine:
                 "short_cancel": self._tg_action_short_cancel,
             }
         )
+        self.on_settings_updated(trigger_probe=False)
 
     # ---------- Client & Proxy Construction ----------
+
+    def _persist_active_proxies(self, active_urls: List[str]) -> None:
+        """Persist the auto-selected Active Pool into `monitor_proxies` setting."""
+        try:
+            if self.db.get_setting("proxy_auto_pool", False):
+                self.db.update_settings({"monitor_proxies": "\n".join(active_urls)})
+        except Exception:
+            pass
+
+    def on_settings_updated(self, trigger_probe: bool = True) -> None:
+        """Sync ProxyPoolManager when settings change; auto-migrate legacy monitor_proxies if needed."""
+        settings = self.db.get_settings()
+        if (
+            settings.get("proxy_auto_pool")
+            and not str(settings.get("monitor_proxies_pool") or "").strip()
+            and str(settings.get("monitor_proxies") or "").strip()
+        ):
+            migrated = str(settings.get("monitor_proxies") or "").strip()
+            settings = self.db.update_settings({"monitor_proxies_pool": migrated})
+        _, needs_probe = self.proxy_pool.sync_from_settings(settings)
+        if trigger_probe and needs_probe:
+            self.trigger_proxy_pool_probe(force_all=False)
+
+    def trigger_proxy_pool_probe(self, force_all: bool = True) -> Dict[str, Any]:
+        """Wake background staggered 1-by-1 prober (spawns a oneshot thread if engine loop isn't running)."""
+        self.on_settings_updated(trigger_probe=False)
+        if force_all:
+            self._proxy_probe_force_all = True
+        self._proxy_probe_wake.set()
+        daemon_alive = any(t.is_alive() and t.name == "proxy-pool-loop" for t in self._threads)
+        if not daemon_alive and not self._stop_event.is_set():
+            def _runner() -> None:
+                force = self._proxy_probe_force_all
+                self._proxy_probe_force_all = False
+                self._proxy_probe_wake.clear()
+                self.proxy_pool.run_staggered_probe_pass(stop_event=self._stop_event, force_all=force)
+
+            th = threading.Thread(target=_runner, name="proxy-probe-oneshot", daemon=True)
+            with self._lock:
+                self._oneshot_threads = [t for t in self._oneshot_threads if t.is_alive()]
+                self._oneshot_threads.append(th)
+            th.start()
+        return self.proxy_pool.get_snapshot()
+
+    def get_proxy_pool_status(self) -> Dict[str, Any]:
+        self.proxy_pool.sync_from_settings(self.db.get_settings())
+        return self.proxy_pool.get_snapshot()
+
+    def evict_active_proxy(self, proxy_id: str) -> Dict[str, Any]:
+        res = self.proxy_pool.evict_by_id(proxy_id)
+        res["pool"] = self.proxy_pool.get_snapshot()
+        return res
 
     def _select_proxy(
         self,
@@ -115,10 +174,20 @@ class SniperEngine:
             or os.environ.get("HTTP_PROXY")
             or ""
         ).strip()
+        auto_pool = bool(settings.get("proxy_auto_pool", False))
+        master_raw = str(settings.get("monitor_proxies_pool") or os.environ.get("OVH_MONITOR_PROXIES_POOL") or "").strip()
         monitor_raw = str(settings.get("monitor_proxies") or os.environ.get("OVH_MONITOR_PROXIES") or "").strip()
 
         if account is None:
-            pool_src = proxy_override.strip() or monitor_raw or fallback_global
+            if proxy_override.strip():
+                pool_src = proxy_override.strip()
+                return self.proxy_rotator.pick(pool_src, exclude=exclude), pool_src
+            if auto_pool and master_raw:
+                self.proxy_pool.sync_from_settings(settings)
+                chosen = self.proxy_pool.pick_active(exclude=exclude)
+                act_src = "\n".join(self.proxy_pool.get_active_urls())
+                return chosen, (act_src or master_raw)
+            pool_src = monitor_raw or fallback_global
             return self.proxy_rotator.pick(pool_src, exclude=exclude), pool_src
 
         if proxy_override.strip():
@@ -129,8 +198,14 @@ class SniperEngine:
         if acc_proxy:
             return self.proxy_rotator.pick(acc_proxy, exclude=exclude), acc_proxy
 
-        if settings.get("order_use_proxy", False) and monitor_raw:
-            return self.proxy_rotator.pick(monitor_raw, exclude=exclude), monitor_raw
+        if settings.get("order_use_proxy", False):
+            if auto_pool and master_raw:
+                self.proxy_pool.sync_from_settings(settings)
+                chosen = self.proxy_pool.pick_active(exclude=exclude)
+                if chosen:
+                    return chosen, "\n".join(self.proxy_pool.get_active_urls())
+            if monitor_raw:
+                return self.proxy_rotator.pick(monitor_raw, exclude=exclude), monitor_raw
 
         return self.proxy_rotator.pick(fallback_global, exclude=exclude), fallback_global
 
@@ -166,17 +241,25 @@ class SniperEngine:
         fn: Callable[[OVHClient], Any],
         proxy_override: str = "",
     ) -> Any:
-        """Execute a public monitoring request with automatic proxy rotation & optional direct fallback."""
+        """Execute a public monitoring request with automatic proxy rotation, hot-swap & optional direct fallback."""
         if self._custom_client_factory:
             return fn(self.build_client(account=None, endpoint=endpoint, proxy_override=proxy_override))
 
         settings = self.db.get_settings()
+        use_auto = bool(settings.get("proxy_auto_pool", False)) and not proxy_override.strip()
         first_proxy, pool_src = self._select_proxy(settings, account=None, proxy_override=proxy_override)
+
         if not first_proxy:
+            # Pool was configured (e.g. auto pool where all nodes are in cooldown), check fallback policy!
+            if pool_src.strip():
+                if settings.get("monitor_proxy_fallback_direct", True) and not proxy_override.strip():
+                    self.db.add_log("WARNING", "活跃代理池当前无可用代理（全部冷却中），本次临时回退本机直连", "proxy")
+                    return fn(self.build_client(account=None, endpoint=endpoint, explicit_proxy=""))
+                raise OVHAPIError("活跃代理池当前无可用健康代理（全部处于故障冷却中），且已禁止回退本机直连", status_code=0)
             return fn(self.build_client(account=None, endpoint=endpoint, explicit_proxy=""))
 
         pool_items = parse_proxy_list(pool_src)
-        max_proxy_tries = max(1, min(3, len(pool_items)))
+        max_proxy_tries = max(1, min(3, max(len(pool_items), self.proxy_pool.master_count if use_auto else 1)))
         tried: set = set()
         last_err: Optional[Exception] = None
         cand = first_proxy
@@ -186,20 +269,37 @@ class SniperEngine:
                 break
             tried.add(cand)
             client = self.build_client(account=None, endpoint=endpoint, explicit_proxy=cand)
+            t0 = time.monotonic()
             try:
                 res = fn(client)
-                self.proxy_rotator.mark_ok(cand)
+                ms = int((time.monotonic() - t0) * 1000)
+                if use_auto:
+                    self.proxy_pool.report_success(cand, latency_ms=ms)
+                else:
+                    self.proxy_rotator.mark_ok(cand)
                 return res
             except OVHAPIError as exc:
                 last_err = exc
                 if exc.status_code in (0, 403, 407, 429, 502, 503, 504):
-                    self.proxy_rotator.mark_failed(cand)
+                    if use_auto:
+                        promoted = self.proxy_pool.report_failure(cand, status_code=exc.status_code, error=str(exc))
+                        if promoted and promoted not in tried:
+                            cand = promoted
+                            continue
+                    else:
+                        self.proxy_rotator.mark_failed(cand)
                     cand, _ = self._select_proxy(settings, account=None, proxy_override=proxy_override, exclude=tried)
                     continue
                 raise
             except Exception as exc:
                 last_err = exc
-                self.proxy_rotator.mark_failed(cand)
+                if use_auto:
+                    promoted = self.proxy_pool.report_failure(cand, status_code=0, error=str(exc))
+                    if promoted and promoted not in tried:
+                        cand = promoted
+                        continue
+                else:
+                    self.proxy_rotator.mark_failed(cand)
                 cand, _ = self._select_proxy(settings, account=None, proxy_override=proxy_override, exclude=tried)
 
         # Optional direct fallback when all configured monitoring proxies fail
@@ -295,14 +395,17 @@ class SniperEngine:
                 threading.Thread(target=self._tracker_loop, name="tracker-loop", daemon=True),
                 threading.Thread(target=self._radar_loop, name="radar-loop", daemon=True),
                 threading.Thread(target=self._vps_loop, name="vps-loop", daemon=True),
+                threading.Thread(target=self._proxy_pool_loop, name="proxy-pool-loop", daemon=True),
             ]
             for t in self._threads:
                 t.start()
+            self.on_settings_updated(trigger_probe=True)
             self.notifier.start_telegram_polling()
             self.db.add_log("INFO", "OVH Sniper v2.1 引擎已启动（含快速通道 & 交付中奖跟踪）", "engine")
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._proxy_probe_wake.set()
         self.notifier.stop()
         with self._lock:
             to_join = list(self._threads) + list(self._oneshot_threads)
@@ -337,7 +440,18 @@ class SniperEngine:
     def get_status(self) -> Dict[str, Any]:
         settings = self.db.get_settings()
         uptime = int(time.time() - self.started_at) if self.started_at else 0
-        proxy_list = parse_proxy_list(str(settings.get("monitor_proxies") or settings.get("http_proxy") or ""))
+        auto_pool = bool(settings.get("proxy_auto_pool", False))
+        if auto_pool:
+            self.proxy_pool.sync_from_settings(settings)
+            snap = self.proxy_pool.get_snapshot()
+            active_cnt = snap["active_count"]
+            master_cnt = snap["master_count"]
+            probing = snap["probing"]
+        else:
+            proxy_list = parse_proxy_list(str(settings.get("monitor_proxies") or settings.get("http_proxy") or ""))
+            active_cnt = len(proxy_list)
+            master_cnt = len(parse_proxy_list(str(settings.get("monitor_proxies_pool") or "")))
+            probing = False
         return {
             "running": not self._stop_event.is_set() and any(t.is_alive() for t in self._threads),
             "sniper_enabled": bool(settings.get("sniper_enabled", True)),
@@ -345,13 +459,39 @@ class SniperEngine:
             "tracker_enabled": bool(settings.get("tracker_enabled", True)),
             "radar_enabled": bool(settings.get("radar_enabled", False)),
             "vps_monitor_enabled": bool(settings.get("vps_monitor_enabled", False)),
-            "monitor_proxy_count": len(proxy_list),
+            "proxy_auto_pool": auto_pool,
+            "monitor_proxy_count": active_cnt,
+            "master_proxy_count": master_cnt,
+            "proxy_probing": probing,
             "order_use_proxy": bool(settings.get("order_use_proxy", False)),
             "uptime_seconds": uptime,
             "total_polls": self.total_polls,
             "stock_hits": self.stock_hits,
             "stats": self.db.get_stats(),
         }
+
+    # ---------- Staggered 1-by-1 Proxy Pool Health Loop ----------
+
+    def _proxy_pool_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                settings = self.db.get_settings()
+                self.proxy_pool.sync_from_settings(settings)
+                auto = bool(settings.get("proxy_auto_pool", False))
+                recheck = int(settings.get("proxy_recheck_interval") or 0)
+                woke = self._proxy_probe_wake.is_set()
+                due_periodic = auto and recheck > 0 and self.proxy_pool.master_count > 0 and (
+                    time.time() - self.proxy_pool.last_pass_at >= recheck
+                )
+                if woke or due_periodic:
+                    force = self._proxy_probe_force_all
+                    self._proxy_probe_force_all = False
+                    self._proxy_probe_wake.clear()
+                    if self.proxy_pool.master_count > 0:
+                        self.proxy_pool.run_staggered_probe_pass(stop_event=self._stop_event, force_all=force)
+            except Exception as exc:
+                self.db.add_log("WARNING", f"代理池后台巡检异常: {exc}", "proxy")
+            self._proxy_probe_wake.wait(timeout=3.0)
 
     # ---------- Fast Lane Prebuilt Cart Maintenance Loop ----------
 

@@ -92,6 +92,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "bulk_availability_threshold": 3,
     "http_proxy": "",
     "monitor_proxies": "",
+    "monitor_proxies_pool": "",
+    "proxy_auto_pool": False,
+    "proxy_max_active": 5,
+    "proxy_fail_threshold": 2,
+    "proxy_cooldown_sec": 300,
+    "proxy_max_latency_ms": 3000,
+    "proxy_recheck_interval": 600,
+    "proxy_test_endpoint": "ovh-eu",
     "monitor_proxy_fallback_direct": True,
     "order_use_proxy": False,
     "telegram_bot_token": "",
@@ -342,6 +350,7 @@ class Database:
         env_overrides = {
             "http_proxy": os.environ.get("OVH_HTTP_PROXY", ""),
             "monitor_proxies": os.environ.get("OVH_MONITOR_PROXIES", ""),
+            "monitor_proxies_pool": os.environ.get("OVH_MONITOR_PROXIES_POOL", ""),
             "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
             "telegram_topic_id": os.environ.get("TELEGRAM_TOPIC_ID", ""),
@@ -1298,7 +1307,7 @@ class Database:
             for sk in EXPORT_SECRET_SETTING_KEYS:
                 val = str(settings.get(sk) or "")
                 settings[sk] = mask_secret(val) if val else ""
-            for pk in ("http_proxy", "monitor_proxies", "telegram_proxy"):
+            for pk in ("http_proxy", "monitor_proxies", "monitor_proxies_pool", "telegram_proxy"):
                 if settings.get(pk):
                     settings[pk] = redact_proxy_list_text(str(settings[pk]))
             for collection in (accounts, tasks, radar_rules, vps_watches):

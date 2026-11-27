@@ -307,6 +307,489 @@ class ProxyRotator:
             self._cooldown_until.pop(norm, None)
 
 
+def proxy_short_id(proxy_url: str) -> str:
+    """Deterministic credential-safe short ID for UI actions (e.g. manual evict)."""
+    norm = normalize_proxy_url(proxy_url)
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:10] if norm else ""
+
+
+class ProxyPoolManager:
+    """Two-tier monitoring proxy pool (Master Pool -> Top-N lowest-latency Active Pool).
+
+    Features:
+    - Maintains up to `max_active` fastest healthy proxies in Active Pool (sorted by latency ascending)
+    - Evicts failing/rate-limited active proxies into temporary cooldown and hot-swaps the fastest standby
+    - Staggered 1-by-1 background probing with randomized inter-probe jitter (never bursts all proxies at once)
+    """
+
+    def __init__(
+        self,
+        on_active_changed=None,
+        log_fn=None,
+        probe_fn=None,
+        delay_range: Tuple[float, float] = (1.5, 4.0),
+    ):
+        self._lock = threading.RLock()
+        self._probe_lock = threading.Lock()
+        self._on_active_changed = on_active_changed
+        self._log = log_fn or (lambda level, msg, source="proxy": None)
+        self._custom_probe_fn = probe_fn
+        self.delay_min = max(0.0, float(delay_range[0]))
+        self.delay_max = max(self.delay_min, float(delay_range[1]))
+
+        # Configuration snapshot
+        self.auto_enabled: bool = False
+        self.max_active: int = 5
+        self.fail_threshold: int = 2
+        self.cooldown_sec: int = 300
+        self.max_latency_ms: int = 3000
+        self.recheck_interval: int = 600
+        self.test_endpoint: str = "ovh-eu"
+
+        # Pool state
+        self._master: List[str] = []
+        self._active: List[str] = []
+        self._entries: Dict[str, Dict[str, Any]] = {}
+        self._cursor: int = 0
+
+        # Background staggered probe telemetry
+        self._probing: bool = False
+        self._probe_done: int = 0
+        self._probe_total: int = 0
+        self.last_pass_at: float = 0.0
+
+    def _ensure_entry_locked(self, norm_url: str) -> Dict[str, Any]:
+        entry = self._entries.get(norm_url)
+        if entry is None:
+            entry = {
+                "url": norm_url,
+                "id": proxy_short_id(norm_url),
+                "latency_ms": None,
+                "ok": None,
+                "fail_streak": 0,
+                "ok_count": 0,
+                "fail_count": 0,
+                "cooldown_until": 0.0,
+                "last_checked_ts": 0.0,
+                "last_error": "",
+            }
+            self._entries[norm_url] = entry
+        return entry
+
+    def _rebalance_locked(self, now: Optional[float] = None) -> Tuple[List[str], List[str]]:
+        """Recompute Top-N active list from Master Pool. Returns (prev_active, new_active)."""
+        ts = time.time() if now is None else now
+        prev = list(self._active)
+        if not self.auto_enabled or not self._master:
+            self._active = []
+            return prev, []
+
+        tier_measured = []
+        tier_untested = []
+        for idx, url in enumerate(self._master):
+            ent = self._ensure_entry_locked(url)
+            if ent["cooldown_until"] > ts:
+                continue
+            if ent["ok"] is False:
+                # Cooldown expired after a previous failure: keep in standby until next probe verifies it,
+                # unless NO measured/untested candidates exist at all (handled below).
+                continue
+            lat = ent["latency_ms"]
+            if ent["ok"] is True and lat is not None:
+                if lat <= self.max_latency_ms:
+                    tier_measured.append((lat, idx, url))
+            elif ent["ok"] is None:
+                tier_untested.append((idx, url))
+
+        tier_measured.sort(key=lambda x: (x[0], x[1]))
+        chosen = [u for _, _, u in tier_measured[: self.max_active]]
+        if len(chosen) < self.max_active and tier_untested:
+            need = self.max_active - len(chosen)
+            chosen.extend(u for _, u in tier_untested[:need])
+
+        self._active = chosen
+        return prev, list(self._active)
+
+    def _notify_if_changed(self, prev: List[str], cur: List[str]) -> None:
+        if prev != cur and self._on_active_changed:
+            try:
+                self._on_active_changed(list(cur))
+            except Exception:
+                pass
+
+    def sync_from_settings(self, settings: Dict[str, Any]) -> Tuple[bool, bool]:
+        """Sync pool config & master list from DB settings.
+
+        Returns (active_changed, needs_initial_probe).
+        """
+        auto = bool(settings.get("proxy_auto_pool", False))
+        max_act = max(1, min(50, int(settings.get("proxy_max_active") or 5)))
+        fail_th = max(1, min(20, int(settings.get("proxy_fail_threshold") or 2)))
+        cd_sec = max(10, min(86400, int(settings.get("proxy_cooldown_sec") or 300)))
+        max_lat = max(100, min(30000, int(settings.get("proxy_max_latency_ms") or 3000)))
+        recheck = max(0, min(86400, int(settings.get("proxy_recheck_interval") or 600)))
+        ep = str(settings.get("proxy_test_endpoint") or "ovh-eu")
+        if ep not in ENDPOINTS:
+            ep = "ovh-eu"
+
+        master_raw = str(settings.get("monitor_proxies_pool") or "").strip()
+        master_list = parse_proxy_list(master_raw)
+
+        needs_probe = False
+        with self._lock:
+            prev_master = list(self._master)
+            prev_auto = self.auto_enabled
+            self.auto_enabled = auto
+            self.max_active = max_act
+            self.fail_threshold = fail_th
+            self.cooldown_sec = cd_sec
+            self.max_latency_ms = max_lat
+            self.recheck_interval = recheck
+            self.test_endpoint = ep
+            self._master = master_list
+
+            # Prune removed entries so memory stays bounded
+            keep = set(master_list)
+            for k in [k for k in self._entries if k not in keep]:
+                self._entries.pop(k, None)
+            for u in master_list:
+                ent = self._ensure_entry_locked(u)
+                if ent["ok"] is None:
+                    needs_probe = True
+
+            if auto and master_list and (not prev_auto or master_list != prev_master):
+                needs_probe = True
+
+            prev_act, new_act = self._rebalance_locked()
+
+        changed = prev_act != new_act
+        if changed:
+            self._notify_if_changed(prev_act, new_act)
+        return changed, (auto and bool(master_list) and needs_probe)
+
+    @property
+    def master_count(self) -> int:
+        with self._lock:
+            return len(self._master)
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def get_active_urls(self) -> List[str]:
+        with self._lock:
+            return list(self._active)
+
+    def pick_active(self, exclude: Optional[set] = None) -> str:
+        """Round-robin pick from the current Active Pool."""
+        excluded = exclude or set()
+        with self._lock:
+            if not self._active:
+                self._rebalance_locked()
+            pool = [u for u in self._active if u not in excluded]
+            if not pool:
+                return ""
+            idx = self._cursor % len(pool)
+            chosen = pool[idx]
+            self._cursor = (idx + 1) % len(pool)
+            return chosen
+
+    def report_success(self, proxy_url: str, latency_ms: Optional[int] = None) -> None:
+        norm = normalize_proxy_url(proxy_url)
+        if not norm:
+            return
+        with self._lock:
+            if norm not in self._entries:
+                return
+            ent = self._entries[norm]
+            ent["ok"] = True
+            ent["fail_streak"] = 0
+            ent["cooldown_until"] = 0.0
+            ent["ok_count"] += 1
+            ent["last_error"] = ""
+            if latency_ms is not None and latency_ms >= 0:
+                prev_lat = ent["latency_ms"]
+                ent["latency_ms"] = int(round(prev_lat * 0.6 + latency_ms * 0.4)) if prev_lat is not None else int(latency_ms)
+
+    def report_failure(self, proxy_url: str, status_code: int = 0, error: str = "") -> Optional[str]:
+        """Record a runtime failure; if threshold or 403/407/429 hit, evict & hot-swap fastest standby.
+
+        Returns replacement proxy URL (if one was promoted), else None.
+        """
+        norm = normalize_proxy_url(proxy_url)
+        if not norm:
+            return None
+        now = time.time()
+        evicted = False
+        promoted: Optional[str] = None
+        prom_lat: Optional[int] = None
+        active_rem = 0
+        prev_act: List[str] = []
+        new_act: List[str] = []
+
+        with self._lock:
+            if norm not in self._entries:
+                return None
+            ent = self._entries[norm]
+            ent["fail_streak"] += 1
+            ent["fail_count"] += 1
+            ent["last_error"] = str(error or f"HTTP {status_code}")[:240]
+
+            immediate = status_code in (403, 407, 429)
+            if immediate or ent["fail_streak"] >= self.fail_threshold:
+                evicted = norm in self._active
+                ent["ok"] = False
+                ent["cooldown_until"] = now + self.cooldown_sec
+                prev_act, new_act = self._rebalance_locked(now)
+                active_rem = len(new_act)
+                added = [u for u in new_act if u not in prev_act]
+                if added:
+                    promoted = added[0]
+                    prom_lat = self._entries[promoted]["latency_ms"]
+
+        if prev_act != new_act:
+            self._notify_if_changed(prev_act, new_act)
+        if evicted:
+            bad_disp = redact_proxy_url(norm)
+            if promoted:
+                good_disp = redact_proxy_url(promoted)
+                lat_txt = f"{prom_lat}ms" if prom_lat is not None else "待测速"
+                self._log(
+                    "INFO",
+                    f"🔄 [代理池热替补] 移出异常代理 {bad_disp} (冷却 {self.cooldown_sec}s)，已自动补入最快候选 {good_disp} ({lat_txt})",
+                    "proxy",
+                )
+            else:
+                self._log(
+                    "WARNING",
+                    f"⚠️ [代理池剔除] 移出异常代理 {bad_disp} (冷却 {self.cooldown_sec}s)，总池暂无健康替补（当前活跃 {active_rem} 条）",
+                    "proxy",
+                )
+        return promoted
+
+    def evict_by_id(self, proxy_id: str) -> Dict[str, Any]:
+        """Manually evict an active proxy into cooldown by its short ID and promote fastest standby."""
+        now = time.time()
+        target_url = ""
+        promoted = ""
+        prom_lat = None
+        with self._lock:
+            for url, ent in self._entries.items():
+                if ent["id"] == proxy_id:
+                    target_url = url
+                    ent["ok"] = False
+                    ent["fail_streak"] = self.fail_threshold
+                    ent["cooldown_until"] = now + self.cooldown_sec
+                    ent["last_error"] = "手动踢出冷却"
+                    break
+            if not target_url:
+                return {"ok": False, "error": "未找到对应代理节点"}
+            prev_act, new_act = self._rebalance_locked(now)
+            added = [u for u in new_act if u not in prev_act]
+            if added:
+                promoted = added[0]
+                prom_lat = self._entries[promoted]["latency_ms"]
+
+        self._notify_if_changed(prev_act, new_act)
+        if promoted:
+            self._log(
+                "INFO",
+                f"🔄 [手动换血] 已踢出 {redact_proxy_url(target_url)}，替补入池: {redact_proxy_url(promoted)}"
+                + (f" ({prom_lat}ms)" if prom_lat is not None else ""),
+                "proxy",
+            )
+        return {
+            "ok": True,
+            "evicted": redact_proxy_url(target_url),
+            "promoted": redact_proxy_url(promoted) if promoted else "",
+            "promoted_latency_ms": prom_lat,
+        }
+
+    def _default_probe_one(self, proxy_url: str, endpoint: str, timeout: float) -> int:
+        t0 = time.monotonic()
+        cli = OVHClient(endpoint=endpoint, proxy_url=proxy_url, qps=20.0, timeout=timeout, max_retries=1)
+        cli._raw_request("GET", f"{cli.api_base}/auth/time")
+        return max(1, int((time.monotonic() - t0) * 1000))
+
+    def run_staggered_probe_pass(
+        self,
+        stop_event: Optional[threading.Event] = None,
+        force_all: bool = False,
+    ) -> Dict[str, Any]:
+        """Probe Master Pool proxies strictly ONE BY ONE with randomized delay between probes."""
+        if not self._probe_lock.acquire(blocking=False):
+            return {"started": False, "reason": "already_probing"}
+
+        try:
+            now = time.time()
+            with self._lock:
+                ep = self.test_endpoint
+                max_lat = self.max_latency_ms
+                cd_sec = self.cooldown_sec
+                master_snap = list(self._master)
+                active_set = set(self._active)
+                untested = []
+                standby_ready = []
+                active_list = []
+                for u in master_snap:
+                    ent = self._ensure_entry_locked(u)
+                    if not force_all and ent["cooldown_until"] > now and u not in active_set:
+                        continue
+                    if ent["ok"] is None:
+                        untested.append(u)
+                    elif u not in active_set:
+                        standby_ready.append(u)
+                    else:
+                        active_list.append(u)
+                queue = untested + standby_ready + active_list
+                self._probing = True
+                self._probe_done = 0
+                self._probe_total = len(queue)
+
+            if not queue:
+                return {"started": True, "probed": 0, "passed": 0}
+
+            timeout_sec = min(8.0, max(2.0, max_lat / 1000.0 + 1.5))
+            probed_cnt = 0
+            passed_cnt = 0
+
+            for idx, p_url in enumerate(queue):
+                if stop_event and stop_event.is_set():
+                    break
+                with self._lock:
+                    if p_url not in self._master:
+                        self._probe_done = idx + 1
+                        continue
+
+                probe_ok = False
+                ms: Optional[int] = None
+                err_msg = ""
+                try:
+                    if self._custom_probe_fn is not None:
+                        ms = int(self._custom_probe_fn(p_url, ep, timeout_sec))
+                    else:
+                        ms = self._default_probe_one(p_url, ep, timeout_sec)
+                    probe_ok = True
+                except Exception as exc:
+                    err_msg = str(exc)
+
+                probed_cnt += 1
+                ts_now = time.time()
+                with self._lock:
+                    if p_url in self._entries:
+                        ent = self._entries[p_url]
+                        ent["last_checked_ts"] = ts_now
+                        if probe_ok and ms is not None and ms <= self.max_latency_ms:
+                            ent["ok"] = True
+                            ent["latency_ms"] = ms
+                            ent["fail_streak"] = 0
+                            ent["cooldown_until"] = 0.0
+                            ent["last_error"] = ""
+                            ent["ok_count"] += 1
+                            passed_cnt += 1
+                        else:
+                            ent["ok"] = False
+                            ent["latency_ms"] = ms if probe_ok else None
+                            ent["fail_count"] += 1
+                            ent["cooldown_until"] = ts_now + cd_sec
+                            ent["last_error"] = (
+                                f"延迟超上限 ({ms}ms > {self.max_latency_ms}ms)" if probe_ok else err_msg[:240]
+                            )
+                        prev_act, new_act = self._rebalance_locked(ts_now)
+                    else:
+                        prev_act, new_act = [], []
+                    self._probe_done = idx + 1
+
+                if prev_act != new_act:
+                    self._notify_if_changed(prev_act, new_act)
+
+                # Staggered random delay before probing the next proxy (never burst!)
+                if idx + 1 < len(queue) and self.delay_max > 0:
+                    delay = random.uniform(self.delay_min, self.delay_max)
+                    if stop_event is not None:
+                        if stop_event.wait(delay):
+                            break
+                    else:
+                        time.sleep(delay)
+
+            with self._lock:
+                act_cnt = len(self._active)
+                top_lat = (
+                    self._entries[self._active[0]]["latency_ms"]
+                    if self._active and self._active[0] in self._entries
+                    else None
+                )
+            if probed_cnt > 0:
+                best_str = f"，最快 {top_lat}ms" if top_lat is not None else ""
+                self._log(
+                    "INFO",
+                    f"🌐 [代理池巡检完成] 逐条测速 {probed_cnt} 条，达标 {passed_cnt} 条，当前活跃池 {act_cnt}/{self.max_active} 条{best_str}",
+                    "proxy",
+                )
+            return {"started": True, "probed": probed_cnt, "passed": passed_cnt}
+        finally:
+            with self._lock:
+                self._probing = False
+                self.last_pass_at = time.time()
+            self._probe_lock.release()
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """Return UI-safe snapshot of Active Pool, Standby Pool, Cooldowns, and probe progress."""
+        now = time.time()
+        with self._lock:
+            active_set = set(self._active)
+
+            def _fmt(url: str, is_active: bool) -> Dict[str, Any]:
+                ent = self._ensure_entry_locked(url)
+                cd_rem = max(0, int(ent["cooldown_until"] - now))
+                return {
+                    "id": ent["id"],
+                    "proxy": redact_proxy_url(url),
+                    "active": is_active,
+                    "ok": ent["ok"],
+                    "latency_ms": ent["latency_ms"],
+                    "fail_streak": ent["fail_streak"],
+                    "ok_count": ent["ok_count"],
+                    "fail_count": ent["fail_count"],
+                    "cooldown_remaining": cd_rem,
+                    "last_checked_ago": int(now - ent["last_checked_ts"]) if ent["last_checked_ts"] > 0 else None,
+                    "last_error": ent["last_error"],
+                }
+
+            active_items = [_fmt(u, True) for u in self._active]
+            standby_urls = [u for u in self._master if u not in active_set]
+            standby_urls.sort(
+                key=lambda u: (
+                    1 if self._entries[u]["cooldown_until"] > now else 0,
+                    0 if self._entries[u]["ok"] is True else (1 if self._entries[u]["ok"] is None else 2),
+                    self._entries[u]["latency_ms"] if self._entries[u]["latency_ms"] is not None else 999999,
+                )
+            )
+            standby_items = [_fmt(u, False) for u in standby_urls]
+            cooldown_cnt = sum(1 for x in standby_items if x["cooldown_remaining"] > 0)
+            healthy_standby = sum(1 for x in standby_items if x["ok"] is True and x["cooldown_remaining"] == 0)
+
+            return {
+                "auto_enabled": self.auto_enabled,
+                "max_active": self.max_active,
+                "fail_threshold": self.fail_threshold,
+                "cooldown_sec": self.cooldown_sec,
+                "max_latency_ms": self.max_latency_ms,
+                "recheck_interval": self.recheck_interval,
+                "test_endpoint": self.test_endpoint,
+                "probing": self._probing,
+                "probe_done": self._probe_done,
+                "probe_total": self._probe_total,
+                "master_count": len(self._master),
+                "active_count": len(active_items),
+                "healthy_standby_count": healthy_standby,
+                "cooldown_count": cooldown_cnt,
+                "active": active_items,
+                "standby": standby_items,
+            }
+
+
 def _recv_exact(sock: socket.socket, length: int) -> bytes:
     buf = bytearray()
     while len(buf) < length:

@@ -35,7 +35,10 @@ const TAB_TITLES = {
   vps: "VPS 监控",
   orders: "订单与交付",
   accounts: "OVH 账号",
-  settings: "通知与设置",
+  notify: "通知设置",
+  network: "网络设置",
+  features: "功能开关",
+  security: "面板安全",
   logs: "运行日志",
 };
 
@@ -47,9 +50,14 @@ const TAB_SUBS = {
   vps: "各机房 VPS 套餐补货状态",
   orders: "短链下单、订单历史、交付进度与硬件中奖检测",
   accounts: "管理多个 OVH API 凭据，检查默认支付方式",
-  settings: "推送渠道、引擎限流与面板安全",
+  notify: "配置 Telegram Bot、多渠道 Webhook 与消息推送事件",
+  network: "配置 API 速率限制、各模块轮询间隔与监控专用代理池",
+  features: "管理核心抢购引擎、快速通道、交付中奖跟踪与交互增强开关",
+  security: "管理面板访问密码、API 门禁与脱敏配置备份",
   logs: "SSE 实时日志流",
 };
+
+const SETTINGS_TABS = new Set(["notify", "network", "features", "security"]);
 
 function esc(str) {
   return String(str ?? "")
@@ -114,7 +122,7 @@ function switchTab(tab) {
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${tab}`));
   document.getElementById("page-title").textContent = TAB_TITLES[tab] || tab;
   document.getElementById("page-sub").textContent = TAB_SUBS[tab] || "";
-  if (tab === "settings") loadSettings();
+  if (SETTINGS_TABS.has(tab)) loadSettings();
   if (tab === "logs") loadLogs();
 }
 
@@ -178,9 +186,17 @@ function renderStatus() {
   document.getElementById("toggle-vps").checked = !!st.vps_monitor_enabled;
 
   const pCount = st.monitor_proxy_count || 0;
+  const mCount = st.master_proxy_count || 0;
   document.querySelectorAll(".js-open-proxy-modal").forEach((btn) => {
-    btn.textContent = pCount > 0 ? `🌐 监控代理 (${pCount})` : "🌐 配置监控代理";
+    if (st.proxy_auto_pool && mCount > 0) {
+      btn.textContent = `${st.proxy_probing ? "⏳" : "🌐"} 活跃代理 (${pCount}/${mCount})`;
+    } else {
+      btn.textContent = pCount > 0 ? `🌐 监控代理 (${pCount})` : "🌐 配置监控代理";
+    }
   });
+  if (state.activeTab === "network") {
+    loadProxyPoolStatus();
+  }
 
   const pill = document.getElementById("sidebar-engine-pill");
   const txt = document.getElementById("sidebar-engine-text");
@@ -926,14 +942,166 @@ async function deleteAccount(id) {
 
 // ---------- Settings ----------
 
+let _poolFastTimer = null;
+
+function syncProxyPoolModeUI() {
+  const chk = document.getElementById("chk-proxy-auto-pool");
+  if (!chk) return;
+  const auto = chk.checked;
+  const autoSec = document.getElementById("auto-pool-section");
+  const manualSec = document.getElementById("manual-pool-section");
+  if (autoSec) autoSec.classList.toggle("hidden", !auto);
+  if (manualSec) manualSec.classList.toggle("hidden", auto);
+  const badge = document.getElementById("pool-probe-badge");
+  if (badge && !auto) {
+    badge.className = "pill pill-gray";
+    badge.textContent = "手动模式";
+  }
+}
+
+function updateMasterCountHint() {
+  const txt = document.getElementById("txt-proxies-pool");
+  const hint = document.getElementById("master-pool-count-hint");
+  if (!txt || !hint) return;
+  const cnt = txt.value
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter((x) => x && !x.startsWith("#")).length;
+  hint.textContent = `总池 ${cnt} 条`;
+}
+
+async function loadProxyPoolStatus() {
+  try {
+    const snap = await api("/api/proxy/pool");
+    renderProxyPoolBoard(snap);
+  } catch (_) {}
+}
+
+function renderProxyPoolBoard(snap) {
+  if (!snap) return;
+  const badge = document.getElementById("pool-probe-badge");
+  const chk = document.getElementById("chk-proxy-auto-pool");
+  const uiAuto = chk ? chk.checked : !!snap.auto_enabled;
+
+  if (badge) {
+    if (snap.probing) {
+      badge.className = "pill pill-blue";
+      badge.textContent = `⏳ 逐条静默测速 ${snap.probe_done}/${snap.probe_total}`;
+    } else if (uiAuto) {
+      badge.className = snap.active_count > 0 ? "pill pill-green" : "pill pill-amber";
+      badge.textContent = `自动优选 · 活跃 ${snap.active_count}/${snap.max_active}`;
+    } else {
+      badge.className = "pill pill-gray";
+      badge.textContent = "手动模式";
+    }
+  }
+
+  const sumEl = document.getElementById("active-pool-summary");
+  if (sumEl) {
+    sumEl.textContent = `活跃 ${snap.active_count} / ${snap.max_active} · 健康候补 ${snap.healthy_standby_count} · 冷却 ${snap.cooldown_count}（总池 ${snap.master_count} 条）`;
+  }
+
+  const actBox = document.getElementById("active-pool-board");
+  if (actBox) {
+    const act = snap.active || [];
+    if (!act.length) {
+      actBox.innerHTML = `<div class="muted">${
+        snap.master_count
+          ? snap.probing
+            ? "⏳ 正在逐条测速筛选可用节点..."
+            : "当前无健康活跃代理（请检查总池地址或点击「逐条测速并重排活跃池」）"
+          : "请先在上方「代理总池」填入候选代理并保存"
+      }</div>`;
+    } else {
+      actBox.innerHTML = act
+        .map((item, idx) => {
+          const latPill =
+            item.latency_ms != null
+              ? `<span class="pill pill-green">${item.latency_ms} ms</span>`
+              : `<span class="pill pill-blue">待测速</span>`;
+          const statsTxt = `成功 ${item.ok_count || 0}${item.fail_streak ? ` · 连败 ${item.fail_streak}` : ""}`;
+          return `<div class="list-row">
+            <div>
+              <div><span class="pill pill-purple">#${idx + 1}</span> <code class="mono">${esc(item.proxy)}</code> ${latPill}</div>
+              <div class="muted mt-6">${esc(statsTxt)}</div>
+            </div>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="evictPoolProxy('${esc(item.id)}')" title="移出活跃池进入冷却，并立即补入最快候补">踢出换新</button>
+          </div>`;
+        })
+        .join("");
+    }
+  }
+
+  const sbSum = document.getElementById("standby-pool-summary");
+  const sbBox = document.getElementById("standby-pool-board");
+  const sb = snap.standby || [];
+  if (sbSum) sbSum.textContent = `查看总池候补与冷却节点 (${sb.length})`;
+  if (sbBox) {
+    sbBox.innerHTML = sb.length
+      ? sb
+          .map((item) => {
+            let stPill = `<span class="pill pill-gray">待测速</span>`;
+            if (item.cooldown_remaining > 0) {
+              stPill = `<span class="pill pill-red">冷却 ${item.cooldown_remaining}s</span>`;
+            } else if (item.ok === true && item.latency_ms != null) {
+              stPill = `<span class="pill pill-blue">候补 ${item.latency_ms} ms</span>`;
+            } else if (item.ok === false) {
+              stPill = `<span class="pill pill-amber">待复测</span>`;
+            }
+            const errLine = item.last_error ? `<div class="error-text" style="margin:4px 0 0">${esc(item.last_error)}</div>` : "";
+            return `<div class="list-row">
+              <div><code class="mono">${esc(item.proxy)}</code>${errLine}</div>
+              ${stPill}
+            </div>`;
+          })
+          .join("")
+      : `<div class="muted">暂无候补节点</div>`;
+  }
+
+  // Fast-poll every 1.8s while staggered probing is active on the Network tab
+  if (snap.probing && state.activeTab === "network") {
+    if (!_poolFastTimer) {
+      _poolFastTimer = setTimeout(() => {
+        _poolFastTimer = null;
+        if (state.activeTab === "network") loadProxyPoolStatus();
+      }, 1800);
+    }
+  }
+}
+
+async function evictPoolProxy(proxyId) {
+  try {
+    const res = await api("/api/proxy/pool/evict", { method: "POST", body: { proxy_id: proxyId } });
+    if (res.promoted) {
+      const ms = res.promoted_latency_ms != null ? ` (${res.promoted_latency_ms}ms)` : "";
+      toast(`已踢出 ${res.evicted}，自动替补: ${res.promoted}${ms}`, "ok");
+    } else {
+      toast(`已踢出 ${res.evicted}（当前无可用候补节点）`, "info");
+    }
+    if (res.pool) renderProxyPoolBoard(res.pool);
+    refreshAll();
+  } catch (err) {
+    toast(err.message, "err");
+  }
+}
+
 async function loadSettings() {
   try {
     const s = await api("/api/settings");
-    const form = document.getElementById("settings-form");
-    for (const el of form.elements) {
-      if (!el.name || !(el.name in s)) continue;
-      if (el.type === "checkbox") el.checked = !!s[el.name];
-      else el.value = s[el.name] ?? "";
+    document.querySelectorAll(".js-settings-form").forEach((form) => {
+      for (const el of form.elements) {
+        if (!el.name || !(el.name in s)) continue;
+        if (el.type === "checkbox") el.checked = !!s[el.name];
+        else el.value = s[el.name] ?? "";
+      }
+    });
+    syncProxyPoolModeUI();
+    updateMasterCountHint();
+    if (state.activeTab === "network") loadProxyPoolStatus();
+    const authBadge = document.getElementById("security-auth-badge");
+    if (authBadge) {
+      authBadge.className = `pill ${s.has_panel_password ? "pill-green" : "pill-amber"}`;
+      authBadge.textContent = s.has_panel_password ? "已开启密码保护" : "未设置密码（公开访问）";
     }
   } catch (err) {
     toast(err.message, "err");
@@ -1037,6 +1205,7 @@ function bindEvents() {
       try {
         state.status = await api("/api/engine/toggle", { method: "POST", body: { [key]: e.target.checked } });
         renderStatus();
+        if (state.activeTab === "features") loadSettings();
         toast("引擎状态已更新", "ok");
       } catch (err) {
         toast(err.message, "err");
@@ -1326,25 +1495,79 @@ function bindEvents() {
     }
   });
 
-  // Settings
-  document.getElementById("settings-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const f = e.target;
+  // Settings (Notify / Network / Features / Security)
+  function collectFormSettings(f) {
     const body = {};
     for (const el of f.elements) {
       if (!el.name) continue;
       if (el.type === "checkbox") body[el.name] = el.checked;
-      else if (el.type === "number") body[el.name] = parseFloat(el.value);
-      else body[el.name] = el.value.trim();
+      else if (el.type === "number") {
+        const num = parseFloat(el.value);
+        if (!isNaN(num)) body[el.name] = num;
+      } else body[el.name] = el.value.trim();
     }
-    try {
-      await api("/api/settings", { method: "PUT", body });
-      toast("设置已保存并立即生效", "ok");
-      loadSettings();
-    } catch (err) {
-      toast(err.message, "err");
+    // In auto-pool mode, `monitor_proxies` (Active Pool) is maintained dynamically by ProxyPoolManager
+    if (body.proxy_auto_pool && body.monitor_proxies_pool) {
+      delete body.monitor_proxies;
     }
+    return body;
+  }
+
+  document.querySelectorAll(".js-settings-form").forEach((formEl) => {
+    formEl.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const body = collectFormSettings(e.target);
+      try {
+        await api("/api/settings", { method: "PUT", body });
+        toast("设置已保存并立即生效", "ok");
+        loadSettings();
+        refreshAll();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
   });
+
+  const autoPoolChk = document.getElementById("chk-proxy-auto-pool");
+  if (autoPoolChk) {
+    autoPoolChk.addEventListener("change", () => {
+      const poolTxt = document.getElementById("txt-proxies-pool");
+      const manualTxt = document.getElementById("txt-proxies-manual");
+      if (autoPoolChk.checked && poolTxt && manualTxt && !poolTxt.value.trim() && manualTxt.value.trim()) {
+        poolTxt.value = manualTxt.value.trim();
+      }
+      syncProxyPoolModeUI();
+      updateMasterCountHint();
+      loadProxyPoolStatus();
+    });
+  }
+  const poolTextarea = document.getElementById("txt-proxies-pool");
+  if (poolTextarea) {
+    poolTextarea.addEventListener("input", updateMasterCountHint);
+  }
+  const startPoolProbeBtn = document.getElementById("btn-start-pool-probe");
+  if (startPoolProbeBtn) {
+    startPoolProbeBtn.addEventListener("click", async () => {
+      const netForm = document.getElementById("network-settings-form");
+      const body = collectFormSettings(netForm);
+      if (!body.monitor_proxies_pool) {
+        toast("请先在「代理总池」填入至少一条候选代理", "err");
+        return;
+      }
+      startPoolProbeBtn.disabled = true;
+      try {
+        await api("/api/settings", { method: "PUT", body });
+        const res = await api("/api/proxy/pool/probe", { method: "POST", body: { force_all: true } });
+        toast("已启动后台逐条随机间隔测速，活跃池将按最低延迟实时更新", "ok");
+        if (res.pool) renderProxyPoolBoard(res.pool);
+        refreshAll();
+      } catch (err) {
+        toast(err.message, "err");
+      } finally {
+        startPoolProbeBtn.disabled = false;
+      }
+    });
+  }
   document.getElementById("btn-test-notify").addEventListener("click", async () => {
     toast("正在发送测试通知...", "info");
     try {
@@ -1358,12 +1581,15 @@ function bindEvents() {
       toast(err.message, "err");
     }
   });
-  document.getElementById("btn-save-password").addEventListener("click", async () => {
+  document.getElementById("security-password-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
     const pw = document.getElementById("new-panel-password").value;
     try {
-      await api("/api/auth/password", { method: "POST", body: { password: pw } });
+      const res = await api("/api/auth/password", { method: "POST", body: { password: pw } });
       document.getElementById("new-panel-password").value = "";
+      document.getElementById("btn-logout").classList.toggle("hidden", !res.auth_enabled);
       toast(pw ? "面板访问密码已更新" : "已清除数据库密码", "ok");
+      loadSettings();
     } catch (err) {
       toast(err.message, "err");
     }
@@ -1384,14 +1610,29 @@ function bindEvents() {
   });
 
   // Monitor Proxy Modal & Tester
+  function syncModalAutoUI() {
+    const auto = document.getElementById("proxy-modal-auto").checked;
+    document.getElementById("proxy-modal-max-wrap").classList.toggle("hidden", !auto);
+    document.getElementById("proxy-modal-textarea-label").innerHTML = auto
+      ? "代理总池列表（一行一条；保存后后台逐条随机延迟测速，自动挑最快 Top-N 进活跃池）"
+      : "监控代理列表（每行一条或逗号分隔；支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code> 及 <code>ip:port:user:pass</code>）";
+  }
+  document.getElementById("proxy-modal-auto").addEventListener("change", syncModalAutoUI);
+
   document.querySelectorAll(".js-open-proxy-modal").forEach((btn) => {
     btn.addEventListener("click", async () => {
       try {
         const s = await api("/api/settings");
-        document.getElementById("proxy-modal-textarea").value = s.monitor_proxies || s.http_proxy || "";
+        const auto = !!s.proxy_auto_pool;
+        document.getElementById("proxy-modal-auto").checked = auto;
+        document.getElementById("proxy-modal-max-active").value = s.proxy_max_active || 5;
+        document.getElementById("proxy-modal-textarea").value = auto
+          ? s.monitor_proxies_pool || s.monitor_proxies || ""
+          : s.monitor_proxies || s.http_proxy || "";
         document.getElementById("proxy-modal-fallback").checked = s.monitor_proxy_fallback_direct !== false;
         document.getElementById("proxy-modal-order-use").checked = !!s.order_use_proxy;
         document.getElementById("proxy-test-results").innerHTML = "";
+        syncModalAutoUI();
         openModal("proxy-modal");
       } catch (err) {
         toast(err.message, "err");
@@ -1454,7 +1695,7 @@ function bindEvents() {
   const settingsProxyTestBtn = document.getElementById("btn-test-settings-proxy");
   if (settingsProxyTestBtn) {
     settingsProxyTestBtn.addEventListener("click", () => {
-      const f = document.getElementById("settings-form");
+      const f = document.getElementById("network-settings-form");
       const raw = (f.elements.monitor_proxies && f.elements.monitor_proxies.value.trim()) || f.elements.http_proxy.value.trim();
       const epEl = document.getElementById("settings-proxy-test-endpoint");
       const ep = (epEl && epEl.value) || "ovh-eu";
@@ -1465,17 +1706,23 @@ function bindEvents() {
   document.getElementById("proxy-modal-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      await api("/api/settings", {
-        method: "PUT",
-        body: {
-          monitor_proxies: document.getElementById("proxy-modal-textarea").value.trim(),
-          monitor_proxy_fallback_direct: document.getElementById("proxy-modal-fallback").checked,
-          order_use_proxy: document.getElementById("proxy-modal-order-use").checked,
-        },
-      });
+      const auto = document.getElementById("proxy-modal-auto").checked;
+      const rawTxt = document.getElementById("proxy-modal-textarea").value.trim();
+      const patch = {
+        proxy_auto_pool: auto,
+        monitor_proxy_fallback_direct: document.getElementById("proxy-modal-fallback").checked,
+        order_use_proxy: document.getElementById("proxy-modal-order-use").checked,
+      };
+      if (auto) {
+        patch.monitor_proxies_pool = rawTxt;
+        patch.proxy_max_active = Math.max(1, parseInt(document.getElementById("proxy-modal-max-active").value || "5", 10) || 5);
+      } else {
+        patch.monitor_proxies = rawTxt;
+      }
+      await api("/api/settings", { method: "PUT", body: patch });
       closeModal("proxy-modal");
-      toast("监控代理配置已保存并立即生效!", "ok");
-      if (state.activeTab === "settings") loadSettings();
+      toast(auto ? "总代理池已保存，后台正在逐条优选最低延迟节点!" : "监控代理配置已保存并立即生效!", "ok");
+      if (SETTINGS_TABS.has(state.activeTab)) loadSettings();
       refreshAll();
     } catch (err) {
       toast(err.message, "err");
@@ -1549,5 +1796,6 @@ window.deleteAccount = deleteAccount;
 window.trackOrder = trackOrder;
 window.confirmShortLink = confirmShortLink;
 window.cancelShortLink = cancelShortLink;
+window.evictPoolProxy = evictPoolProxy;
 
 document.addEventListener("DOMContentLoaded", init);

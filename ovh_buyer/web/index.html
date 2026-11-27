@@ -52,6 +52,8 @@
     <symbol id="i-cart" viewBox="0 0 24 24"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></symbol>
     <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></symbol>
   </svg>
 
   <!-- Login Overlay -->
@@ -96,7 +98,10 @@
         <button class="nav-item" data-tab="vps"><svg class="ic"><use href="#i-cloud"/></svg><span class="grow">VPS 监控</span></button>
         <div class="nav-label">配置</div>
         <button class="nav-item" data-tab="accounts"><svg class="ic"><use href="#i-key"/></svg><span class="grow">OVH 账号</span></button>
-        <button class="nav-item" data-tab="settings"><svg class="ic"><use href="#i-bell"/></svg><span class="grow">通知与设置</span></button>
+        <button class="nav-item" data-tab="notify"><svg class="ic"><use href="#i-bell"/></svg><span class="grow">通知设置</span></button>
+        <button class="nav-item" data-tab="network"><svg class="ic"><use href="#i-globe"/></svg><span class="grow">网络设置</span></button>
+        <button class="nav-item" data-tab="features"><svg class="ic"><use href="#i-sliders"/></svg><span class="grow">功能开关</span></button>
+        <button class="nav-item" data-tab="security"><svg class="ic"><use href="#i-lock"/></svg><span class="grow">面板安全</span></button>
         <button class="nav-item" data-tab="logs"><svg class="ic"><use href="#i-terminal"/></svg><span class="grow">运行日志</span></button>
       </nav>
 
@@ -413,83 +418,112 @@
         </div>
       </section>
 
-      <!-- TAB: Settings -->
-      <section id="tab-settings" class="tab-panel">
-        <form id="settings-form" class="two-col">
-          <div class="card">
-            <div class="card-header">
-              <h3><svg class="ic"><use href="#i-send"/></svg>通知渠道</h3>
-              <button type="button" class="btn btn-sm" id="btn-test-notify">发送测试通知</button>
-            </div>
-            <div class="form-section">Telegram（零域名 Long Polling）</div>
-            <div class="field">
-              <label>Bot Token</label>
-              <input type="text" name="telegram_bot_token" placeholder="123456:ABC-DEF..." />
-            </div>
-            <div class="form-row">
-              <div class="field">
-                <label>Chat ID / 话题链接（逗号分隔多个）</label>
-                <input type="text" name="telegram_chat_id" placeholder="-100123456/45 或 https://t.me/c/123456/45" />
+      <!-- TAB: Notify Settings -->
+      <section id="tab-notify" class="tab-panel">
+        <form id="notify-settings-form" class="js-settings-form">
+          <div class="two-col">
+            <div class="card">
+              <div class="card-header">
+                <h3><svg class="ic"><use href="#i-send"/></svg>Telegram（零域名 Long Polling）</h3>
+                <button type="button" class="btn btn-sm" id="btn-test-notify">发送测试通知</button>
               </div>
               <div class="field">
-                <label>默认话题 Topic ID（可选）</label>
-                <input type="text" name="telegram_topic_id" placeholder="如 45（已用 /45 指定可留空）" />
+                <label>Bot Token</label>
+                <input type="text" name="telegram_bot_token" placeholder="123456:ABC-DEF..." />
               </div>
-            </div>
-            <div class="form-row">
-              <div class="field">
-                <label>群组授权用户 ID（可选，仅授权点按钮不收重复推送）</label>
-                <input type="text" name="telegram_admin_ids" placeholder="如 123456789（逗号分隔）" />
+              <div class="form-row">
+                <div class="field">
+                  <label>Chat ID / 话题链接（逗号分隔多个）</label>
+                  <input type="text" name="telegram_chat_id" placeholder="-100123456/45 或 https://t.me/c/123456/45" />
+                </div>
+                <div class="field">
+                  <label>默认话题 Topic ID（可选）</label>
+                  <input type="text" name="telegram_topic_id" placeholder="如 45（已用 /45 指定可留空）" />
+                </div>
               </div>
-              <div class="field">
-                <label>专用代理（可选）</label>
-                <input type="text" name="telegram_proxy" placeholder="http://127.0.0.1:7890" />
+              <div class="form-row">
+                <div class="field">
+                  <label>群组授权用户 ID（可选，仅授权点按钮不收重复推送）</label>
+                  <input type="text" name="telegram_admin_ids" placeholder="如 123456789（逗号分隔）" />
+                </div>
+                <div class="field">
+                  <label>专用代理（可选）</label>
+                  <input type="text" name="telegram_proxy" placeholder="http://127.0.0.1:7890" />
+                </div>
               </div>
-            </div>
-            <div class="field checkbox-row">
-              <label><input type="checkbox" name="telegram_polling_enabled" /><span><b>启用 Bot 交互指令与一键下单按钮</b><small>无需公网 HTTPS 域名，支持 /status /check /order /servers 等</small></span></label>
-            </div>
-            <div class="form-section">其他渠道</div>
-            <div class="form-row">
-              <div class="field">
-                <label>Bark URL（iOS）</label>
-                <input type="text" name="bark_url" placeholder="https://api.day.app/KEY" />
-              </div>
-              <div class="field">
-                <label>Server酱 SendKey</label>
-                <input type="text" name="serverchan_key" placeholder="SCT..." />
+              <div class="field checkbox-row" style="margin-bottom:0">
+                <label><input type="checkbox" name="telegram_polling_enabled" /><span><b>启用 Bot 交互指令与一键下单按钮</b><small>无需公网 HTTPS 域名，支持 /status /check /order /servers 等</small></span></label>
               </div>
             </div>
-            <div class="form-row">
-              <div class="field">
-                <label>钉钉 Webhook</label>
-                <input type="text" name="dingtalk_webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+
+            <div class="card">
+              <div class="card-header">
+                <h3><svg class="ic"><use href="#i-bell"/></svg>其他推送渠道</h3>
+                <span class="muted">支持多渠道同时送达</span>
               </div>
-              <div class="field">
-                <label>钉钉加签 Secret</label>
-                <input type="text" name="dingtalk_secret" placeholder="SEC..." />
+              <div class="form-row">
+                <div class="field">
+                  <label>Bark URL（iOS）</label>
+                  <input type="text" name="bark_url" placeholder="https://api.day.app/KEY" />
+                </div>
+                <div class="field">
+                  <label>Server酱 SendKey</label>
+                  <input type="text" name="serverchan_key" placeholder="SCT..." />
+                </div>
               </div>
-            </div>
-            <div class="form-row">
-              <div class="field">
-                <label>飞书 Webhook</label>
-                <input type="text" name="feishu_webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+              <div class="form-row">
+                <div class="field">
+                  <label>钉钉 Webhook</label>
+                  <input type="text" name="dingtalk_webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+                </div>
+                <div class="field">
+                  <label>钉钉加签 Secret</label>
+                  <input type="text" name="dingtalk_secret" placeholder="SEC..." />
+                </div>
               </div>
-              <div class="field">
-                <label>Discord Webhook</label>
-                <input type="text" name="discord_webhook" placeholder="https://discord.com/api/webhooks/..." />
+              <div class="form-row">
+                <div class="field">
+                  <label>飞书 Webhook</label>
+                  <input type="text" name="feishu_webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+                </div>
+                <div class="field">
+                  <label>Discord Webhook</label>
+                  <input type="text" name="discord_webhook" placeholder="https://discord.com/api/webhooks/..." />
+                </div>
               </div>
-            </div>
-            <div class="field">
-              <label>自定义 Webhook（POST JSON）</label>
-              <input type="text" name="custom_webhook_url" placeholder="https://..." />
+              <div class="field" style="margin-bottom:0">
+                <label>自定义 Webhook（POST JSON）</label>
+                <input type="text" name="custom_webhook_url" placeholder="https://..." />
+              </div>
             </div>
           </div>
 
+          <div class="card">
+            <div class="card-header">
+              <h3><svg class="ic"><use href="#i-check"/></svg>推送事件</h3>
+              <span class="muted">勾选需要触发消息推送的事件类型</span>
+            </div>
+            <div class="field checkbox-grid">
+              <label><input type="checkbox" name="notify_on_stock" /><span><b>发现补货</b><small>监控命中可订库存时推送补货卡片</small></span></label>
+              <label><input type="checkbox" name="notify_on_order" /><span><b>下单成功 / 演练完成</b><small>抢购出单或演练校验通过时推送</small></span></label>
+              <label><input type="checkbox" name="notify_on_paid" /><span><b>订单已付款</b><small>跟踪到订单完成支付进入核查/交付时推送</small></span></label>
+              <label><input type="checkbox" name="notify_on_delivered" /><span><b>交付 &amp; 中奖</b><small>独服开通交付及检测到免费硬件升级时推送</small></span></label>
+              <label><input type="checkbox" name="notify_on_error" /><span><b>下单失败</b><small>建车或结账接口报错时推送提醒</small></span></label>
+            </div>
+            <div style="display:flex;justify-content:flex-end">
+              <button type="submit" class="btn btn-primary">保存通知设置</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <!-- TAB: Network Settings -->
+      <section id="tab-network" class="tab-panel">
+        <form id="network-settings-form" class="js-settings-form two-col">
           <div class="stack">
             <div class="card">
               <div class="card-header">
-                <h3><svg class="ic"><use href="#i-zap"/></svg>引擎与网络</h3>
+                <h3><svg class="ic"><use href="#i-activity"/></svg>速率限制与轮询间隔</h3>
               </div>
               <div class="form-row">
                 <div class="field">
@@ -512,19 +546,103 @@
                 </div>
               </div>
               <div class="form-row">
-                <div class="field">
+                <div class="field" style="margin-bottom:0">
                   <label>批量查询阈值（≥ N 个型号合并请求）</label>
                   <input type="number" min="2" max="20" name="bulk_availability_threshold" />
                 </div>
-                <div class="field">
+                <div class="field" style="margin-bottom:0">
                   <label>兜底全局代理（通知 / 未配监控代理时使用）</label>
                   <input type="text" name="http_proxy" placeholder="http://127.0.0.1:7890" />
                 </div>
               </div>
-              <div class="form-section">监控专用代理池（查库存 / 雷达 / VPS 监控）</div>
+              <div class="muted mt-12">提示：监控 ≥ 批量查询阈值的型号时会自动合并为单次全量库存请求，显著降低 QPS 消耗。</div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h3><svg class="ic"><use href="#i-shield"/></svg>代理隔离与回退策略</h3>
+              </div>
+              <div class="field checkbox-row">
+                <label><input type="checkbox" name="monitor_proxy_fallback_direct" /><span><b>监控代理全部不可用时允许回退本机直连</b><small>关闭则严格仅通过活跃代理请求监控接口，哪怕代理全挂也绝不暴露本机 IP</small></span></label>
+                <label><input type="checkbox" name="order_use_proxy" /><span><b>下单与账号请求也走监控代理池</b><small>默认关闭：仅高频监控走代理防 429 封 IP，账号建车与结账默认直连（也可在账号里绑定独立固定代理）</small></span></label>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block">保存网络设置</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3><svg class="ic"><use href="#i-globe"/></svg>监控专用代理池（总池 &amp; 活跃池）</h3>
+              <span class="pill pill-gray" id="pool-probe-badge">手动模式</span>
+            </div>
+
+            <div class="field checkbox-row">
+              <label><input type="checkbox" name="proxy_auto_pool" id="chk-proxy-auto-pool" /><span><b>启用自动配置活跃代理池（延迟优选 + 故障热替补）</b><small>后台逐条串行测速（随机间隔 1.5~4s 避免并发特征），自动将延迟最低的 Top-N 放入活跃池；连接失败自动移出冷却并秒换最快候补</small></span></label>
+            </div>
+
+            <!-- Auto Two-Tier Pool Mode -->
+            <div id="auto-pool-section" class="hidden">
               <div class="field">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                  <label style="margin:0">代理总池（候选仓库，一行一个，支持 HTTP / HTTPS / SOCKS5 / ip:port:user:pass）</label>
+                  <span class="muted" id="master-pool-count-hint">总池 0 条</span>
+                </div>
+                <textarea name="monitor_proxies_pool" id="txt-proxies-pool" rows="4" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass"></textarea>
+              </div>
+
+              <div class="form-row">
+                <div class="field">
+                  <label>最大活跃代理数（Top N）</label>
+                  <input type="number" min="1" max="50" name="proxy_max_active" />
+                </div>
+                <div class="field">
+                  <label>最高可接受延迟（ms）</label>
+                  <input type="number" min="100" max="30000" step="50" name="proxy_max_latency_ms" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="field">
+                  <label>连续失败剔除次数（403/407/429 立即踢）</label>
+                  <input type="number" min="1" max="20" name="proxy_fail_threshold" />
+                </div>
+                <div class="field">
+                  <label>淘汰冷却复活时间（秒）</label>
+                  <input type="number" min="10" max="86400" name="proxy_cooldown_sec" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="field">
+                  <label>后台静默重测周期（秒，0 = 仅故障替补）</label>
+                  <input type="number" min="0" max="86400" name="proxy_recheck_interval" />
+                </div>
+                <div class="field">
+                  <label>基准测速区域</label>
+                  <select name="proxy_test_endpoint">
+                    <option value="ovh-eu">OVH EU (欧洲)</option>
+                    <option value="ovh-ca">OVH CA (加拿大/亚太)</option>
+                    <option value="ovh-us">OVH US (美国)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-section" style="margin-top:4px">当前活跃代理池</div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                <span class="muted" id="active-pool-summary">活跃 0 / 5 · 健康候补 0 · 冷却 0</span>
+                <button type="button" class="btn btn-sm" id="btn-start-pool-probe">⚡ 逐条测速并重排活跃池</button>
+              </div>
+              <div id="active-pool-board" class="list-stack" style="max-height:220px;overflow:auto"></div>
+
+              <details id="standby-pool-details" class="mt-8">
+                <summary class="muted" style="cursor:pointer;user-select:none" id="standby-pool-summary">查看总池候补与冷却节点 (0)</summary>
+                <div id="standby-pool-board" class="list-stack mt-6" style="max-height:180px;overflow:auto"></div>
+              </details>
+            </div>
+
+            <!-- Manual Pool Mode -->
+            <div id="manual-pool-section">
+              <div class="field" style="margin-bottom:0">
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-                  <label style="margin:0">监控代理列表（一行一个，自动轮询与故障切换，支持 HTTP / HTTPS / SOCKS5）</label>
+                  <label style="margin:0">活跃监控代理列表（手动固定轮询，一行一个）</label>
                   <div class="toolbar" style="gap:6px">
                     <select id="settings-proxy-test-endpoint" style="height:28px;min-width:110px;font-size:12.5px">
                       <option value="ovh-eu">OVH EU</option>
@@ -534,45 +652,71 @@
                     <button type="button" class="btn btn-sm" id="btn-test-settings-proxy">⚡ 测速验证代理</button>
                   </div>
                 </div>
-                <textarea name="monitor_proxies" rows="3" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass"></textarea>
+                <textarea name="monitor_proxies" id="txt-proxies-manual" rows="5" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass"></textarea>
                 <div id="settings-proxy-test-results" class="list-stack mt-8" style="max-height:200px;overflow:auto"></div>
               </div>
-              <div class="field checkbox-row">
-                <label><input type="checkbox" name="monitor_proxy_fallback_direct" /><span><b>监控代理全部不可用时允许回退本机直连</b><small>关闭则严格仅通过代理请求监控接口，绝不暴露本机 IP</small></span></label>
-                <label><input type="checkbox" name="order_use_proxy" /><span><b>下单与账号请求也走监控代理池</b><small>默认关闭：仅高频监控走代理防 429 封 IP，账号建车与结账默认直连（也可在账号里绑定独立固定代理）</small></span></label>
-              </div>
-              <div class="form-section">功能开关</div>
-              <div class="field checkbox-row">
-                <label><input type="checkbox" name="fast_lane_enabled" /><span><b>预建购物车快速通道</b><small>为开启快速通道的任务提前建车并自动续期</small></span></label>
-                <label><input type="checkbox" name="tracker_enabled" /><span><b>订单交付与硬件中奖跟踪</b><small>自动查询付款 / 交付状态并比对实机硬件</small></span></label>
-                <label><input type="checkbox" name="edit_sold_out_telegram" /><span><b>售罄自动划线 Telegram 卡片</b><small>补货卡片在售罄后标记「已被抢完」</small></span></label>
-              </div>
-              <div class="form-section">推送事件</div>
-              <div class="field checkbox-grid">
-                <label><input type="checkbox" name="notify_on_stock" /><span>发现补货</span></label>
-                <label><input type="checkbox" name="notify_on_order" /><span>下单成功 / 演练完成</span></label>
-                <label><input type="checkbox" name="notify_on_paid" /><span>订单已付款</span></label>
-                <label><input type="checkbox" name="notify_on_delivered" /><span>交付 &amp; 中奖</span></label>
-                <label><input type="checkbox" name="notify_on_error" /><span>下单失败</span></label>
-              </div>
-              <button type="submit" class="btn btn-primary btn-block">保存全部设置</button>
-            </div>
-
-            <div class="card">
-              <div class="card-header">
-                <h3><svg class="ic"><use href="#i-lock"/></svg>面板安全与备份</h3>
-              </div>
-              <div class="field">
-                <label>面板登录密码（部署到公网强烈建议设置）</label>
-                <div class="inline-form">
-                  <input type="password" id="new-panel-password" placeholder="输入新密码（留空可清除数据库密码）" autocomplete="new-password" />
-                  <button type="button" class="btn" id="btn-save-password">更新密码</button>
-                </div>
-              </div>
-              <button type="button" class="btn btn-sm" id="btn-export-config"><svg class="ic"><use href="#i-download"/></svg>导出 JSON 配置备份（脱敏）</button>
             </div>
           </div>
         </form>
+      </section>
+
+      <!-- TAB: Feature Switches -->
+      <section id="tab-features" class="tab-panel">
+        <form id="features-settings-form" class="js-settings-form two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3><svg class="ic"><use href="#i-zap"/></svg>核心引擎与监控模块</h3>
+              <span class="muted">与顶部快捷拨动开关实时同步</span>
+            </div>
+            <div class="field checkbox-row" style="margin-bottom:0">
+              <label><input type="checkbox" name="sniper_enabled" /><span><b>全局抢购引擎</b><small>开启后后台自动轮询所有「运行中」的独服 / Eco 抢购任务</small></span></label>
+              <label><input type="checkbox" name="fast_lane_enabled" /><span><b>预建购物车快速通道</b><small>为开启快速通道的任务提前建好购物车并自动续期，有货 1 次请求秒结账</small></span></label>
+              <label><input type="checkbox" name="radar_enabled" /><span><b>黑五新品与配置雷达</b><small>定期扫描官方商品目录，发现新品上架或匹配硬件规格时自动告警/入队</small></span></label>
+              <label><input type="checkbox" name="vps_monitor_enabled" /><span><b>VPS 补货监控</b><small>定期检测监控列表中的 OVH VPS 套餐各机房库存状态</small></span></label>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3><svg class="ic"><use href="#i-sliders"/></svg>交付跟踪与交互增强</h3>
+            </div>
+            <div class="field checkbox-row">
+              <label><input type="checkbox" name="tracker_enabled" /><span><b>订单交付与硬件中奖跟踪</b><small>自动查询未付款 → 已交付进度，交付后读取实机硬件并比对是否免费升级（中奖）</small></span></label>
+              <label><input type="checkbox" name="edit_sold_out_telegram" /><span><b>售罄自动划线 Telegram 卡片</b><small>已发送的 Telegram 补货卡片在后续检测售罄后自动编辑划上删除线并标记「已被抢完」</small></span></label>
+            </div>
+            <button type="submit" class="btn btn-primary btn-block">保存功能开关</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- TAB: Panel Security -->
+      <section id="tab-security" class="tab-panel">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3><svg class="ic"><use href="#i-lock"/></svg>面板登录密码与门禁</h3>
+              <span class="pill pill-gray" id="security-auth-badge">检测中...</span>
+            </div>
+            <form id="security-password-form">
+              <div class="field">
+                <label>面板登录密码（部署到公网强烈建议设置）</label>
+                <div class="inline-form">
+                  <input type="password" id="new-panel-password" placeholder="输入新密码（留空保存可清除数据库密码）" autocomplete="new-password" />
+                  <button type="submit" class="btn btn-primary" id="btn-save-password">更新密码</button>
+                </div>
+              </div>
+            </form>
+            <div class="muted">密码采用 PBKDF2-HMAC-SHA256 哈希存储；修改密码会使所有旧登录会话立即失效；连续输错 8 次将锁定来源 IP 5 分钟。也可通过 <code>X-API-Key</code> 请求头调用 REST API。</div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3><svg class="ic"><use href="#i-shield"/></svg>配置备份与导出</h3>
+            </div>
+            <p class="card-desc">导出包含系统设置、账号骨架、抢购任务、黑五雷达规则与 VPS 监控项的 JSON 备份文件。所有敏感凭据（OVH Secret / Consumer Key、Telegram Token、Webhook 密钥、代理密码）均自动脱敏打码。</p>
+            <button type="button" class="btn" id="btn-export-config"><svg class="ic"><use href="#i-download"/></svg>导出 JSON 配置备份（脱敏）</button>
+          </div>
+        </div>
       </section>
 
       <!-- TAB: Live Logs -->
@@ -952,10 +1096,17 @@
       </div>
       <form id="proxy-modal-form">
         <p class="card-desc" style="margin-bottom:12px">
-          用于 <b>抢购任务库存轮询、黑五雷达、VPS 补货监控、目录与秒查库存</b>。支持单代理或多行代理池自动轮询与故障切换，高频监控不怕本机 IP 被 OVH 限流（429 / WAF）。
+          用于 <b>抢购任务库存轮询、黑五雷达、VPS 补货监控、目录与秒查库存</b>。支持手动固定池或开启「自动优选活跃池」（更多高级参数可在左侧「网络设置」调整）。
         </p>
+        <div class="field checkbox-row">
+          <label><input type="checkbox" id="proxy-modal-auto" /><span><b>启用自动配置活跃代理池（从总池自动优选最低延迟 Top-N 并故障热替补）</b></span></label>
+        </div>
+        <div class="field hidden" id="proxy-modal-max-wrap">
+          <label>最大活跃代理数（Top N）</label>
+          <input type="number" id="proxy-modal-max-active" min="1" max="50" value="5" />
+        </div>
         <div class="field">
-          <label>监控代理列表（每行一条或逗号分隔；支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code> 及 <code>ip:port:user:pass</code>）</label>
+          <label id="proxy-modal-textarea-label">监控代理列表（每行一条或逗号分隔；支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code> 及 <code>ip:port:user:pass</code>）</label>
           <textarea name="monitor_proxies" id="proxy-modal-textarea" rows="5" placeholder="socks5://user:pass@1.2.3.4:1080&#10;http://user:pass@5.6.7.8:8080&#10;9.10.11.12:8080:user:pass&#10;http://127.0.0.1:7890"></textarea>
         </div>
         <div class="field checkbox-row">

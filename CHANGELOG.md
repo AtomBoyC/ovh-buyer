@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0
 
 ---
 
+## [2.1.4] - 2026-11-27
+
+### Added
+
+- **Two-Tier Monitoring Proxy Pool (`ProxyPoolManager`: Master Pool + Auto-Selected Active Pool)**:
+  - Automatically maintains up to `proxy_max_active` (default `5`) lowest-latency healthy proxies in the Active Pool (`<= proxy_max_latency_ms`) from a larger candidate Master Pool (`monitor_proxies_pool` / `OVH_MONITOR_PROXIES_POOL`);
+  - **Staggered 1-by-1 Silent Background Probing**: probes candidates strictly sequentially with randomized jitter delays (`1.5s–4.0s`) rather than concurrent bursts, preventing proxy-gateway concurrency throttling and anti-bot burst signatures;
+  - **Instant Hot-Swap Failover & Cooldown Resurrection**: immediately quarantines proxies hitting `403 / 407 / 429` or `proxy_fail_threshold` consecutive errors for `proxy_cooldown_sec`, hot-swaps in the fastest pre-measured standby proxy with zero wait, and re-admits cooled proxies in subsequent probe passes;
+  - **Live Active Pool Dashboard & APIs**: added `GET /api/proxy/pool`, `POST /api/proxy/pool/probe`, and `POST /api/proxy/pool/evict` (one-click manual eviction/rotation using credential-safe hashed IDs).
+
+### Changed
+
+- **Modular Configuration Navigation**: refactored the monolithic Settings view under the `Configuration` sidebar section into four focused tabs — **Notification Settings** (unifying Telegram, multi-channel Webhooks, and Push Event switches), **Network Settings**, **Feature Switches**, and **Panel Security**.
+
+### Fixed
+
+- **Strict No-Local-IP-Leak Guard**: when all monitoring pool proxies are in failure cooldown and `monitor_proxy_fallback_direct` is disabled, monitoring requests now strictly abort instead of falling back to direct host connections.
+- **Proxy Parser & Tester Enhancements**: added inline per-proxy test results and loading states in Network Settings; supported scheme-prefixed shorthand (`socks5://host:port:user:pass` / `http://host:port:user:pass`), preserved `,` and `;` inside proxy passwords, and omitted `:443` from `Host` headers over SOCKS5/HTTPS tunnels.
+
+---
+
 ## [2.1.3] - 2026-11-27
 
 ### Added
