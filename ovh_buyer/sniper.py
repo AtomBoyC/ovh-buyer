@@ -27,7 +27,24 @@ from .config import (
 from .database import Database, now_iso
 from .notifier import Notifier
 from .order_engine import CartSlotPool, OrderEngine, safe_delete_cart
-from .ovh_client import OVHAPIError, OVHClient, ProxyPoolManager, ProxyRotator, parse_proxy_list, redact_proxy_url
+from .ovh_client import (
+    OVHAPIError,
+    OVHClient,
+    ProxyPoolManager,
+    ProxyRotator,
+    merge_masked_proxy_input,
+    parse_proxy_list,
+    redact_proxy_url,
+)
+from .scheduler import (
+    describe_global_rule,
+    evaluate_item_schedule,
+    is_in_daily_windows,
+    now_in_tz,
+    parse_hhmm,
+    parse_local_datetime,
+    parse_time_windows,
+)
 from .specs import GLOBAL_FX
 from .tracker import OrderTracker
 
@@ -71,12 +88,15 @@ class SniperEngine:
 
         # In-memory cooldown & short-link cart cache
         self._task_last_poll: Dict[str, float] = {}
+        self._task_last_db_sync: Dict[str, float] = {}
+        self._task_pending_attempts: Dict[str, int] = {}
         self._stock_notify_cooldown: Dict[str, float] = {}
         self._order_fail_cooldown: Dict[str, float] = {}
         self._radar_last_poll: float = 0.0
         self._vps_last_poll: float = 0.0
         self._fastlane_last_tick: float = 0.0
         self._tracker_last_tick: float = 0.0
+        self._scheduler_last_tick: float = 0.0
         self._short_link_lock = threading.Lock()
         self._short_link_carts: Dict[str, Dict[str, Any]] = {}
         # Tasks currently being evaluated/ordered (guards against concurrent double-orders)
@@ -92,6 +112,8 @@ class SniperEngine:
             {
                 "status": self._tg_cmd_status,
                 "tasks": self._tg_cmd_tasks,
+                "schedule": self._tg_cmd_schedule,
+                "schedules": self._tg_cmd_schedule,
                 "check": self._tg_cmd_check,
                 "order": self._tg_cmd_short_order,
                 "orders": self._tg_cmd_orders,
@@ -219,6 +241,23 @@ class SniperEngine:
 
         return self.proxy_rotator.pick(fallback_global, exclude=exclude), fallback_global
 
+    def _account_proxy_policy(self, account: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> str:
+        """Stable proxy policy tag for Fast Lane cart fingerprinting across round-robin pool picks."""
+        acc_p = str(account.get("proxy_url") or "").strip()
+        if acc_p:
+            return f"acc:{acc_p}"
+        s = settings if settings is not None else self.db.get_settings()
+        if s.get("order_use_proxy", False):
+            return "pool"
+        fb = str(
+            s.get("http_proxy")
+            or os.environ.get("OVH_HTTP_PROXY")
+            or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("HTTP_PROXY")
+            or ""
+        ).strip()
+        return f"direct:{fb}"
+
     def build_client(
         self,
         account: Optional[Dict[str, Any]] = None,
@@ -328,9 +367,13 @@ class SniperEngine:
     def test_proxies(self, raw_proxies: str = "", endpoint: str = "ovh-eu") -> Dict[str, Any]:
         """Test connectivity & latency (ms) of configured proxies against OVH API."""
         settings = self.db.get_settings()
-        src = raw_proxies.strip() if raw_proxies and raw_proxies.strip() else str(
-            settings.get("monitor_proxies") or settings.get("http_proxy") or ""
-        ).strip()
+        saved_combined = "\n".join(
+            str(settings.get(k) or "") for k in ("monitor_proxies_pool", "monitor_proxies", "http_proxy", "telegram_proxy")
+        )
+        if raw_proxies and raw_proxies.strip():
+            src = merge_masked_proxy_input(raw_proxies.strip(), saved_combined)
+        else:
+            src = str(settings.get("monitor_proxies") or settings.get("http_proxy") or "").strip()
         all_proxies = parse_proxy_list(src)
         proxies = all_proxies[:20]
         if not proxies:
@@ -340,7 +383,7 @@ class SniperEngine:
 
         def _probe(p_url: str) -> Dict[str, Any]:
             t0 = time.monotonic()
-            cli = OVHClient(endpoint=ep, proxy_url=p_url, qps=20.0, timeout=8.0, max_retries=1)
+            cli = OVHClient(endpoint=ep, proxy_url=p_url, timeout=8.0, max_retries=1, bypass_rate_limit=True)
             try:
                 srv_ts = cli._raw_request("GET", f"{cli.api_base}/auth/time")
                 ms = int((time.monotonic() - t0) * 1000)
@@ -406,12 +449,13 @@ class SniperEngine:
                 threading.Thread(target=self._radar_loop, name="radar-loop", daemon=True),
                 threading.Thread(target=self._vps_loop, name="vps-loop", daemon=True),
                 threading.Thread(target=self._proxy_pool_loop, name="proxy-pool-loop", daemon=True),
+                threading.Thread(target=self._scheduler_loop, name="scheduler-loop", daemon=True),
             ]
             for t in self._threads:
                 t.start()
             self.on_settings_updated(trigger_probe=True)
             self.notifier.start_telegram_polling()
-            self.db.add_log("INFO", "OVH Sniper v2.1 引擎已启动（含快速通道 & 交付中奖跟踪）", "engine")
+            self.db.add_log("INFO", "OVH Sniper v2.2 引擎已启动（含快速通道、双层定时调度 & 交付中奖跟踪）", "engine")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -474,11 +518,151 @@ class SniperEngine:
             "master_proxy_count": master_cnt,
             "proxy_probing": probing,
             "order_use_proxy": bool(settings.get("order_use_proxy", False)),
+            "schedule_timezone": str(settings.get("schedule_timezone") or "Asia/Shanghai"),
+            "server_local_time": now_in_tz(str(settings.get("schedule_timezone") or "Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S"),
             "uptime_seconds": uptime,
             "total_polls": self.total_polls,
             "stock_hits": self.stock_hits,
             "stats": self.db.get_stats(),
         }
+
+    # ---------- Two-Tier Scheduler Loop (Global Rules + Item Auto-Stop) ----------
+
+    def _scheduler_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.run_schedule_tick()
+            except Exception as exc:
+                self.db.add_log("WARNING", f"定时调度器巡检异常: {exc}", "schedule")
+            self._stop_event.wait(2.0)
+
+    def _apply_schedule_targets(self, rule: Dict[str, Any], enable: bool, qps: float = 0.0) -> str:
+        """Apply scheduled ON/OFF transition to target modules/tasks (never touching pending_confirm/completed)."""
+        targets = rule.get("targets") or ["sniper"]
+        settings_patch: Dict[str, Any] = {}
+        applied_labels: List[str] = []
+        target_map = {
+            "sniper": ("sniper_enabled", "抢购引擎"),
+            "fast_lane": ("fast_lane_enabled", "快速通道"),
+            "radar": ("radar_enabled", "黑五雷达"),
+            "vps": ("vps_monitor_enabled", "VPS监控"),
+        }
+        for tgt in targets:
+            if tgt in target_map:
+                s_key, cn = target_map[tgt]
+                settings_patch[s_key] = bool(enable)
+                applied_labels.append(f"{cn}->{'开启' if enable else '暂停'}")
+            elif tgt == "all_tasks":
+                cnt = 0
+                for t in self.db.list_tasks():
+                    if enable and t["status"] == "paused":
+                        self.db.update_task(t["id"], {"status": "running"})
+                        cnt += 1
+                    elif not enable and t["status"] == "running":
+                        self.db.update_task(t["id"], {"status": "paused"})
+                        self.slot_pool.cleanup_task(t["id"])
+                        cnt += 1
+                applied_labels.append(f"批量任务({'启动' if enable else '暂停'} {cnt} 个)")
+            elif tgt.startswith("task:"):
+                tid = tgt.split(":", 1)[1].strip()
+                t = self.db.get_task(tid)
+                if t and t["status"] in ("running", "paused"):
+                    new_st = "running" if enable else "paused"
+                    if t["status"] != new_st:
+                        self.db.update_task(tid, {"status": new_st})
+                        if not enable:
+                            self.slot_pool.cleanup_task(tid)
+                    applied_labels.append(f"任务[{t['name']}]->{new_st}")
+
+        if qps and qps > 0:
+            settings_patch["global_qps"] = float(qps)
+            applied_labels.append(f"QPS={qps}")
+
+        if settings_patch:
+            self.db.update_settings(settings_patch)
+            if settings_patch.get("fast_lane_enabled") is False:
+                self.ctx_cleanup_slots()
+
+        summary = "，".join(applied_labels) or ("开启" if enable else "暂停")
+        self.db.add_log("INFO", f"⏰ [定时调度] 规则「{rule['name']}」已触发: {summary}", "schedule")
+        if rule.get("notify"):
+            self.notifier.notify(
+                title=f"⏰ 定时调度已触发: {rule['name']}",
+                body=f"执行动作: {summary}",
+                event="schedule",
+            )
+        if enable:
+            self._spawn_immediate_tick()
+        return summary
+
+    def ctx_cleanup_slots(self) -> None:
+        try:
+            self.slot_pool.cleanup_all()
+        except Exception:
+            pass
+
+    def run_schedule_tick(self, now_ts: Optional[float] = None) -> int:
+        """Evaluate all enabled global schedule rules (edge-triggered windows, daily_at, and one-shot rules)."""
+        settings = self.db.get_settings()
+        tz_name = str(settings.get("schedule_timezone") or "Asia/Shanghai")
+        now_dt = now_in_tz(tz_name, now_ts)
+        tz = now_dt.tzinfo
+        fired = 0
+
+        for rule in self.db.list_schedule_rules():
+            if not rule.get("enabled"):
+                continue
+            rtype = str(rule.get("rule_type") or "window").lower()
+            prev_state = str(rule.get("last_state") or "")
+
+            if rtype == "window":
+                wins = parse_time_windows(str(rule.get("windows") or ""))
+                if not wins:
+                    continue
+                in_win = is_in_daily_windows(now_dt, wins, rule.get("weekdays") or [])
+                cur_state = "in" if in_win else "out"
+                if prev_state == "":
+                    if in_win:
+                        self._apply_schedule_targets(rule, enable=True, qps=float(rule.get("start_qps") or 0))
+                        self.db.update_schedule_rule(rule["id"], {"last_state": "in", "last_triggered_at": now_iso()})
+                        fired += 1
+                    else:
+                        self.db.update_schedule_rule(rule["id"], {"last_state": "out"})
+                elif prev_state != cur_state:
+                    if in_win:
+                        self._apply_schedule_targets(rule, enable=True, qps=float(rule.get("start_qps") or 0))
+                    else:
+                        self._apply_schedule_targets(rule, enable=False, qps=float(rule.get("end_qps") or 0))
+                    self.db.update_schedule_rule(rule["id"], {"last_state": cur_state, "last_triggered_at": now_iso()})
+                    fired += 1
+
+            elif rtype == "daily_at":
+                target_min = parse_hhmm(str(rule.get("at_time") or ""))
+                if target_min is None:
+                    continue
+                day_set = set(rule.get("weekdays") or [1, 2, 3, 4, 5, 6, 7])
+                cur_min = now_dt.hour * 60 + now_dt.minute
+                today_key = now_dt.strftime("%Y-%m-%d")
+                if now_dt.isoweekday() in day_set and 0 <= (cur_min - target_min) <= 2 and prev_state != today_key:
+                    en = rule.get("action") == "enable"
+                    qps_val = float((rule.get("start_qps") if en else rule.get("end_qps")) or 0)
+                    self._apply_schedule_targets(rule, enable=en, qps=qps_val)
+                    self.db.update_schedule_rule(rule["id"], {"last_state": today_key, "last_triggered_at": now_iso()})
+                    fired += 1
+
+            elif rtype == "once":
+                run_dt = parse_local_datetime(str(rule.get("run_at") or ""), tz)  # type: ignore[arg-type]
+                if run_dt is not None and now_dt >= run_dt and prev_state != "fired":
+                    en = rule.get("action") == "enable"
+                    qps_val = float((rule.get("start_qps") if en else rule.get("end_qps")) or 0)
+                    self._apply_schedule_targets(rule, enable=en, qps=qps_val)
+                    self.db.update_schedule_rule(
+                        rule["id"],
+                        {"enabled": False, "last_state": "fired", "last_triggered_at": now_iso()},
+                    )
+                    fired += 1
+
+        return fired
 
     # ---------- Staggered 1-by-1 Proxy Pool Health Loop ----------
 
@@ -517,12 +701,14 @@ class SniperEngine:
                 self.db.add_log("WARNING", f"快速通道维护循环异常: {exc}", "fastlane")
             self._stop_event.wait(3.0)
 
-    def run_fastlane_maintenance(self) -> int:
-        """Maintain prebuilt carts for all running buy-mode non-dry-run tasks with fast_lane=True."""
+    def run_fastlane_maintenance(self, now_ts: Optional[float] = None) -> int:
+        """Maintain prebuilt carts for all running/warming Fast Lane tasks (including 5-min pre-window warmup)."""
+        tz_name = str(self.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
         tasks = self.db.list_tasks()
         active_fl_ids = set()
         built = 0
         for task in tasks:
+            sched = evaluate_item_schedule(task.get("schedule"), tz_name, now_ts=now_ts)
             eligible = (
                 task["status"] == "running"
                 and task["mode"] == "buy"
@@ -530,6 +716,7 @@ class SniperEngine:
                 and task.get("fast_lane")
                 and task["product_line"] != "vps"
                 and int(task["ordered_count"]) < int(task["max_orders"])
+                and (sched["active"] or sched["in_warmup"])
             )
             if not eligible:
                 self.slot_pool.cleanup_task(task["id"])
@@ -566,7 +753,9 @@ class SniperEngine:
                 target_dcs=target_dcs,
                 resolved_options=resolved_opts,
                 stop_event=self._stop_event,
+                proxy_url=self._account_proxy_policy(acc),
             )
+        self.slot_pool.cleanup_orphans(active_fl_ids)
         return built
 
     # ---------- Order Delivery Tracker Loop ----------
@@ -593,10 +782,14 @@ class SniperEngine:
                     self._stop_event.wait(1.5)
                     continue
                 self.run_sniper_tick()
+                tz_name = str(settings.get("schedule_timezone") or "Asia/Shanghai")
                 running_intervals = [
                     max(0.0, float(t["poll_interval"]))
                     for t in self.db.list_tasks()
-                    if t["status"] == "running" and t["product_line"] != "vps" and t.get("poll_interval") not in (None, "")
+                    if t["status"] == "running"
+                    and t["product_line"] != "vps"
+                    and t.get("poll_interval") not in (None, "")
+                    and evaluate_item_schedule(t.get("schedule"), tz_name)["active"]
                 ]
                 if running_intervals:
                     wait_sec = min(1.0, max(0.05, min(running_intervals)))
@@ -604,9 +797,11 @@ class SniperEngine:
                 self.db.add_log("ERROR", f"抢购主循环异常: {exc}", "sniper")
             self._stop_event.wait(wait_sec)
 
-    def run_sniper_tick(self) -> int:
-        """Execute one polling cycle over all due running Eco/Baremetal sniper tasks."""
-        now = time.time()
+    def run_sniper_tick(self, now_ts: Optional[float] = None) -> int:
+        """Execute one polling cycle over all due & schedule-active running Eco/Baremetal sniper tasks."""
+        now = float(now_ts) if now_ts is not None else time.time()
+        settings = self.db.get_settings()
+        tz_name = str(settings.get("schedule_timezone") or "Asia/Shanghai")
         all_tasks = self.db.list_tasks()
         due_tasks = []
         for task in all_tasks:
@@ -617,6 +812,17 @@ class SniperEngine:
             if int(task["ordered_count"]) >= int(task["max_orders"]) and task["mode"] == "buy":
                 self.db.update_task(task["id"], {"status": "completed", "last_status_msg": "已达到最大购买数量"})
                 self.slot_pool.cleanup_task(task["id"])
+                continue
+            sched = evaluate_item_schedule(task.get("schedule"), tz_name, now_ts=now)
+            if sched["expired"] and (task.get("schedule") or {}).get("auto_pause_on_end", True):
+                self.db.update_task(
+                    task["id"],
+                    {"status": "paused", "last_status_msg": "⏹ 已到达定时结束时间，自动暂停"},
+                )
+                self.slot_pool.cleanup_task(task["id"])
+                self.db.add_log("INFO", f"⏰ 任务 [{task['name']}] 已到定时结束时间，自动暂停", "schedule")
+                continue
+            if not sched["active"]:
                 continue
             last_ts = self._task_last_poll.get(task["id"], 0.0)
             raw_pi = task.get("poll_interval")
@@ -634,7 +840,6 @@ class SniperEngine:
             p_ovr = str(task.get("proxy_url") or "").strip()
             by_group.setdefault((ep, p_ovr), []).append(task)
 
-        settings = self.db.get_settings()
         bulk_threshold = int(settings.get("bulk_availability_threshold") or 3)
         processed = 0
 
@@ -784,7 +989,8 @@ class SniperEngine:
         elif matched_hits:
             matched_hits.sort(key=lambda h: 0 if h["is_default"] else 1)
 
-        attempts = int(task.get("attempts") or 0) + 1
+        pending_inc = self._task_pending_attempts.get(task["id"], 0) + 1
+        attempts = int(task.get("attempts") or 0) + pending_inc
         prev_avail = task.get("last_availability") or {}
         card_key = f"task:{task['id']}"
 
@@ -797,6 +1003,16 @@ class SniperEngine:
                 msg = f"有货但不匹配: {'；'.join(skip_reasons[:2])}"
             else:
                 msg = f"暂无符合条件的库存 (已检 {len(avail_items)} 组配置)"
+            raw_pi = task.get("poll_interval")
+            poll_interval = max(0.0, float(raw_pi)) if raw_pi not in (None, "") else 5.0
+            now_mono = time.monotonic()
+            state_changed = prev_had_stock or (msg != task.get("last_status_msg")) or (summary_map != prev_avail)
+            if poll_interval < 1.0 and not state_changed and (now_mono - self._task_last_db_sync.get(task["id"], 0.0) < 1.5):
+                # Throttle disk commits during sub-second tight-loop polling while keeping count exact
+                self._task_pending_attempts[task["id"]] = pending_inc
+                return
+            self._task_pending_attempts[task["id"]] = 0
+            self._task_last_db_sync[task["id"]] = now_mono
             self.db.update_task(
                 task["id"],
                 {
@@ -807,6 +1023,9 @@ class SniperEngine:
                 },
             )
             return
+
+        self._task_pending_attempts[task["id"]] = 0
+        self._task_last_db_sync[task["id"]] = time.monotonic()
 
         # Stock detected!
         self.stock_hits += 1
@@ -896,10 +1115,13 @@ class SniperEngine:
                 self.db.add_log("WARNING", f"[{task['name']}] 跳过不可下单配置: {opt_err}", "sniper")
                 continue
 
-            # ⚡ Fast Lane: try prebuilt verified cart first (1 single POST /checkout!)
+            # ⚡ Fast Lane: try prebuilt verified cart first (1 single POST /checkout on matching exit IP!)
             result = None
             if not task["dry_run"] and task.get("fast_lane"):
-                slot = self.slot_pool.take_ready_slot(task["id"], hit["dc"], task=fresh_task, options=options_to_use)
+                proxy_policy = self._account_proxy_policy(acc, settings=settings)
+                slot = self.slot_pool.take_ready_slot(
+                    task["id"], hit["dc"], task=fresh_task, options=options_to_use, proxy_url=proxy_policy
+                )
                 if slot:
                     self.db.add_log(
                         "INFO",
@@ -907,7 +1129,7 @@ class SniperEngine:
                         "order",
                     )
                     result = self.order_engine.checkout_cart(
-                        client=client,
+                        client=slot.get("client") or client,
                         cart_id=slot["cart_id"],
                         plan_code=plan_code,
                         datacenter=hit["dc"],
@@ -1180,8 +1402,21 @@ class SniperEngine:
                 self.db.add_log("ERROR", f"黑五雷达循环异常: {exc}", "radar")
             self._stop_event.wait(wait_sec)
 
-    def run_radar_tick(self) -> int:
-        rules = [r for r in self.db.list_radar_rules() if r["enabled"]]
+    def run_radar_tick(self, ignore_schedule: bool = False, now_ts: Optional[float] = None) -> int:
+        tz_name = str(self.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        rules = []
+        for r in self.db.list_radar_rules():
+            if not r["enabled"]:
+                continue
+            if not ignore_schedule:
+                sched = evaluate_item_schedule(r.get("schedule"), tz_name, now_ts=now_ts)
+                if sched["expired"] and (r.get("schedule") or {}).get("auto_pause_on_end", True):
+                    self.db.update_radar_rule(r["id"], {"enabled": False})
+                    self.db.add_log("INFO", f"⏰ 雷达规则 [{r['name']}] 已到定时结束时间，自动停用", "schedule")
+                    continue
+                if not sched["active"]:
+                    continue
+            rules.append(r)
         if not rules:
             return 0
         by_market: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
@@ -1328,17 +1563,30 @@ class SniperEngine:
                 self.db.add_log("ERROR", f"VPS 监控循环异常: {exc}", "vps")
             self._stop_event.wait(wait_sec)
 
-    def run_vps_tick(self) -> int:
+    def run_vps_tick(self, ignore_schedule: bool = False, now_ts: Optional[float] = None) -> int:
         # Serialize VPS ticks (loop thread vs. /api/vps/check) so auto_order can't fire twice
         if not self._vps_tick_lock.acquire(blocking=False):
             return 0
         try:
-            return self._run_vps_tick_locked()
+            return self._run_vps_tick_locked(ignore_schedule=ignore_schedule, now_ts=now_ts)
         finally:
             self._vps_tick_lock.release()
 
-    def _run_vps_tick_locked(self) -> int:
-        watches = [w for w in self.db.list_vps_watches() if w["enabled"]]
+    def _run_vps_tick_locked(self, ignore_schedule: bool = False, now_ts: Optional[float] = None) -> int:
+        tz_name = str(self.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        watches = []
+        for w in self.db.list_vps_watches():
+            if not w["enabled"]:
+                continue
+            if not ignore_schedule:
+                sched = evaluate_item_schedule(w.get("schedule"), tz_name, now_ts=now_ts)
+                if sched["expired"] and (w.get("schedule") or {}).get("auto_pause_on_end", True):
+                    self.db.update_vps_watch(w["id"], {"enabled": False})
+                    self.db.add_log("INFO", f"⏰ VPS 监控 [{w['plan_code']}] 已到定时结束时间，自动停用", "schedule")
+                    continue
+                if not sched["active"]:
+                    continue
+            watches.append(w)
         if not watches:
             return 0
         checked = 0
@@ -1622,6 +1870,7 @@ class SniperEngine:
         tasks = self.db.list_tasks()
         if not tasks:
             return "当前没有抢购任务。"
+        tz_name = str(self.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
         lines = ["🎯 抢购任务列表:"]
         for t in tasks[:15]:
             icon = (
@@ -1632,7 +1881,39 @@ class SniperEngine:
             dcs = ",".join(d.upper() for d in t["datacenters"]) if t["datacenters"] else "ALL"
             fl = " ⚡" if t.get("fast_lane") else ""
             dry = " [演练]" if t["dry_run"] else ""
-            lines.append(f"{icon} {t['plan_code']}@{dcs}{fl}{dry} ({t['ordered_count']}/{t['max_orders']})")
+            sched = evaluate_item_schedule(t.get("schedule"), tz_name)
+            sched_str = f" [{sched['status_hint']}]" if sched.get("scheduled") and sched.get("status_hint") else ""
+            lines.append(f"{icon} {t['plan_code']}@{dcs}{fl}{dry}{sched_str} ({t['ordered_count']}/{t['max_orders']})")
+        return "\n".join(lines)
+
+    def _tg_cmd_schedule(self, args: List[str]) -> str:
+        tz_name = str(self.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        if len(args) >= 2 and args[0].lower() in ("on", "off", "enable", "disable"):
+            en = args[0].lower() in ("on", "enable")
+            rid = args[1].strip()
+            updated = self.db.update_schedule_rule(rid, {"enabled": en})
+            if not updated:
+                return f"❌ 未找到定时规则 ID: {rid}"
+            return f"{'🟢 已启用' if en else '⏸ 已停用'}定时规则 [{updated['name']}] (#{rid})"
+
+        rules = self.db.list_schedule_rules()
+        now_str = now_in_tz(tz_name).strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"⏰ 定时调度状态 ({tz_name}: {now_str})"]
+        if not rules:
+            lines.append("\n暂无全局定时规则（可在 Web 面板「定时调度」添加）。")
+        else:
+            lines.append("\n全局定时规则:")
+            for r in rules[:15]:
+                meta = describe_global_rule(r, tz_name)
+                st = "🟢" if r["enabled"] else "⏸"
+                lines.append(f"{st} #{r['id']} {r['name']} — {meta['schedule_label']}")
+        sched_tasks = [t for t in self.db.list_tasks() if (t.get("schedule") or {}).get("enabled")]
+        if sched_tasks:
+            lines.append(f"\n内置定时窗口任务 ({len(sched_tasks)} 个):")
+            for t in sched_tasks[:8]:
+                ev = evaluate_item_schedule(t.get("schedule"), tz_name)
+                lines.append(f"• {t['name']} ({t['plan_code']}): {ev['status_hint'] or ev['summary']}")
+        lines.append("\n提示: 发送 /schedule on <ID> 或 /schedule off <ID> 可远程开关规则。")
         return "\n".join(lines)
 
     def _tg_cmd_check(self, args: List[str]) -> str:

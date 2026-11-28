@@ -8,6 +8,7 @@ import os
 import socket
 import socketserver
 import sqlite3
+import ssl
 import tempfile
 import threading
 import time
@@ -47,15 +48,23 @@ from ovh_buyer.database import Database, protect_secret, reveal_secret
 from ovh_buyer.notifier import Notifier, parse_telegram_target, render_telegram_stock_card
 from ovh_buyer.order_engine import OrderEngine
 from ovh_buyer.ovh_client import (
+    MAX_RATE_LIMITERS,
     OVHAPIError,
     OVHClient,
     ProxyPoolManager,
     ProxyRotator,
+    _GLOBAL_POOL,
+    _GLOBAL_RATE_LIMITERS,
+    get_endpoint_rate_limiter,
+    mask_proxy_list_for_ui,
+    merge_masked_proxy_input,
     normalize_proxy_url,
     parse_proxy_config,
     parse_proxy_list,
+    proxy_http_request,
     redact_proxy_url,
 )
+from ovh_buyer.scheduler import evaluate_item_schedule, resolve_timezone
 from ovh_buyer.sniper import SniperEngine
 from ovh_buyer.specs import FXConverter, compare_specs, parse_actual_hardware, parse_official_spec
 from ovh_buyer.web_server import AppContext, create_http_server
@@ -1519,6 +1528,504 @@ class TestOVHSniper(unittest.TestCase):
         # Export redacts credentials in monitor_proxies_pool too
         exported = self.db.export_config(include_secrets=False)
         self.assertNotIn("secretpass", json.dumps(exported, ensure_ascii=False))
+
+    def test_v22_https_proxy_tls_in_tls_and_tunnel_407_and_socks5_notify(self):
+        cert_pem = (
+            "-----BEGIN CERTIFICATE-----\n"
+            "MIICyTCCAbGgAwIBAgIJAO7Ug+RDdO16MA0GCSqGSIb3DQEBCwUAMBQxEjAQBgNV\n"
+            "BAMMCTEyNy4wLjAuMTAeFw0yNjExMjgwNTMwNDNaFw0zNjExMjUwNTMwNDNaMBQx\n"
+            "EjAQBgNVBAMMCTEyNy4wLjAuMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC\n"
+            "ggEBAJ+bcaoSogV1ZjeBkQG0WDPCDEqgxmcwBr0KAdxBwIrRDrT72vE/kyL3T6cE\n"
+            "HOSRtW2xGd1PS4RqNRucp6hIasCdH3LovNOhbh89Un/becHC77P923mjGBtmEK/y\n"
+            "vTrM3QqalargEii+Br25NZh0vEETcW1tYPfgT1BlsTgBJN5VZvU88u0ms4VJUYup\n"
+            "OmCsXyDHa3e49NN5cDxxOm65/AzbFbCDhK1oMDikwT/S4KDUtgoUg/mQT8dGxNZr\n"
+            "q4f06DHHx9xCiNSl7SAu6sEKIEcaRWTPxCDsgi1XvXpX0r+7iU/Q62d4wnUqCVJK\n"
+            "n4aZDSMV0RrIo60gg+/nyTDCJqECAwEAAaMeMBwwGgYDVR0RBBMwEYcEfwAAAYIJ\n"
+            "bG9jYWxob3N0MA0GCSqGSIb3DQEBCwUAA4IBAQByC+xlVqcwiJ6HjMUlNhKHXS/5\n"
+            "qRndNe+jk8j3TvGb3ZDFstpiPzw8wxMs/ajB4U1ky+jMBXgLTkv9Tl7S+um3kuVp\n"
+            "C8LdGKLHxDUXLAPPoWX16EmdFr5jYV8x6V6F6Dz4lGz4RFZr8K9PHeyP0JBSoSNm\n"
+            "KAvKTKxWaUivbA+i7gFujwjpDIgHumRHUK/jiHSFwc6OhykIiBN5sp0XfZBzzh6J\n"
+            "s/B005jtXfcevhsdJVK65TE04H6ukxNpiP51mWvwP+R0LVS+RMdUdEoEcmI+Do2Y\n"
+            "jVOD0hsoGxkMETs9nypI1hTQJOwdek/O0NUYjtNuXX8KbCGIHNXiWCPovtfD\n"
+            "-----END CERTIFICATE-----\n"
+        )
+        key_pem = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCfm3GqEqIFdWY3\n"
+            "gZEBtFgzwgxKoMZnMAa9CgHcQcCK0Q60+9rxP5Mi90+nBBzkkbVtsRndT0uEajUb\n"
+            "nKeoSGrAnR9y6LzToW4fPVJ/23nBwu+z/dt5oxgbZhCv8r06zN0KmpWq4BIovga9\n"
+            "uTWYdLxBE3FtbWD34E9QZbE4ASTeVWb1PPLtJrOFSVGLqTpgrF8gx2t3uPTTeXA8\n"
+            "cTpuufwM2xWwg4StaDA4pME/0uCg1LYKFIP5kE/HRsTWa6uH9Ogxx8fcQojUpe0g\n"
+            "LurBCiBHGkVkz8Qg7IItV716V9K/u4lP0OtneMJ1KglSSp+GmQ0jFdEayKOtIIPv\n"
+            "58kwwiahAgMBAAECggEAEZD9MJe+Z1Vle6Rx/jsIHiI0Uh5h18eMZk/spn5CH8Uk\n"
+            "ljzF+xlhK08G4D3upCV5T2pXi2kHyboawEA8n6Pgw/RHGtGMvsocoamRI+tW+kFn\n"
+            "OmstNbUCmTlhisvvkcIsbddXs6fXt846VbVFtdLbSVpHeKC6NG3mrNWUbLKLiUC2\n"
+            "eNOV7dJNjgr5bzNUKc2Ei0e4fAk3U/ywPn8vE6DlTntk1kT4j0X34vMvIWn9kmkw\n"
+            "14V0FTywO9MZydupXVgVbcgoQOuWCyQ1DC03l89/GatD3dOnXSpxx+MpCjRnGoP5\n"
+            "ZcYE9RD+5SPCeLwrVDB55sINlHDIvXVU6xer1ri18QKBgQDURcWEZ75sAITsF80I\n"
+            "DaSTQNOdel1y2d/rsCzZGE3HJhlApt/fl6Ms4BNyoqLtLr+VReWmx8MlOD/MZFmS\n"
+            "1o1Z8Wy2jgE+R8LzoJTs940NXlrVpr1i0tsWnQ+08l9G/MNZTgZjz8zYssqvWyYA\n"
+            "fRSHt7nzzgLs3brcN342aCNNBQKBgQDAfFtUxn2PluuGxdqWKD0y4NSLhdUx7zxP\n"
+            "F1fPJ6VZqDtX+kc7K3i8eO7uRNhAhNSYdCy/pCCpNaXYFC4FNT1LGzX6TfD5rMjY\n"
+            "nqWtHSyeK/29km8u/ATAaXSvJpEKt64w3iSUwbsIquOtbH2Ymbn31efm3XVItP0n\n"
+            "pu3+l8PF7QKBgG2zZSFJMBrGpesRXc90pYHINdSjoVmyiUtXb8X+DmwGH3TPCNGX\n"
+            "nyeY4dQTgtnKmA3/4nAvuoUorafmkHgXU1ORNhqeBrx1/6VCbtSMFqQ7B/x0QFmr\n"
+            "GLh2EOD1hRG9nQMxFJJOmNHAjIjVNS15druw0nPSGqbo7CHUt/BMHzo1AoGAUomA\n"
+            "iDuMv7ORTvssHdMnWte5jBJZNs5E6A00Y+m2J1nSCImTXbXoUbjxi04OBKxwlObM\n"
+            "AWkZcDVG5f7RNP59R+VlIe2l9Qm4Hdr5Y9/sr+5hIZbXAiiiyPbvR+ObsiLNGLtI\n"
+            "qFjiIHdWpZitym+wpKseg4pWrlSdcRFNYCwnkIkCgYBhySLqHtExTiZJawdJvzmW\n"
+            "jc25j32bIppXWIvbdj4Woxy39ATrHkNDYsg0BtNlBqfQL8sov+JKqrcv5l1Yxr0v\n"
+            "/PwvHjvowkch+BxApdqWHZQaiUoIvpDEzkCJRbX1pSjaRo+1mMqZEqccioSWr9mq\n"
+            "jmxoHWZaZHkRMViBm2iOSQ==\n"
+            "-----END PRIVATE KEY-----\n"
+        )
+        cert_file = Path(self.tmpdir.name) / "test_cert.pem"
+        key_file = Path(self.tmpdir.name) / "test_key.pem"
+        cert_file.write_text(cert_pem, encoding="utf-8")
+        key_file.write_text(key_pem, encoding="utf-8")
+
+        srv_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ssl.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+        cli_ssl = ssl.create_default_context(cafile=str(cert_file))
+
+        # 1. Spin up a local HTTPS target API + Webhook receiver
+        webhook_received = []
+
+        class _TargetHTTPSHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):
+                body = json.dumps({"nested_tls": True, "path": self.path}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                ln = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(ln).decode("utf-8"))
+                webhook_received.append(payload)
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        target_srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _TargetHTTPSHandler)
+        target_srv.socket = srv_ssl.wrap_socket(target_srv.socket, server_side=True)
+        target_port = target_srv.server_address[1]
+        threading.Thread(target=target_srv.serve_forever, daemon=True).start()
+
+        # 2. Spin up a local HTTPS CONNECT proxy (requiring Basic Auth) for real TLS-in-TLS verification
+        expected_auth = "Basic " + base64.b64encode(b"tlsuser:tlspass").decode("ascii")
+        https_proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        https_proxy_sock.bind(("127.0.0.1", 0))
+        https_proxy_sock.listen(8)
+        https_proxy_port = https_proxy_sock.getsockname()[1]
+
+        def _duplex(a, b):
+            def _pump(src, dst):
+                try:
+                    while True:
+                        d = src.recv(4096)
+                        if not d:
+                            break
+                        dst.sendall(d)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        dst.close()
+                    except Exception:
+                        pass
+
+            t1 = threading.Thread(target=_pump, args=(a, b), daemon=True)
+            t2 = threading.Thread(target=_pump, args=(b, a), daemon=True)
+            t1.start()
+            t2.start()
+
+        def _https_proxy_worker():
+            while True:
+                try:
+                    raw_c, _ = https_proxy_sock.accept()
+                except OSError:
+                    break
+                try:
+                    tls_c = srv_ssl.wrap_socket(raw_c, server_side=True)
+                    buf = bytearray()
+                    while b"\r\n\r\n" not in buf and len(buf) < 8192:
+                        ch = tls_c.recv(1024)
+                        if not ch:
+                            break
+                        buf.extend(ch)
+                    req_txt = buf.decode("latin1", errors="replace")
+                    lines = req_txt.split("\r\n")
+                    target_hp = lines[0].split(" ")[1]
+                    thost, tport = target_hp.rsplit(":", 1)
+                    hdrs = {}
+                    for ln in lines[1:]:
+                        if ":" in ln:
+                            k, v = ln.split(":", 1)
+                            hdrs[k.strip().lower()] = v.strip()
+                    if hdrs.get("proxy-authorization") != expected_auth:
+                        tls_c.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+                        tls_c.close()
+                        continue
+                    up = socket.create_connection((thost, int(tport)), timeout=5.0)
+                    tls_c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    _duplex(tls_c, up)
+                except Exception:
+                    try:
+                        raw_c.close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_https_proxy_worker, daemon=True).start()
+
+        # 3. Also spin up a SOCKS5 proxy to test Notifier over SOCKS5 + bad-auth 407 propagation
+        socks_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        socks_sock.bind(("127.0.0.1", 0))
+        socks_sock.listen(8)
+        socks_port = socks_sock.getsockname()[1]
+
+        def _socks_worker():
+            while True:
+                try:
+                    cs, _ = socks_sock.accept()
+                except OSError:
+                    break
+                try:
+                    hdr = cs.recv(2)
+                    cs.recv(hdr[1])
+                    cs.sendall(b"\x05\x02")
+                    ver = cs.recv(1)[0]
+                    ul = cs.recv(1)[0]
+                    un = cs.recv(ul).decode()
+                    pl = cs.recv(1)[0]
+                    pw = cs.recv(pl).decode()
+                    if ver != 1 or un != "suser" or pw != "spass":
+                        cs.sendall(b"\x01\x01")
+                        cs.close()
+                        continue
+                    cs.sendall(b"\x01\x00")
+                    rh = cs.recv(4)
+                    if rh[3] == 0x01:
+                        dh = socket.inet_ntoa(cs.recv(4))
+                    else:
+                        dl = cs.recv(1)[0]
+                        dh = cs.recv(dl).decode()
+                    dp = int.from_bytes(cs.recv(2), "big")
+                    up = socket.create_connection((dh, dp), timeout=5.0)
+                    cs.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+                    _duplex(cs, up)
+                except Exception:
+                    try:
+                        cs.close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_socks_worker, daemon=True).start()
+
+        orig_ssl_ctx = _GLOBAL_POOL._ssl_context
+        _GLOBAL_POOL._ssl_context = cli_ssl
+        try:
+            # A. Genuine TLS-in-TLS (https:// proxy -> https:// target) succeeds!
+            good_https_proxy = f"https://tlsuser:tlspass@127.0.0.1:{https_proxy_port}"
+            st, _, body = proxy_http_request(
+                "GET",
+                f"https://127.0.0.1:{target_port}/1.0/ping",
+                proxy_url=good_https_proxy,
+                timeout=5.0,
+            )
+            self.assertEqual(st, 200)
+            self.assertTrue(json.loads(body.decode("utf-8"))["nested_tls"])
+
+            # B. HTTPS proxy returning 407 propagates status_code=407 so ProxyPoolManager evicts immediately!
+            bad_https_proxy = f"https://tlsuser:wrongpass@127.0.0.1:{https_proxy_port}"
+            c_bad = OVHClient(
+                endpoint="ovh-eu",
+                proxy_url=bad_https_proxy,
+                base_url_override=f"https://127.0.0.1:{target_port}/1.0",
+                max_retries=1,
+            )
+            with self.assertRaises(OVHAPIError) as err407:
+                c_bad.get("/ping", need_auth=False)
+            self.assertEqual(err407.exception.status_code, 407)
+
+            # SOCKS5 wrong password also propagates status_code=407
+            c_bad_socks = OVHClient(
+                endpoint="ovh-eu",
+                proxy_url=f"socks5://suser:wrong@127.0.0.1:{socks_port}",
+                base_url_override=f"https://127.0.0.1:{target_port}/1.0",
+                max_retries=1,
+            )
+            with self.assertRaises(OVHAPIError) as socks407:
+                c_bad_socks.get("/ping", need_auth=False)
+            self.assertEqual(socks407.exception.status_code, 407)
+
+            # C. Notifier webhook works over SOCKS5 shorthand proxy!
+            self.db.update_settings(
+                {
+                    "custom_webhook_url": f"https://127.0.0.1:{target_port}/webhook",
+                    "http_proxy": f"socks5://127.0.0.1:{socks_port}:suser:spass",
+                }
+            )
+            ok_wh = self.notifier.send_custom_webhook("test", "标题", "内容")
+            self.assertTrue(ok_wh)
+            self.assertEqual(len(webhook_received), 1)
+            self.assertEqual(webhook_received[0]["title"], "标题")
+        finally:
+            _GLOBAL_POOL._ssl_context = orig_ssl_ctx
+            https_proxy_sock.close()
+            socks_sock.close()
+            target_srv.shutdown()
+            target_srv.server_close()
+
+    def test_v22_encrypted_proxies_masked_roundtrip_rate_limiter_and_fastlane_ip(self):
+        # 1. RateLimiter bounded LRU & probe isolation
+        lim = get_endpoint_rate_limiter("test-ep|http://198.51.100.77:8080", qps=3.5)
+        self.assertEqual(lim._qps, 3.5)
+        _ = OVHClient(
+            endpoint="ovh-eu",
+            proxy_url="http://198.51.100.77:8080",
+            base_url_override="test-ep",
+            qps=20.0,
+            bypass_rate_limit=True,
+        )
+        self.assertEqual(lim._qps, 3.5)  # Probe did NOT overwrite QPS!
+        for idx in range(MAX_RATE_LIMITERS + 30):
+            get_endpoint_rate_limiter(f"lru-ep-{idx}", qps=4.0)
+        self.assertLessEqual(len(_GLOBAL_RATE_LIMITERS), MAX_RATE_LIMITERS)
+
+        # 2. At-rest encryption for settings/task proxies & UI ':****@' round-trip preservation
+        enc_db_path = Path(self.tmpdir.name) / "enc_v22.db"
+        enc_db = Database(db_path=enc_db_path, encryption_key="super-secret-at-rest-key")
+        try:
+            enc_db.update_settings(
+                {
+                    "telegram_bot_token": "999888:SECRET_TG_TOKEN",
+                    "monitor_proxies_pool": "socks5://pooluser:poolpass@198.51.100.10:1080",
+                }
+            )
+            created_t = enc_db.create_task(
+                {
+                    "name": "加密代理测试",
+                    "plan_code": "26skleb01",
+                    "proxy_url": "http://tuser:tpass@198.51.100.11:8080",
+                }
+            )
+            # Raw SQLite bytes must NOT contain plaintext secrets
+            raw_conn = sqlite3.connect(str(enc_db_path))
+            raw_dump = "\n".join(raw_conn.iterdump())
+            raw_conn.close()
+            self.assertNotIn("SECRET_TG_TOKEN", raw_dump)
+            self.assertNotIn("poolpass", raw_dump)
+            self.assertNotIn("tpass", raw_dump)
+
+            # Masked list for UI hides password while merge_masked_proxy_input restores it
+            masked_task = enc_db.get_task(created_t["id"], mask=True)
+            self.assertEqual(masked_task["proxy_url"], "http://tuser:****@198.51.100.11:8080")
+            enc_db.update_task(created_t["id"], {"name": "改名保留密码", "proxy_url": masked_task["proxy_url"]})
+            unmasked_task = enc_db.get_task(created_t["id"], mask=False)
+            self.assertEqual(unmasked_task["proxy_url"], "http://tuser:tpass@198.51.100.11:8080")
+        finally:
+            enc_db.close()
+
+        # 3. Fast Lane CartSlotPool invalidates prebuilt cart when account proxy changes
+        acc = self.db.create_account(
+            {
+                "name": "代理指纹号",
+                "endpoint": "ovh-eu",
+                "subsidiary": "IE",
+                "app_key": MOCK_APP_KEY,
+                "app_secret": MOCK_APP_SECRET,
+                "consumer_key": MOCK_CONSUMER_KEY,
+                "proxy_url": "http://198.51.100.1:8080",
+            }
+        )
+        fl_task = self.db.create_task(
+            {
+                "name": "FastLane IP 一致性",
+                "account_id": acc["id"],
+                "plan_code": "26skleb01",
+                "datacenters": ["gra"],
+                "fast_lane": True,
+                "dry_run": False,
+            }
+        )
+        class _MockProxyTaggedClient(OVHClient):
+            def _raw_request(self, method, full_url, headers=None, body_bytes=None, allow_resend=True):
+                req_h = {"Accept": "application/json", "User-Agent": self.USER_AGENT}
+                if headers:
+                    req_h.update(headers)
+                if body_bytes is not None:
+                    req_h.setdefault("Content-Type", "application/json; charset=utf-8")
+                return self._request_via_pool(method, full_url, req_h, body_bytes, allow_resend=allow_resend)
+
+        cli_p1 = _MockProxyTaggedClient(
+            endpoint="ovh-eu",
+            app_key=MOCK_APP_KEY,
+            app_secret=MOCK_APP_SECRET,
+            consumer_key=MOCK_CONSUMER_KEY,
+            proxy_url="http://198.51.100.1:8080",
+            base_url_override=self.api_base,
+            v1_url_override=self.v1_base,
+        )
+        built_cnt = self.engine.slot_pool.maintain_task(
+            task=fl_task,
+            client=cli_p1,
+            subsidiary="IE",
+            target_dcs=["gra"],
+            resolved_options=["ram-32g-ecc-2400-26skleb01", "softraid-2x450nvme-26skleb01", "bandwidth-500-26skleb"],
+        )
+        self.assertEqual(built_cnt, 1)
+        # Asking for a slot with a DIFFERENT proxy_url must NOT return the old-IP prebuilt cart!
+        wrong_ip_slot = self.engine.slot_pool.take_ready_slot(
+            fl_task["id"],
+            "gra",
+            task=fl_task,
+            options=["ram-32g-ecc-2400-26skleb01", "softraid-2x450nvme-26skleb01", "bandwidth-500-26skleb"],
+            proxy_url="http://198.51.100.2:8080",
+        )
+        self.assertIsNone(wrong_ip_slot)
+        same_ip_slot = self.engine.slot_pool.take_ready_slot(
+            fl_task["id"],
+            "gra",
+            task=fl_task,
+            options=["ram-32g-ecc-2400-26skleb01", "softraid-2x450nvme-26skleb01", "bandwidth-500-26skleb"],
+            proxy_url="http://198.51.100.1:8080",
+        )
+        self.assertIsNotNone(same_ip_slot)
+
+    def test_v22_two_tier_scheduling_overnight_warmup_and_global_rules(self):
+        tz_sh = resolve_timezone("Asia/Shanghai")
+        # 1. Overnight cross-midnight window (22:00-02:00 on Friday [5] covers Sat 01:15, not Sun 01:15)
+        fri_sched = {"enabled": True, "mode": "daily_window", "windows": "22:00-02:00", "weekdays": [5], "warmup_minutes": 5}
+        fri_2330 = datetime(2026, 11, 27, 23, 30, tzinfo=tz_sh).timestamp()  # Friday
+        sat_0115 = datetime(2026, 11, 28, 1, 15, tzinfo=tz_sh).timestamp()   # Saturday early morning (part of Fri night!)
+        sun_0115 = datetime(2026, 11, 29, 1, 15, tzinfo=tz_sh).timestamp()   # Sunday early morning (Sat not in [5])
+        fri_2157 = datetime(2026, 11, 27, 21, 57, tzinfo=tz_sh).timestamp()  # 3 min before Friday 22:00 -> warmup!
+
+        self.assertTrue(evaluate_item_schedule(fri_sched, "Asia/Shanghai", fri_2330)["active"])
+        self.assertTrue(evaluate_item_schedule(fri_sched, "Asia/Shanghai", sat_0115)["active"])
+        self.assertFalse(evaluate_item_schedule(fri_sched, "Asia/Shanghai", sun_0115)["active"])
+        ev_warm = evaluate_item_schedule(fri_sched, "Asia/Shanghai", fri_2157)
+        self.assertFalse(ev_warm["active"])
+        self.assertTrue(ev_warm["in_warmup"])
+
+        # 2. Item-level datetime_range + Fast Lane 5-min pre-warmup + auto-pause after end_at
+        self.db.update_settings({"schedule_timezone": "Asia/Shanghai"})
+        acc = self.db.create_account(
+            {
+                "name": "定时闪购号",
+                "endpoint": "ovh-eu",
+                "subsidiary": "IE",
+                "app_key": MOCK_APP_KEY,
+                "app_secret": MOCK_APP_SECRET,
+                "consumer_key": MOCK_CONSUMER_KEY,
+            }
+        )
+        flash_task = self.db.create_task(
+            {
+                "name": "黑五 23:00 定时开抢",
+                "account_id": acc["id"],
+                "plan_code": "26skleb01",
+                "datacenters": ["gra"],
+                "fast_lane": True,
+                "dry_run": False,
+                "max_orders": 2,
+                "schedule": {
+                    "enabled": True,
+                    "mode": "datetime_range",
+                    "start_at": "2026-11-28T23:00",
+                    "end_at": "2026-11-28T23:30",
+                    "warmup_minutes": 5,
+                    "auto_pause_on_end": True,
+                },
+            }
+        )
+        ts_2240 = datetime(2026, 11, 28, 22, 40, tzinfo=tz_sh).timestamp()
+        ts_2257 = datetime(2026, 11, 28, 22, 57, tzinfo=tz_sh).timestamp()
+        ts_2301 = datetime(2026, 11, 28, 23, 1, tzinfo=tz_sh).timestamp()
+        ts_2335 = datetime(2026, 11, 28, 23, 35, tzinfo=tz_sh).timestamp()
+
+        # At 22:40 (20m early): neither Fast Lane nor Sniper polls
+        self.assertEqual(self.engine.run_fastlane_maintenance(now_ts=ts_2240), 0)
+        self.assertEqual(self.engine.run_sniper_tick(now_ts=ts_2240), 0)
+
+        # At 22:57 (3m before start): Fast Lane prebuilds cart in warmup while Sniper still waits!
+        self.assertEqual(self.engine.run_fastlane_maintenance(now_ts=ts_2257), 1)
+        self.assertEqual(len(self.engine.slot_pool.get_task_slots_summary(flash_task["id"])), 1)
+        self.assertEqual(self.engine.run_sniper_tick(now_ts=ts_2257), 0)
+
+        # At 23:01 (window open, stock available in GRA): Sniper fires 1-call Fast Lane checkout!
+        self.assertEqual(self.engine.run_sniper_tick(now_ts=ts_2301), 1)
+        after_hit = self.db.get_task(flash_task["id"])
+        self.assertEqual(after_hit["ordered_count"], 1)
+        self.assertEqual(after_hit["status"], "running")  # max_orders=2, still running
+
+        # At 23:35 (past end_at): task automatically pauses!
+        self.engine.run_sniper_tick(now_ts=ts_2335)
+        self.assertEqual(self.db.get_task(flash_task["id"])["status"], "paused")
+
+        # 3. Global Schedule Rules: edge-triggered window + pending_confirm protection + Telegram /schedule
+        pending_task = self.db.create_task(
+            {
+                "name": "待核对熔断任务",
+                "account_id": acc["id"],
+                "plan_code": "26skleb01",
+                "status": "pending_confirm",
+            }
+        )
+        paused_task = self.db.create_task(
+            {
+                "name": "普通暂停任务",
+                "account_id": acc["id"],
+                "plan_code": "26skleb01",
+                "status": "paused",
+            }
+        )
+        self.db.update_settings({"sniper_enabled": False, "radar_enabled": False, "global_qps": 2.0})
+        g_rule = self.db.create_schedule_rule(
+            {
+                "name": "晚间黄金档",
+                "rule_type": "window",
+                "windows": "22:00-02:00",
+                "weekdays": [1, 2, 3, 4, 5, 6, 7],
+                "targets": ["sniper", "radar", "all_tasks"],
+                "start_qps": 6.0,
+                "end_qps": 2.0,
+            }
+        )
+        # First tick inside window -> activates sniper, radar, paused_task, QPS=6.0, NEVER touches pending_confirm!
+        self.assertEqual(self.engine.run_schedule_tick(now_ts=ts_2301), 1)
+        self.assertTrue(self.db.get_setting("sniper_enabled"))
+        self.assertTrue(self.db.get_setting("radar_enabled"))
+        self.assertEqual(self.db.get_setting("global_qps"), 6.0)
+        self.assertEqual(self.db.get_task(paused_task["id"])["status"], "running")
+        self.assertEqual(self.db.get_task(pending_task["id"])["status"], "pending_confirm")
+
+        # Manual override mid-window is respected (edge-triggered: does NOT fight user mid-window!)
+        self.db.update_settings({"sniper_enabled": False})
+        self.assertEqual(self.engine.run_schedule_tick(now_ts=ts_2301 + 60), 0)
+        self.assertFalse(self.db.get_setting("sniper_enabled"))
+
+        # Leaving window (03:00 next morning) -> turns off radar & tasks, restores QPS=2.0
+        ts_0300 = datetime(2026, 11, 29, 3, 0, tzinfo=tz_sh).timestamp()
+        self.assertEqual(self.engine.run_schedule_tick(now_ts=ts_0300), 1)
+        self.assertFalse(self.db.get_setting("radar_enabled"))
+        self.assertEqual(self.db.get_setting("global_qps"), 2.0)
+        self.assertEqual(self.db.get_task(paused_task["id"])["status"], "paused")
+
+        # Telegram /schedule command lists and toggles rule
+        tg_out = self.engine._tg_cmd_schedule([])
+        self.assertIn("晚间黄金档", tg_out)
+        tg_off = self.engine._tg_cmd_schedule(["off", g_rule["id"]])
+        self.assertIn("已停用", tg_off)
+        self.assertFalse(self.db.get_schedule_rule(g_rule["id"])["enabled"])
 
 
 if __name__ == "__main__":

@@ -15,9 +15,18 @@ from ovh_buyer.config import format_datacenter_label, get_server_config, load_do
 from ovh_buyer.database import Database
 from ovh_buyer.notifier import Notifier
 from ovh_buyer.order_engine import OrderEngine
-from ovh_buyer.ovh_client import OVHClient
+from ovh_buyer.ovh_client import OVHClient, parse_proxy_list
 from ovh_buyer.sniper import SniperEngine
 from ovh_buyer.web_server import AppContext, create_http_server
+
+
+def _cli_proxy() -> str:
+    for env_key in ("OVH_MONITOR_PROXIES", "OVH_MONITOR_PROXIES_POOL", "OVH_HTTP_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            items = parse_proxy_list(raw)
+            return items[0] if items else raw
+    return ""
 
 
 def _build_services(seed_file: str = ""):
@@ -96,7 +105,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY", "")
+    proxy = _cli_proxy()
     client = OVHClient(endpoint=args.endpoint, proxy_url=proxy)
     items = client.get_availabilities(args.plan_code)
     if not items:
@@ -115,7 +124,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_catalog(args: argparse.Namespace) -> int:
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY", "")
+    proxy = _cli_proxy()
     client = OVHClient(endpoint=args.endpoint, proxy_url=proxy)
     cm = CatalogManager()
     plans = cm.get_catalog_plans(
@@ -142,7 +151,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
 
 
 def cmd_vps(args: argparse.Namespace) -> int:
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY", "")
+    proxy = _cli_proxy()
     client = OVHClient(endpoint=args.endpoint, proxy_url=proxy)
     data = client.get_vps_datacenter_availability(args.plan_code, subsidiary=args.subsidiary)
     dcs = data.get("datacenters") or []

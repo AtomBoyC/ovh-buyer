@@ -53,6 +53,7 @@
     <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
     <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
     <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></symbol>
   </svg>
 
@@ -96,6 +97,7 @@
         <div class="nav-label">监控</div>
         <button class="nav-item" data-tab="radar"><svg class="ic"><use href="#i-radar"/></svg><span class="grow">黑五雷达</span></button>
         <button class="nav-item" data-tab="vps"><svg class="ic"><use href="#i-cloud"/></svg><span class="grow">VPS 监控</span></button>
+        <button class="nav-item" data-tab="schedules"><svg class="ic"><use href="#i-clock"/></svg><span class="grow">定时调度</span><span class="badge" id="nav-schedules-badge">0</span></button>
         <div class="nav-label">配置</div>
         <button class="nav-item" data-tab="accounts"><svg class="ic"><use href="#i-key"/></svg><span class="grow">OVH 账号</span></button>
         <button class="nav-item" data-tab="notify"><svg class="ic"><use href="#i-bell"/></svg><span class="grow">通知设置</span></button>
@@ -324,6 +326,46 @@
             </div>
           </div>
           <div id="vps-list" class="list-stack"></div>
+        </div>
+      </section>
+
+      <!-- TAB: Schedules -->
+      <section id="tab-schedules" class="tab-panel">
+        <div class="card">
+          <div class="card-header">
+            <h3><svg class="ic"><use href="#i-clock"/></svg>全局定时调度规则</h3>
+            <div class="toolbar">
+              <span class="pill pill-blue mono" id="schedule-clock-pill" title="当前调度时区时间">--:--:--</span>
+              <select id="schedule-tz-select" title="切换定时调度基准时区"></select>
+              <button class="btn btn-primary btn-sm" id="btn-open-schedule-modal"><svg class="ic"><use href="#i-plus"/></svg>新建定时规则</button>
+            </div>
+          </div>
+          <p class="card-desc">
+            <b>时段守护</b>：进入活跃窗口（支持如 <code>22:00-02:00</code> 跨零点及多时间段）自动开启抢购引擎 / 快速通道 / 雷达 / VPS 或调高 QPS，离开窗口自动暂停休眠（边沿触发，时段中途仍可随时手动覆盖开关）。
+            <b>每日定点 / 单次倒计时</b>：适合黑五预告场定点自动开抢或休眠。
+          </p>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>规则名称 / 模式</th>
+                  <th>触发时间 / 周期</th>
+                  <th>控制目标 / 速率</th>
+                  <th>当前状态 / 最近触发</th>
+                  <th style="text-align:right">操作</th>
+                </tr>
+              </thead>
+              <tbody id="schedules-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3><svg class="ic"><use href="#i-target"/></svg>已开启内置定时窗口的任务与监控项</h3>
+            <span class="muted">在单条「抢购任务 / 黑五雷达 / VPS 监控」编辑弹窗中设置；开启快速通道的任务会在窗口前自动预建车热身</span>
+          </div>
+          <div id="scheduled-items-list" class="list-stack"></div>
         </div>
       </section>
 
@@ -754,6 +796,7 @@
                 <option value="notify">notify</option>
                 <option value="telegram">telegram</option>
                 <option value="proxy">proxy</option>
+                <option value="schedule">schedule</option>
               </select>
               <label class="toggle"><input type="checkbox" id="log-autoscroll" class="vh" checked /><span class="tr"></span>自动滚底</label>
               <button class="btn btn-danger btn-sm" id="btn-clear-logs"><svg class="ic"><use href="#i-trash"/></svg>清空</button>
@@ -872,6 +915,46 @@
         <div class="field">
           <label>独立监控代理（可选，留空自动使用全局监控代理池；支持 http / socks5 / 多代理逗号分隔）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080（留空走全局监控代理池）" />
+        </div>
+        <div class="form-section">定时运行（可选）</div>
+        <div class="form-row">
+          <div class="field">
+            <label>定时运行策略</label>
+            <select name="sched_mode" id="task-sched-mode">
+              <option value="off">全天候运行（不限时段）</option>
+              <option value="daily_window">每日活跃时段（支持跨零点，如 22:00-02:00）</option>
+              <option value="datetime_range">指定起止日期时间（黑五闪购定点开抢 / 自动停）</option>
+            </select>
+          </div>
+          <div class="field hidden" id="task-sched-warmup-wrap">
+            <label>⚡ 快速通道提前预热（分钟，开抢前提前建好购物车）</label>
+            <input type="number" min="0" max="60" name="sched_warmup" value="5" />
+          </div>
+        </div>
+        <div id="task-sched-daily" class="hidden">
+          <div class="field">
+            <label>活跃时间段（24 小时制，多段用逗号分隔，支持跨午夜）</label>
+            <input type="text" name="sched_windows" value="22:00-02:00" placeholder="如 22:00-02:00 或 15:00-18:00, 21:30-01:30" />
+          </div>
+          <div class="field">
+            <label>生效星期（点击切换）</label>
+            <div class="dc-picker" id="task-sched-days"></div>
+          </div>
+        </div>
+        <div id="task-sched-range" class="hidden">
+          <div class="form-row">
+            <div class="field">
+              <label>定时开始时间（留空 = 立即允许运行）</label>
+              <input type="datetime-local" name="sched_start_at" />
+            </div>
+            <div class="field">
+              <label>定时结束时间（留空 = 不自动结束）</label>
+              <input type="datetime-local" name="sched_end_at" />
+            </div>
+          </div>
+          <div class="field ovh-opt-stack">
+            <label><input type="checkbox" name="sched_auto_pause" checked /><span><b>到达结束时间后自动暂停该任务</b></span></label>
+          </div>
         </div>
         <div class="ovh-opt-grid">
           <label><input type="checkbox" name="dry_run" /><span><b>演练模式</b><small>校验购物车与实时价格，不提交订单</small></span></label>
@@ -1012,6 +1095,39 @@
           <label>独立监控代理（可选，留空走全局监控代理池）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080" />
         </div>
+        <div class="field">
+          <label>定时扫描策略</label>
+          <select name="sched_mode" id="radar-sched-mode">
+            <option value="off">全天候扫描（默认）</option>
+            <option value="daily_window">每日活跃时段（如 14:00-02:00）</option>
+            <option value="datetime_range">指定起止日期时间</option>
+          </select>
+        </div>
+        <div id="radar-sched-daily" class="hidden">
+          <div class="field">
+            <label>活跃时间段（多段逗号分隔，支持跨零点）</label>
+            <input type="text" name="sched_windows" value="14:00-02:00" placeholder="如 14:00-02:00" />
+          </div>
+          <div class="field">
+            <label>生效星期</label>
+            <div class="dc-picker" id="radar-sched-days"></div>
+          </div>
+        </div>
+        <div id="radar-sched-range" class="hidden">
+          <div class="form-row">
+            <div class="field">
+              <label>开始时间</label>
+              <input type="datetime-local" name="sched_start_at" />
+            </div>
+            <div class="field">
+              <label>结束时间</label>
+              <input type="datetime-local" name="sched_end_at" />
+            </div>
+          </div>
+          <div class="field ovh-opt-stack">
+            <label><input type="checkbox" name="sched_auto_pause" checked /><span>到达结束时间后自动停用规则</span></label>
+          </div>
+        </div>
         <div class="ovh-opt-stack">
           <label><input type="checkbox" name="auto_snipe" /><span><b>命中后自动创建任务并开抢</b></span></label>
           <label><input type="checkbox" name="dry_run" checked /><span><b>自动任务使用演练模式</b><small>推荐先演练确认</small></span></label>
@@ -1074,6 +1190,37 @@
           <label>独立监控代理（可选，留空走全局监控代理池）</label>
           <input type="text" name="proxy_url" placeholder="如 socks5://user:pass@1.2.3.4:1080" />
         </div>
+        <div class="field">
+          <label>定时监控策略</label>
+          <select name="sched_mode" id="vps-sched-mode">
+            <option value="off">全天候监控（默认）</option>
+            <option value="daily_window">每日活跃时段（如 14:00-02:00）</option>
+            <option value="datetime_range">指定起止日期时间</option>
+          </select>
+        </div>
+        <div id="vps-sched-daily" class="hidden">
+          <div class="field">
+            <label>活跃时间段</label>
+            <input type="text" name="sched_windows" value="14:00-02:00" placeholder="如 14:00-02:00" />
+          </div>
+          <div class="field">
+            <label>生效星期</label>
+            <div class="dc-picker" id="vps-sched-days"></div>
+          </div>
+        </div>
+        <div id="vps-sched-range" class="hidden">
+          <div class="field">
+            <label>开始时间</label>
+            <input type="datetime-local" name="sched_start_at" />
+          </div>
+          <div class="field">
+            <label>结束时间</label>
+            <input type="datetime-local" name="sched_end_at" />
+          </div>
+          <div class="field ovh-opt-stack">
+            <label><input type="checkbox" name="sched_auto_pause" checked /><span>到结束时间自动停用</span></label>
+          </div>
+        </div>
         <div class="ovh-opt-stack">
           <label><input type="checkbox" name="auto_order" /><span>有货时自动下单</span></label>
           <label><input type="checkbox" name="dry_run" checked /><span>演练模式</span></label>
@@ -1095,6 +1242,85 @@
         <button class="icon-btn" onclick="closeModal('avail-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
       </div>
       <div id="avail-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Modal: Global Schedule Rule -->
+  <div id="schedule-modal" class="overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="schedule-modal-title">新建全局定时规则</h3>
+        <button class="icon-btn" onclick="closeModal('schedule-modal')" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+      </div>
+      <form id="schedule-form">
+        <input type="hidden" name="id" />
+        <div class="field">
+          <label>规则名称 *</label>
+          <input type="text" name="name" placeholder="例如：晚间黄金档自动开启抢购与雷达" required />
+        </div>
+        <div class="field">
+          <label>调度模式</label>
+          <select name="rule_type" id="sched-rule-type">
+            <option value="window">时段守护（进入时段自动开启，离开时段自动暂停）</option>
+            <option value="daily_at">每日定点触发（每天指定时刻执行一次开启或暂停）</option>
+            <option value="once">单次定时触发（指定日期时间触发一次后自动完成）</option>
+          </select>
+        </div>
+        <div id="sched-rule-window-wrap">
+          <div class="field">
+            <label>活跃时段（支持多段逗号分隔与跨零点，如 <code>22:00-02:00</code>）</label>
+            <input type="text" name="windows" value="22:00-02:00" placeholder="22:00-02:00 或 15:00-18:00, 21:30-01:30" />
+          </div>
+        </div>
+        <div id="sched-rule-action-wrap" class="hidden">
+          <div class="form-row">
+            <div class="field" id="sched-rule-daily-time-field">
+              <label>触发时刻 (HH:MM)</label>
+              <input type="time" name="at_time" value="22:00" />
+            </div>
+            <div class="field hidden" id="sched-rule-once-dt-field">
+              <label>触发日期时间</label>
+              <input type="datetime-local" name="run_at" />
+            </div>
+            <div class="field">
+              <label>执行动作</label>
+              <select name="action">
+                <option value="enable">🟢 开启 / 启动所选目标</option>
+                <option value="disable">⏸ 暂停 / 关闭所选目标</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="field" id="sched-rule-weekdays-wrap">
+          <label>生效星期（点击切换）</label>
+          <div class="dc-picker" id="global-sched-days"></div>
+        </div>
+        <div class="form-section">控制目标与速率调整</div>
+        <div class="field ovh-opt-grid">
+          <label><input type="checkbox" name="tgt_sniper" checked /><span><b>全局抢购引擎</b><small>独服 / Eco 主队列开关</small></span></label>
+          <label><input type="checkbox" name="tgt_fast_lane" /><span><b>预建快速通道</b><small>预建购物车保活开关</small></span></label>
+          <label><input type="checkbox" name="tgt_radar" /><span><b>黑五新品雷达</b><small>目录新品与指纹扫描</small></span></label>
+          <label><input type="checkbox" name="tgt_vps" /><span><b>VPS 补货监控</b><small>VPS 多机房监控开关</small></span></label>
+          <label style="grid-column: 1 / -1"><input type="checkbox" name="tgt_all_tasks" /><span><b>同步批量启动/暂停任务</b><small>仅切换运行中/已暂停任务，绝不触碰「待核对(防重单)」或「已完成」任务</small></span></label>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>开启时调整全局 QPS（0 = 不变）</label>
+            <input type="number" step="0.5" min="0" max="20" name="start_qps" value="0" />
+          </div>
+          <div class="field">
+            <label>暂停时恢复全局 QPS（0 = 不变）</label>
+            <input type="number" step="0.5" min="0" max="20" name="end_qps" value="0" />
+          </div>
+        </div>
+        <div class="field ovh-opt-stack">
+          <label><input type="checkbox" name="notify" /><span><b>定时规则触发时推送消息提醒</b></span></label>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn" onclick="closeModal('schedule-modal')">取消</button>
+          <button type="submit" class="btn btn-primary">保存规则</button>
+        </div>
+      </form>
     </div>
   </div>
 

@@ -8,12 +8,21 @@ const state = {
   tasks: [],
   radar: [],
   vps: [],
+  schedules: [],
+  scheduleTimezone: "Asia/Shanghai",
+  scheduleServerTime: "",
   orders: [],
   catalog: [],
   logs: [],
   logSource: null,
   activeTab: "dashboard",
   selectedDcs: [],
+  schedDays: {
+    task: [1, 2, 3, 4, 5, 6, 7],
+    radar: [1, 2, 3, 4, 5, 6, 7],
+    vps: [1, 2, 3, 4, 5, 6, 7],
+    global: [1, 2, 3, 4, 5, 6, 7],
+  },
   shortLinkPreview: null,
 };
 
@@ -33,6 +42,7 @@ const TAB_TITLES = {
   tasks: "抢购任务",
   radar: "黑五雷达",
   vps: "VPS 监控",
+  schedules: "定时调度",
   orders: "订单与交付",
   accounts: "OVH 账号",
   notify: "通知设置",
@@ -45,9 +55,10 @@ const TAB_TITLES = {
 const TAB_SUBS = {
   dashboard: "引擎状态、实时库存与最近订单一览",
   catalog: "浏览 OVH 官方目录，查看各机房实时库存与幽灵库存标记",
-  tasks: "按型号 / 机房 / 硬件条件自动轮询，有货即下单",
+  tasks: "按型号 / 机房 / 硬件条件自动轮询，支持活跃时段与快速通道提前预热",
   radar: "黑五新品上线与配置指纹自动发现",
   vps: "各机房 VPS 套餐补货状态",
+  schedules: "管理全局定时启停规则（支持跨零点时段守护、定点触发）与单任务定时窗口",
   orders: "短链下单、订单历史、交付进度与硬件中奖检测",
   accounts: "管理多个 OVH API 凭据，检查默认支付方式",
   notify: "配置 Telegram Bot、多渠道 Webhook 与消息推送事件",
@@ -66,6 +77,11 @@ function esc(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function safeHttpUrl(url) {
+  const s = String(url ?? "").trim();
+  return /^https?:\/\//i.test(s) ? s : "";
 }
 
 function syncThemeButtons() {
@@ -137,12 +153,13 @@ function formatUptime(sec) {
 
 async function refreshAll() {
   try {
-    const [status, accs, tasks, radar, vps, orders] = await Promise.all([
+    const [status, accs, tasks, radar, vps, schedules, orders] = await Promise.all([
       api("/api/status"),
       api("/api/accounts"),
       api("/api/tasks"),
       api("/api/radar"),
       api("/api/vps"),
+      api("/api/schedules"),
       api("/api/orders?limit=100"),
     ]);
     state.status = status;
@@ -150,12 +167,16 @@ async function refreshAll() {
     state.tasks = tasks.items || [];
     state.radar = radar.items || [];
     state.vps = vps.items || [];
+    state.schedules = schedules.items || [];
+    state.scheduleTimezone = schedules.timezone || status.schedule_timezone || "Asia/Shanghai";
+    state.scheduleServerTime = schedules.server_time || status.server_local_time || "";
     state.orders = orders.items || [];
     renderStatus();
     renderDashboard();
     renderTasks();
     renderRadar();
     renderVps();
+    renderSchedules();
     renderOrders();
     renderAccounts();
     populateAccountSelects();
@@ -177,8 +198,16 @@ function renderStatus() {
   document.getElementById("kpi-polls").textContent = `${st.total_polls || 0} / ${st.stock_hits || 0}`;
   document.getElementById("kpi-uptime-sub").textContent = `引擎已运行 ${formatUptime(st.uptime_seconds)}`;
   document.getElementById("kpi-accounts").textContent = `${s.accounts_count || 0} / ${s.active_radars || 0}`;
-  document.getElementById("kpi-vps-sub").textContent = `VPS 监控 ${s.active_vps || 0} 个`;
+  document.getElementById("kpi-vps-sub").textContent = `VPS 监控 ${s.active_vps || 0} 个 · 定时 ${s.active_schedules || 0}`;
   document.getElementById("nav-tasks-badge").textContent = s.tasks_running || 0;
+  const schedBadge = document.getElementById("nav-schedules-badge");
+  if (schedBadge) {
+    const itemSchedCnt =
+      state.tasks.filter((t) => t.schedule && t.schedule.enabled).length +
+      state.radar.filter((r) => r.schedule && r.schedule.enabled).length +
+      state.vps.filter((w) => w.schedule && w.schedule.enabled).length;
+    schedBadge.textContent = (s.active_schedules || 0) + itemSchedCnt;
+  }
 
   document.getElementById("toggle-sniper").checked = !!st.sniper_enabled;
   document.getElementById("toggle-fastlane").checked = !!st.fast_lane_enabled;
@@ -222,9 +251,10 @@ function renderDashboard() {
       .map((t) => {
         const dcs = t.datacenters.length ? t.datacenters.map((d) => d.toUpperCase()).join(", ") : "ALL";
         const dryBadge = t.dry_run ? `<span class="pill pill-blue">演练</span>` : "";
+        const sPill = renderItemSchedulePill(t.schedule_status);
         return `<div class="list-row">
           <div>
-            <div><b>${esc(t.name)}</b> <code class="mono">${esc(t.plan_code)}</code> ${dryBadge}</div>
+            <div><b>${esc(t.name)}</b> <code class="mono">${esc(t.plan_code)}</code> ${dryBadge} ${sPill}</div>
             <div class="muted">机房: ${esc(dcs)} · ${esc(t.last_status_msg || "等待首次轮询...")}</div>
           </div>
           <span class="pill pill-green">${t.ordered_count}/${t.max_orders}</span>
@@ -260,6 +290,94 @@ function statusPillForOrder(st) {
   if (st === "pending_confirm") return `<span class="pill pill-red">⚠️ 待核对(防重单)</span>`;
   if (st === "budget_exceeded") return `<span class="pill pill-amber">超预算取消</span>`;
   return `<span class="pill pill-red">失败</span>`;
+}
+
+// ---------- Schedule Helpers ----------
+
+const WEEKDAY_LABELS = [
+  [1, "周一"],
+  [2, "周二"],
+  [3, "周三"],
+  [4, "周四"],
+  [5, "周五"],
+  [6, "周六"],
+  [7, "周日"],
+];
+
+function renderItemSchedulePill(ev) {
+  if (!ev || !ev.scheduled) return "";
+  const hint = ev.status_hint || ev.summary || "定时";
+  if (ev.state === "active") return `<span class="pill pill-green" title="${esc(ev.summary)}">${esc(hint)}</span>`;
+  if (ev.state === "warmup") return `<span class="pill pill-purple" title="${esc(ev.summary)}">${esc(hint)}</span>`;
+  if (ev.state === "waiting") return `<span class="pill pill-amber" title="${esc(ev.summary)}">${esc(hint)}</span>`;
+  return `<span class="pill pill-gray" title="${esc(ev.summary)}">${esc(hint)}</span>`;
+}
+
+function buildWeekdayPicker(scope, selected = [1, 2, 3, 4, 5, 6, 7]) {
+  const days = Array.isArray(selected) && selected.length ? selected.map(Number) : [1, 2, 3, 4, 5, 6, 7];
+  state.schedDays[scope] = days;
+  const elId = scope === "global" ? "global-sched-days" : `${scope}-sched-days`;
+  const box = document.getElementById(elId);
+  if (!box) return;
+  box.innerHTML = WEEKDAY_LABELS.map(
+    ([d, label]) =>
+      `<span class="dc-chip ${days.includes(d) ? "selected" : ""}" onclick="toggleSchedDay('${scope}', ${d})">${label}</span>`
+  ).join("");
+}
+
+function toggleSchedDay(scope, day) {
+  const cur = state.schedDays[scope] || [1, 2, 3, 4, 5, 6, 7];
+  const idx = cur.indexOf(day);
+  if (idx >= 0) {
+    if (cur.length > 1) cur.splice(idx, 1);
+  } else {
+    cur.push(day);
+    cur.sort((a, b) => a - b);
+  }
+  buildWeekdayPicker(scope, cur);
+}
+
+function syncItemScheduleFormUI(scope) {
+  const sel = document.getElementById(`${scope}-sched-mode`);
+  if (!sel) return;
+  const mode = sel.value;
+  const dailyEl = document.getElementById(`${scope}-sched-daily`);
+  const rangeEl = document.getElementById(`${scope}-sched-range`);
+  const warmEl = document.getElementById(`${scope}-sched-warmup-wrap`);
+  if (dailyEl) dailyEl.classList.toggle("hidden", mode !== "daily_window");
+  if (rangeEl) rangeEl.classList.toggle("hidden", mode !== "datetime_range");
+  if (warmEl) warmEl.classList.toggle("hidden", mode === "off");
+}
+
+function hydrateItemScheduleForm(form, scope, sched = {}, defaultWin = "22:00-02:00") {
+  const s = sched && typeof sched === "object" ? sched : {};
+  const mode = s.enabled ? s.mode || "daily_window" : "off";
+  if (form.elements.sched_mode) form.elements.sched_mode.value = mode;
+  if (form.elements.sched_windows) form.elements.sched_windows.value = s.windows || defaultWin;
+  if (form.elements.sched_start_at) form.elements.sched_start_at.value = (s.start_at || "").slice(0, 16);
+  if (form.elements.sched_end_at) form.elements.sched_end_at.value = (s.end_at || "").slice(0, 16);
+  if (form.elements.sched_auto_pause) form.elements.sched_auto_pause.checked = s.auto_pause_on_end !== false;
+  if (form.elements.sched_warmup) form.elements.sched_warmup.value = s.warmup_minutes ?? 5;
+  buildWeekdayPicker(scope, s.weekdays || [1, 2, 3, 4, 5, 6, 7]);
+  syncItemScheduleFormUI(scope);
+}
+
+function collectItemScheduleFromForm(form, scope) {
+  const mode = form.elements.sched_mode ? form.elements.sched_mode.value : "off";
+  const defWarmup = form.elements.sched_warmup ? 5 : 0;
+  if (mode === "off") {
+    return { enabled: false, mode: "daily_window", windows: "", weekdays: [1, 2, 3, 4, 5, 6, 7], warmup_minutes: defWarmup, auto_pause_on_end: true };
+  }
+  return {
+    enabled: true,
+    mode,
+    windows: form.elements.sched_windows ? form.elements.sched_windows.value.trim() : "",
+    weekdays: state.schedDays[scope] || [1, 2, 3, 4, 5, 6, 7],
+    start_at: form.elements.sched_start_at ? form.elements.sched_start_at.value.trim() : "",
+    end_at: form.elements.sched_end_at ? form.elements.sched_end_at.value.trim() : "",
+    warmup_minutes: form.elements.sched_warmup ? Math.max(0, parseInt(form.elements.sched_warmup.value || "5", 10) || 0) : 0,
+    auto_pause_on_end: form.elements.sched_auto_pause ? form.elements.sched_auto_pause.checked : true,
+  };
 }
 
 // ---------- Catalog ----------
@@ -432,10 +550,11 @@ function renderTasks() {
           : t.status === "completed"
           ? `<span class="pill pill-blue">已完成</span>`
           : `<span class="pill pill-gray">已暂停</span>`;
+      const schedPill = renderItemSchedulePill(t.schedule_status);
       const slots = (t.fast_lane_slots || [])
         .map((sl) => `${sl.dc.toUpperCase()}(${sl.ttl_minutes}m)`)
         .join(", ");
-      const slotLine = slots ? `<div class="muted mt-6" style="color:#d8b4fe">⚡ 预建就绪: ${esc(slots)}</div>` : "";
+      const slotLine = slots ? `<div class="muted mt-6" style="color:var(--violet)">⚡ 预建就绪: ${esc(slots)}</div>` : "";
       const toggleLabel = t.status === "running" ? "暂停" : t.status === "pending_confirm" ? "核对后恢复" : "启动";
       const nextStatus = t.status === "running" ? "paused" : "running";
       return `<tr>
@@ -453,7 +572,7 @@ function renderTasks() {
           ${slotLine}
         </td>
         <td>
-          ${stPill}
+          <div style="display:flex;gap:4px;flex-wrap:wrap">${stPill} ${schedPill}</div>
           <div class="muted mt-6">已购 ${t.ordered_count}/${t.max_orders} · 轮询 ${t.attempts} 次</div>
         </td>
         <td style="max-width:220px">
@@ -521,6 +640,7 @@ function openTaskModal(prefill = {}) {
   form.elements.only_instant.checked = !!prefill.only_instant;
   form.elements.price_includes_tax.checked = !!prefill.price_includes_tax;
   form.elements.waive_retractation.checked = prefill.waive_retractation !== false;
+  hydrateItemScheduleForm(form, "task", prefill.schedule || {}, "22:00-02:00");
   buildDcPicker(prefill.datacenters || []);
   openModal("task-modal");
 }
@@ -586,8 +706,9 @@ function renderRadar() {
         .filter(Boolean)
         .join(" | ");
       const proxyTag = r.proxy_url ? ` <span class="pill pill-blue" title="已配独立监控代理">🌐代理</span>` : "";
+      const schedTag = r.schedule_status && r.schedule_status.scheduled ? ` ${renderItemSchedulePill(r.schedule_status)}` : "";
       return `<tr>
-        <td><b>${esc(r.name)}</b><div class="mt-6">${typeLabel} ${r.enabled ? '<span class="pill pill-green">启用</span>' : '<span class="pill pill-gray">停用</span>'}${proxyTag}</div></td>
+        <td><b>${esc(r.name)}</b><div class="mt-6">${typeLabel} ${r.enabled ? '<span class="pill pill-green">启用</span>' : '<span class="pill pill-gray">停用</span>'}${proxyTag}${schedTag}</div></td>
         <td><div>${esc(r.endpoint)} / ${esc(r.subsidiary)}</div><div class="muted">${esc(conds || "全部新品")}</div></td>
         <td><div>上限: ${r.max_price > 0 ? r.max_price : "不限"}</div><div class="muted">${r.auto_snipe ? (r.dry_run ? "自动演练抢购" : "自动实单抢购") : "仅推送提醒"}</div></td>
         <td><div>基线 ${r.known_plan_codes.length} · 命中 ${r.matched_plan_codes.length}</div><div class="muted">${esc(r.matched_plan_codes.slice(-3).join(", ") || r.last_check_at || "未扫描")}</div></td>
@@ -636,6 +757,7 @@ function editRadar(id) {
   f.elements.auto_snipe.checked = !!r.auto_snipe;
   f.elements.dry_run.checked = !!r.dry_run;
   f.elements.auto_pay.checked = !!r.auto_pay;
+  hydrateItemScheduleForm(f, "radar", r.schedule || {}, "14:00-02:00");
   openModal("radar-modal");
 }
 
@@ -663,6 +785,7 @@ function renderVps() {
             <span class="muted">(${esc(w.endpoint)} / ${esc(w.subsidiary)})</span>
             ${w.auto_order ? `<span class="pill ${w.dry_run ? "pill-blue" : "pill-amber"}">${w.dry_run ? "自动演练" : "自动下单"}</span>` : `<span class="pill pill-gray">仅监控</span>`}
             ${w.proxy_url ? `<span class="pill pill-blue" title="已配独立监控代理">🌐代理</span>` : ""}
+            ${renderItemSchedulePill(w.schedule_status)}
           </div>
           <div class="toolbar">
             <span class="muted">${esc(w.last_check_at || "尚未检测")}</span>
@@ -704,7 +827,211 @@ function editVps(id) {
   f.elements.auto_order.checked = !!w.auto_order;
   f.elements.dry_run.checked = !!w.dry_run;
   f.elements.auto_pay.checked = !!w.auto_pay;
+  hydrateItemScheduleForm(f, "vps", w.schedule || {}, "14:00-02:00");
   openModal("vps-modal");
+}
+
+// ---------- Schedules ----------
+
+const SCHEDULE_TARGET_NAMES = {
+  sniper: "抢购引擎",
+  fast_lane: "快速通道",
+  radar: "黑五雷达",
+  vps: "VPS监控",
+  all_tasks: "批量全部任务",
+};
+
+function populateTimezoneSelect() {
+  const sel = document.getElementById("schedule-tz-select");
+  if (!sel) return;
+  const list = (state.meta && state.meta.supported_timezones) || [
+    { id: "Asia/Shanghai", label: "Asia/Shanghai (UTC+8)" },
+    { id: "Europe/Paris", label: "Europe/Paris (CET/CEST)" },
+    { id: "UTC", label: "UTC" },
+  ];
+  const cur = state.scheduleTimezone || "Asia/Shanghai";
+  const hasCur = list.some((t) => t.id === cur);
+  const full = hasCur ? list : [{ id: cur, label: cur }, ...list];
+  sel.innerHTML = full.map((t) => `<option value="${esc(t.id)}">${esc(t.label)}</option>`).join("");
+  sel.value = cur;
+}
+
+function renderSchedules() {
+  const clockEl = document.getElementById("schedule-clock-pill");
+  if (clockEl) {
+    clockEl.textContent = `${state.scheduleTimezone || "Asia/Shanghai"} · ${state.scheduleServerTime || "--:--:--"}`;
+  }
+  populateTimezoneSelect();
+
+  const tbody = document.getElementById("schedules-tbody");
+  if (tbody) {
+    if (!state.schedules.length) {
+      tbody.innerHTML = `<tr><td colspan="5" class="muted text-center">暂无全局定时规则，点击右上角「+ 新建定时规则」设置黄金时段自动开启抢购或休息时段自动暂停</td></tr>`;
+    } else {
+      tbody.innerHTML = state.schedules
+        .map((r) => {
+          const modeBadge =
+            r.rule_type === "window"
+              ? `<span class="pill pill-purple">时段守护</span>`
+              : r.rule_type === "daily_at"
+              ? `<span class="pill pill-blue">每日定点</span>`
+              : `<span class="pill pill-amber">单次定时</span>`;
+          const enBadge = r.enabled ? `<span class="pill pill-green">已启用</span>` : `<span class="pill pill-gray">已停用</span>`;
+          const tgtText = (r.targets || [])
+            .map((t) => SCHEDULE_TARGET_NAMES[t] || t)
+            .join(" · ");
+          const qpsParts = [];
+          if (r.start_qps > 0) qpsParts.push(`开启 QPS=${r.start_qps}`);
+          if (r.end_qps > 0) qpsParts.push(`暂停 QPS=${r.end_qps}`);
+          const statePill = r.active_now
+            ? `<span class="pill pill-green">🟢 时段生效中</span>`
+            : `<span class="pill pill-gray">${esc(r.next_hint || "待触发")}</span>`;
+          return `<tr>
+            <td>
+              <b>${esc(r.name)}</b>
+              <div class="mt-6">${modeBadge} ${enBadge}${r.notify ? ' <span class="pill pill-blue">🔔推送</span>' : ""}</div>
+            </td>
+            <td>
+              <div>${esc(r.schedule_label || "-")}</div>
+            </td>
+            <td>
+              <div>${esc(tgtText || "抢购引擎")}</div>
+              ${qpsParts.length ? `<div class="muted mt-6">${esc(qpsParts.join(" / "))}</div>` : ""}
+            </td>
+            <td>
+              <div>${statePill}</div>
+              <div class="muted mt-6">${esc(r.last_triggered_at ? `上次触发: ${r.last_triggered_at}` : "尚未触发")}</div>
+            </td>
+            <td>
+              <div class="toolbar">
+                <button class="btn btn-ghost btn-sm" onclick="toggleScheduleRule('${esc(r.id)}', ${!r.enabled})">${r.enabled ? "停用" : "启用"}</button>
+                <button class="btn btn-ghost btn-sm" onclick="editScheduleRule('${esc(r.id)}')">编辑</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteScheduleRule('${esc(r.id)}')">删</button>
+              </div>
+            </td>
+          </tr>`;
+        })
+        .join("");
+    }
+  }
+
+  const itemBox = document.getElementById("scheduled-items-list");
+  if (itemBox) {
+    const rows = [];
+    state.tasks
+      .filter((t) => t.schedule && t.schedule.enabled)
+      .forEach((t) => {
+        rows.push({
+          kind: "抢购任务",
+          title: `${t.name} (${t.plan_code})`,
+          ev: t.schedule_status,
+          extra: t.fast_lane ? `⚡ 快速通道提前 ${t.schedule.warmup_minutes ?? 5}m 预热` : "",
+          onEdit: `editTask('${esc(t.id)}')`,
+        });
+      });
+    state.radar
+      .filter((r) => r.schedule && r.schedule.enabled)
+      .forEach((r) => {
+        rows.push({
+          kind: "黑五雷达",
+          title: `${r.name} (${r.endpoint}/${r.subsidiary})`,
+          ev: r.schedule_status,
+          extra: "",
+          onEdit: `editRadar('${esc(r.id)}')`,
+        });
+      });
+    state.vps
+      .filter((w) => w.schedule && w.schedule.enabled)
+      .forEach((w) => {
+        rows.push({
+          kind: "VPS监控",
+          title: `${w.plan_code} (${w.endpoint}/${w.subsidiary})`,
+          ev: w.schedule_status,
+          extra: "",
+          onEdit: `editVps('${esc(w.id)}')`,
+        });
+      });
+
+    if (!rows.length) {
+      itemBox.innerHTML = `<div class="muted">当前没有单独设置定时窗口的任务 / 雷达 / VPS（默认全天候运行）。你可以在任意任务或监控项的「编辑」弹窗中开启定时运行。</div>`;
+    } else {
+      itemBox.innerHTML = rows
+        .map(
+          (it) => `<div class="list-row">
+            <div>
+              <div><span class="pill pill-blue">${esc(it.kind)}</span> <b>${esc(it.title)}</b> ${renderItemSchedulePill(it.ev)}</div>
+              <div class="muted mt-6">计划: ${esc((it.ev && it.ev.summary) || "-")}${it.extra ? ` · ${esc(it.extra)}` : ""}</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="${it.onEdit}">编辑</button>
+          </div>`
+        )
+        .join("");
+    }
+  }
+}
+
+function syncGlobalScheduleModalUI() {
+  const sel = document.getElementById("sched-rule-type");
+  if (!sel) return;
+  const rtype = sel.value;
+  document.getElementById("sched-rule-window-wrap").classList.toggle("hidden", rtype !== "window");
+  document.getElementById("sched-rule-action-wrap").classList.toggle("hidden", rtype === "window");
+  document.getElementById("sched-rule-daily-time-field").classList.toggle("hidden", rtype !== "daily_at");
+  document.getElementById("sched-rule-once-dt-field").classList.toggle("hidden", rtype !== "once");
+  document.getElementById("sched-rule-weekdays-wrap").classList.toggle("hidden", rtype === "once");
+}
+
+function openScheduleModal(prefill = {}) {
+  const f = document.getElementById("schedule-form");
+  f.reset();
+  f.elements.id.value = prefill.id || "";
+  document.getElementById("schedule-modal-title").textContent = prefill.id ? "编辑全局定时规则" : "新建全局定时规则";
+  f.elements.name.value = prefill.name || "";
+  f.elements.rule_type.value = prefill.rule_type || "window";
+  f.elements.windows.value = prefill.windows || "22:00-02:00";
+  f.elements.at_time.value = prefill.at_time || "22:00";
+  f.elements.run_at.value = (prefill.run_at || "").slice(0, 16);
+  f.elements.action.value = prefill.action || "enable";
+  const knownTargets = new Set(["sniper", "fast_lane", "radar", "vps", "all_tasks"]);
+  const tgts = new Set(prefill.targets || ["sniper"]);
+  state.editingScheduleCustomTargets = (prefill.targets || []).filter((t) => !knownTargets.has(t));
+  f.elements.tgt_sniper.checked = tgts.has("sniper");
+  f.elements.tgt_fast_lane.checked = tgts.has("fast_lane");
+  f.elements.tgt_radar.checked = tgts.has("radar");
+  f.elements.tgt_vps.checked = tgts.has("vps");
+  f.elements.tgt_all_tasks.checked = tgts.has("all_tasks");
+  f.elements.start_qps.value = prefill.start_qps ?? 0;
+  f.elements.end_qps.value = prefill.end_qps ?? 0;
+  f.elements.notify.checked = !!prefill.notify;
+  buildWeekdayPicker("global", prefill.weekdays || [1, 2, 3, 4, 5, 6, 7]);
+  syncGlobalScheduleModalUI();
+  openModal("schedule-modal");
+}
+
+function editScheduleRule(id) {
+  const r = state.schedules.find((x) => x.id === id);
+  if (r) openScheduleModal(r);
+}
+
+async function toggleScheduleRule(id, enabled) {
+  try {
+    await api(`/api/schedules/${id}`, { method: "PUT", body: { enabled } });
+    toast(enabled ? "定时规则已启用" : "定时规则已停用", "ok");
+    refreshAll();
+  } catch (err) {
+    toast(err.message, "err");
+  }
+}
+
+async function deleteScheduleRule(id) {
+  if (!confirm("确定删除该定时规则？")) return;
+  try {
+    await api(`/api/schedules/${id}`, { method: "DELETE" });
+    toast("定时规则已删除", "ok");
+    refreshAll();
+  } catch (err) {
+    toast(err.message, "err");
+  }
 }
 
 // ---------- Orders ----------
@@ -741,8 +1068,9 @@ function renderOrders() {
         ? `<div class="muted mt-6">🖥️ <code class="mono">${esc(o.server_name)}</code>${o.server_ip ? ` (${esc(o.server_ip)})` : ""}</div>`
         : "";
 
-      const payBtn = o.order_url
-        ? `<a class="btn btn-primary btn-sm" href="${esc(o.order_url)}" target="_blank" rel="noreferrer">付款 #${esc(o.order_id)} ↗</a>`
+      const safePayUrl = safeHttpUrl(o.order_url);
+      const payBtn = safePayUrl
+        ? `<a class="btn btn-primary btn-sm" href="${esc(safePayUrl)}" target="_blank" rel="noreferrer">付款 #${esc(o.order_id)} ↗</a>`
         : `<span class="muted">${esc(o.order_id || o.error_message || "-")}</span>`;
       const trackBtn =
         o.order_id && !o.dry_run
@@ -803,7 +1131,7 @@ function renderShortLinkPreview(p) {
       <div>
         <div><b>🎯 ${esc(p.plan_code)}</b> @ <b>${esc(String(p.datacenter || "").toUpperCase())}</b> <span class="pill pill-blue">${esc(p.account_name)} (${esc(p.subsidiary)})</span></div>
         <div class="muted mt-6">配件: ${esc((p.options || []).join(", ") || "默认")} · 周期: ${esc(p.duration)} / ${esc(p.pricing_mode)}</div>
-        <div class="mt-6">不含税: <b>${pr.withoutTax ?? "-"} ${esc(pr.currencyCode || "")}</b> · 含税总计: <b style="color:#fcd34d">${esc(p.price_with_tax_cny || `${pr.withTax ?? "-"} ${pr.currencyCode || ""}`)}</b></div>
+        <div class="mt-6">不含税: <b>${pr.withoutTax ?? "-"} ${esc(pr.currencyCode || "")}</b> · 含税总计: <b style="color:var(--amber)">${esc(p.price_with_tax_cny || `${pr.withTax ?? "-"} ${pr.currencyCode || ""}`)}</b></div>
         <div class="muted mt-6">⚠️ 确认后将生成 OVH 官方未付款订单（不自动扣款），点击一次后自动锁定防止重单。</div>
       </div>
       <div class="toolbar">
@@ -1290,6 +1618,7 @@ function bindEvents() {
       only_instant: f.elements.only_instant.checked,
       price_includes_tax: f.elements.price_includes_tax.checked,
       waive_retractation: f.elements.waive_retractation.checked,
+      schedule: collectItemScheduleFromForm(f, "task"),
     };
     const id = f.elements.id.value;
     try {
@@ -1342,6 +1671,7 @@ function bindEvents() {
     f.reset();
     f.elements.id.value = "";
     document.getElementById("radar-modal-title").textContent = "新建雷达规则";
+    hydrateItemScheduleForm(f, "radar", {}, "14:00-02:00");
     openModal("radar-modal");
   });
   document.getElementById("radar-form").addEventListener("submit", async (e) => {
@@ -1363,6 +1693,7 @@ function bindEvents() {
       auto_snipe: f.elements.auto_snipe.checked,
       dry_run: f.elements.dry_run.checked,
       auto_pay: f.elements.auto_pay.checked,
+      schedule: collectItemScheduleFromForm(f, "radar"),
     };
     try {
       if (id) await api(`/api/radar/${id}`, { method: "PUT", body });
@@ -1391,6 +1722,7 @@ function bindEvents() {
     f.reset();
     f.elements.id.value = "";
     document.getElementById("vps-modal-title").textContent = "添加 VPS 监控";
+    hydrateItemScheduleForm(f, "vps", {}, "14:00-02:00");
     openModal("vps-modal");
   });
   document.getElementById("vps-form").addEventListener("submit", async (e) => {
@@ -1407,6 +1739,7 @@ function bindEvents() {
       auto_order: f.elements.auto_order.checked,
       dry_run: f.elements.dry_run.checked,
       auto_pay: f.elements.auto_pay.checked,
+      schedule: collectItemScheduleFromForm(f, "vps"),
     };
     try {
       if (id) await api(`/api/vps/${id}`, { method: "PUT", body });
@@ -1506,7 +1839,7 @@ function bindEvents() {
               (o) => `<div class="list-row">
               <div>
                 <b>#${esc(o.orderId)}</b> · <span class="muted">${esc(o.date)}</span>
-                <div class="muted">含税: ${(o.priceWithTax && o.priceWithTax.text) || "-"}</div>
+                <div class="muted">含税: ${esc((o.priceWithTax && o.priceWithTax.text) || "-")}</div>
               </div>
               ${o.url ? `<a class="btn btn-primary btn-sm" href="${esc(o.url)}" target="_blank" rel="noreferrer">查看 / 付款 ↗</a>` : ""}
             </div>`
@@ -1770,6 +2103,81 @@ function bindEvents() {
     }
   });
 
+  // Schedule UI bindings (Item-level & Global rules)
+  ["task", "radar", "vps"].forEach((scope) => {
+    const modeSel = document.getElementById(`${scope}-sched-mode`);
+    if (modeSel) modeSel.addEventListener("change", () => syncItemScheduleFormUI(scope));
+    buildWeekdayPicker(scope, [1, 2, 3, 4, 5, 6, 7]);
+  });
+  buildWeekdayPicker("global", [1, 2, 3, 4, 5, 6, 7]);
+  const globalTypeSel = document.getElementById("sched-rule-type");
+  if (globalTypeSel) globalTypeSel.addEventListener("change", syncGlobalScheduleModalUI);
+  const openSchedBtn = document.getElementById("btn-open-schedule-modal");
+  if (openSchedBtn) openSchedBtn.addEventListener("click", () => openScheduleModal({}));
+  const tzSel = document.getElementById("schedule-tz-select");
+  if (tzSel) {
+    tzSel.addEventListener("change", async () => {
+      try {
+        await api("/api/settings", { method: "PUT", body: { schedule_timezone: tzSel.value } });
+        toast(`定时调度基准时区已切换为 ${tzSel.value}`, "ok");
+        refreshAll();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+  }
+  const schedForm = document.getElementById("schedule-form");
+  if (schedForm) {
+    schedForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const id = f.elements.id.value;
+      const targets = [...(state.editingScheduleCustomTargets || [])];
+      if (f.elements.tgt_sniper.checked) targets.push("sniper");
+      if (f.elements.tgt_fast_lane.checked) targets.push("fast_lane");
+      if (f.elements.tgt_radar.checked) targets.push("radar");
+      if (f.elements.tgt_vps.checked) targets.push("vps");
+      if (f.elements.tgt_all_tasks.checked) targets.push("all_tasks");
+      if (!targets.length) {
+        toast("请至少勾选一个控制目标", "err");
+        return;
+      }
+      const rtype = f.elements.rule_type.value;
+      const winVal = f.elements.windows.value.trim();
+      const onceVal = f.elements.run_at.value.trim();
+      if (rtype === "window" && !/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/.test(winVal)) {
+        toast("请填写有效的时段格式，例如 22:00-02:00", "err");
+        return;
+      }
+      if (rtype === "once" && !onceVal) {
+        toast("请选择单次定时触发的日期时间", "err");
+        return;
+      }
+      const body = {
+        name: f.elements.name.value.trim(),
+        rule_type: rtype,
+        windows: winVal,
+        at_time: f.elements.at_time.value.trim(),
+        run_at: onceVal,
+        action: f.elements.action.value,
+        weekdays: state.schedDays.global || [1, 2, 3, 4, 5, 6, 7],
+        targets,
+        start_qps: parseFloat(f.elements.start_qps.value || "0") || 0,
+        end_qps: parseFloat(f.elements.end_qps.value || "0") || 0,
+        notify: f.elements.notify.checked,
+      };
+      try {
+        if (id) await api(`/api/schedules/${id}`, { method: "PUT", body });
+        else await api("/api/schedules", { method: "POST", body });
+        closeModal("schedule-modal");
+        toast(id ? "定时规则已更新" : "定时规则已创建", "ok");
+        refreshAll();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+  }
+
   // Logs
   document.getElementById("log-filter-level").addEventListener("change", loadLogs);
   document.getElementById("log-filter-source").addEventListener("change", loadLogs);
@@ -1838,5 +2246,9 @@ window.trackOrder = trackOrder;
 window.confirmShortLink = confirmShortLink;
 window.cancelShortLink = cancelShortLink;
 window.evictPoolProxy = evictPoolProxy;
+window.toggleSchedDay = toggleSchedDay;
+window.editScheduleRule = editScheduleRule;
+window.toggleScheduleRule = toggleScheduleRule;
+window.deleteScheduleRule = deleteScheduleRule;
 
 document.addEventListener("DOMContentLoaded", init);

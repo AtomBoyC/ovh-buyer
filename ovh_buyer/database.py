@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .config import DATA_DIR, DB_PATH, get_data_dir, get_db_path
-from .ovh_client import redact_proxy_list_text
+from .ovh_client import mask_proxy_list_for_ui, merge_masked_proxy_input, redact_proxy_list_text
+from .scheduler import default_timezone_name, normalize_item_schedule, normalize_weekdays
 
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -29,6 +30,14 @@ EXPORT_SECRET_SETTING_KEYS = (
     "discord_webhook",
     "custom_webhook_url",
 )
+
+# Settings encrypted at rest when DATA_ENCRYPTION_KEY is configured
+ENCRYPTED_SETTING_KEYS = set(EXPORT_SECRET_SETTING_KEYS) | {
+    "http_proxy",
+    "monitor_proxies",
+    "monitor_proxies_pool",
+    "telegram_proxy",
+}
 
 
 def now_iso() -> str:
@@ -126,6 +135,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tracker_enabled": True,
     "radar_enabled": False,
     "vps_monitor_enabled": False,
+    "schedule_timezone": default_timezone_name(),
+    "quick_buy_price_margin": 0.10,
     "panel_password_hash": "",
 }
 
@@ -310,6 +321,26 @@ class Database:
                     expires_at REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS schedule_rules (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    rule_type TEXT NOT NULL DEFAULT 'window',
+                    targets_json TEXT NOT NULL DEFAULT '["sniper"]',
+                    action TEXT NOT NULL DEFAULT 'enable',
+                    windows TEXT DEFAULT '22:00-02:00',
+                    at_time TEXT DEFAULT '22:00',
+                    run_at TEXT DEFAULT '',
+                    weekdays TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]',
+                    start_qps REAL NOT NULL DEFAULT 0,
+                    end_qps REAL NOT NULL DEFAULT 0,
+                    notify INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_state TEXT DEFAULT '',
+                    last_triggered_at TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(id DESC);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON sniper_tasks(status);
@@ -344,6 +375,9 @@ class Database:
         self._ensure_column("sniper_tasks", "proxy_url", "TEXT DEFAULT ''")
         self._ensure_column("radar_rules", "proxy_url", "TEXT DEFAULT ''")
         self._ensure_column("vps_watches", "proxy_url", "TEXT DEFAULT ''")
+        self._ensure_column("sniper_tasks", "schedule_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("radar_rules", "schedule_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("vps_watches", "schedule_json", "TEXT NOT NULL DEFAULT '{}'")
         self._conn.commit()
 
     def _seed_default_settings(self) -> None:
@@ -370,9 +404,14 @@ class Database:
             row = cur.fetchone()
             if row is None:
                 initial = env_overrides.get(k) if env_overrides.get(k) else v
+                to_store = (
+                    protect_secret(initial, self.encryption_key)
+                    if (k in ENCRYPTED_SETTING_KEYS and isinstance(initial, str) and initial)
+                    else initial
+                )
                 cur.execute(
                     "INSERT INTO settings(key, value) VALUES (?, ?)",
-                    (k, json.dumps(initial, ensure_ascii=False)),
+                    (k, json.dumps(to_store, ensure_ascii=False)),
                 )
         self._conn.commit()
 
@@ -384,10 +423,14 @@ class Database:
             cur.execute("SELECT key, value FROM settings")
             data = dict(DEFAULT_SETTINGS)
             for row in cur.fetchall():
+                k = row["key"]
                 try:
-                    data[row["key"]] = json.loads(row["value"])
+                    val = json.loads(row["value"])
                 except json.JSONDecodeError:
-                    data[row["key"]] = row["value"]
+                    val = row["value"]
+                if k in ENCRYPTED_SETTING_KEYS and isinstance(val, str):
+                    val = reveal_secret(val, self.encryption_key)
+                data[k] = val
             return data
 
     def get_setting(self, key: str, default: Any = None) -> Any:
@@ -400,10 +443,15 @@ class Database:
             for key, value in patch.items():
                 if key not in DEFAULT_SETTINGS:
                     continue
+                to_store = (
+                    protect_secret(value, self.encryption_key)
+                    if (key in ENCRYPTED_SETTING_KEYS and isinstance(value, str) and value)
+                    else value
+                )
                 cur.execute(
                     "INSERT INTO settings(key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (key, json.dumps(value, ensure_ascii=False)),
+                    (key, json.dumps(to_store, ensure_ascii=False)),
                 )
             self._conn.commit()
         return self.get_settings()
@@ -479,14 +527,17 @@ class Database:
         d = dict(row)
         app_secret = reveal_secret(d["app_secret"], self.encryption_key)
         consumer_key = reveal_secret(d["consumer_key"], self.encryption_key)
+        raw_proxy = reveal_secret(str(d.get("proxy_url") or ""), self.encryption_key)
         d["is_default"] = bool(d["is_default"])
         if mask:
             d["app_secret"] = mask_secret(app_secret)
             d["consumer_key"] = mask_secret(consumer_key)
+            d["proxy_url"] = mask_proxy_list_for_ui(raw_proxy) if raw_proxy else ""
             d["has_secrets"] = bool(app_secret and consumer_key)
         else:
             d["app_secret"] = app_secret
             d["consumer_key"] = consumer_key
+            d["proxy_url"] = raw_proxy
         return d
 
     def list_accounts(self, mask: bool = True) -> List[Dict[str, Any]]:
@@ -536,7 +587,7 @@ class Database:
                     is_default,
                     data.get("nichandle", ""),
                     data.get("currency", "EUR"),
-                    str(data.get("proxy_url", "") or "").strip(),
+                    protect_secret(str(data.get("proxy_url", "") or "").strip(), self.encryption_key),
                     data.get("last_verified_at", ""),
                     now,
                     now,
@@ -564,7 +615,10 @@ class Database:
         currency = patch.get("currency", existing["currency"])
         last_verified_at = patch.get("last_verified_at", existing["last_verified_at"])
         default_payment_type = patch.get("default_payment_type", existing.get("default_payment_type", ""))
-        proxy_url = str(patch.get("proxy_url", existing.get("proxy_url", "")) or "").strip()
+        if "proxy_url" in patch:
+            proxy_url = merge_masked_proxy_input(str(patch.get("proxy_url") or ""), existing.get("proxy_url", ""))
+        else:
+            proxy_url = str(existing.get("proxy_url") or "").strip()
 
         with self._lock:
             cur = self._conn.cursor()
@@ -590,7 +644,7 @@ class Database:
                     nichandle,
                     currency,
                     default_payment_type or "",
-                    proxy_url,
+                    protect_secret(proxy_url, self.encryption_key),
                     last_verified_at,
                     now,
                     account_id,
@@ -624,7 +678,7 @@ class Database:
             val = max(0.0, float(raw))
         return int(val) if val.is_integer() else val
 
-    def _row_to_task(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _row_to_task(self, row: sqlite3.Row, mask: bool = False) -> Dict[str, Any]:
         d = dict(row)
         for field in ("datacenters", "options", "coupons"):
             try:
@@ -635,6 +689,9 @@ class Database:
             d["last_availability"] = json.loads(d["last_availability"]) if d["last_availability"] else {}
         except json.JSONDecodeError:
             d["last_availability"] = {}
+        d["schedule"] = normalize_item_schedule(d.get("schedule_json") or "{}")
+        raw_proxy = reveal_secret(str(d.get("proxy_url") or ""), self.encryption_key)
+        d["proxy_url"] = mask_proxy_list_for_ui(raw_proxy) if (mask and raw_proxy) else raw_proxy
         for bf in (
             "price_includes_tax",
             "auto_pay",
@@ -647,18 +704,18 @@ class Database:
             d[bf] = bool(d.get(bf, 0))
         return d
 
-    def list_tasks(self) -> List[Dict[str, Any]]:
+    def list_tasks(self, mask: bool = False) -> List[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM sniper_tasks ORDER BY priority DESC, created_at DESC")
-            return [self._row_to_task(r) for r in cur.fetchall()]
+            return [self._row_to_task(r, mask=mask) for r in cur.fetchall()]
 
-    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+    def get_task(self, task_id: str, mask: bool = False) -> Optional[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM sniper_tasks WHERE id = ?", (task_id,))
             row = cur.fetchone()
-            return self._row_to_task(row) if row else None
+            return self._row_to_task(row, mask=mask) if row else None
 
     def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
@@ -680,6 +737,8 @@ class Database:
         coupons = data.get("coupons") or []
         if isinstance(coupons, str):
             coupons = [x.strip() for x in coupons.split(",") if x.strip()]
+        sched_json = json.dumps(normalize_item_schedule(data.get("schedule")), ensure_ascii=False)
+        proxy_enc = protect_secret(str(data.get("proxy_url", "") or "").strip(), self.encryption_key)
 
         with self._lock:
             cur = self._conn.cursor()
@@ -691,11 +750,11 @@ class Database:
                     os_code, coupons, max_price, price_includes_tax, quantity,
                     max_orders, ordered_count, auto_pay, waive_retractation,
                     dry_run, mode, only_instant, fast_lane, allow_non_default,
-                    poll_interval, priority, proxy_url, status,
+                    poll_interval, priority, proxy_url, schedule_json, status,
                     attempts, last_check_at, last_status_msg, last_availability,
                     source, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '{}', ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', '{}', ?, ?, ?
                 )
                 """,
                 (
@@ -725,7 +784,8 @@ class Database:
                     1 if data.get("allow_non_default", True) else 0,
                     self._normalize_poll_interval(data.get("poll_interval"), self.get_setting("default_poll_interval", 5)),
                     int(data.get("priority") or 10),
-                    str(data.get("proxy_url", "") or "").strip(),
+                    proxy_enc,
+                    sched_json,
                     str(data.get("status", "running")).strip().lower() or "running",
                     str(data.get("source", "manual")),
                     now,
@@ -761,6 +821,13 @@ class Database:
         last_avail = merged.get("last_availability")
         if not isinstance(last_avail, str):
             last_avail = json.dumps(last_avail or {}, ensure_ascii=False)
+        if "proxy_url" in patch:
+            proxy_plain = merge_masked_proxy_input(str(patch.get("proxy_url") or ""), existing.get("proxy_url", ""))
+        else:
+            proxy_plain = str(existing.get("proxy_url") or "").strip()
+        proxy_enc = protect_secret(proxy_plain, self.encryption_key)
+        sched_obj = normalize_item_schedule(patch["schedule"] if "schedule" in patch else existing.get("schedule"))
+        sched_json = json.dumps(sched_obj, ensure_ascii=False)
 
         with self._lock:
             cur = self._conn.cursor()
@@ -774,7 +841,7 @@ class Database:
                     max_orders = ?, ordered_count = ?, auto_pay = ?,
                     waive_retractation = ?, dry_run = ?, mode = ?, only_instant = ?,
                     fast_lane = ?, allow_non_default = ?,
-                    poll_interval = ?, priority = ?, proxy_url = ?, status = ?, attempts = ?,
+                    poll_interval = ?, priority = ?, proxy_url = ?, schedule_json = ?, status = ?, attempts = ?,
                     last_check_at = ?, last_status_msg = ?, last_availability = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -806,7 +873,8 @@ class Database:
                     1 if merged.get("allow_non_default", True) else 0,
                     self._normalize_poll_interval(merged.get("poll_interval"), 5),
                     int(merged.get("priority") or 10),
-                    str(merged.get("proxy_url", "") or "").strip(),
+                    proxy_enc,
+                    sched_json,
                     str(merged.get("status", "running")).strip().lower(),
                     max(0, int(merged.get("attempts") or 0)),
                     str(merged.get("last_check_at", "")),
@@ -846,29 +914,32 @@ class Database:
 
     # ---------- Black Friday Radar Rules ----------
 
-    def _row_to_radar(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _row_to_radar(self, row: sqlite3.Row, mask: bool = False) -> Dict[str, Any]:
         d = dict(row)
         for field in ("datacenters", "known_plan_codes", "matched_plan_codes"):
             try:
                 d[field] = json.loads(d[field]) if d[field] else []
             except json.JSONDecodeError:
                 d[field] = []
+        d["schedule"] = normalize_item_schedule(d.get("schedule_json") or "{}")
+        raw_proxy = reveal_secret(str(d.get("proxy_url") or ""), self.encryption_key)
+        d["proxy_url"] = mask_proxy_list_for_ui(raw_proxy) if (mask and raw_proxy) else raw_proxy
         for bf in ("auto_snipe", "auto_pay", "dry_run", "enabled"):
             d[bf] = bool(d[bf])
         return d
 
-    def list_radar_rules(self) -> List[Dict[str, Any]]:
+    def list_radar_rules(self, mask: bool = False) -> List[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM radar_rules ORDER BY created_at DESC")
-            return [self._row_to_radar(r) for r in cur.fetchall()]
+            return [self._row_to_radar(r, mask=mask) for r in cur.fetchall()]
 
-    def get_radar_rule(self, rule_id: str) -> Optional[Dict[str, Any]]:
+    def get_radar_rule(self, rule_id: str, mask: bool = False) -> Optional[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM radar_rules WHERE id = ?", (rule_id,))
             row = cur.fetchone()
-            return self._row_to_radar(row) if row else None
+            return self._row_to_radar(row, mask=mask) if row else None
 
     def create_radar_rule(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
@@ -878,15 +949,17 @@ class Database:
             dcs = [x.strip().lower() for x in dcs.split(",") if x.strip()]
         known = data.get("known_plan_codes") or []
         matched = data.get("matched_plan_codes") or []
+        sched_json = json.dumps(normalize_item_schedule(data.get("schedule")), ensure_ascii=False)
+        proxy_enc = protect_secret(str(data.get("proxy_url", "") or "").strip(), self.encryption_key)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO radar_rules (
                     id, name, rule_type, account_id, endpoint, subsidiary,
                     keyword_pattern, memory_pattern, storage_pattern, datacenters,
-                    max_price, auto_snipe, auto_pay, dry_run, enabled, proxy_url,
+                    max_price, auto_snipe, auto_pay, dry_run, enabled, proxy_url, schedule_json,
                     known_plan_codes, matched_plan_codes, last_check_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                 """,
                 (
                     rule_id,
@@ -904,7 +977,8 @@ class Database:
                     1 if data.get("auto_pay") else 0,
                     1 if data.get("dry_run", True) else 0,
                     1 if data.get("enabled", True) else 0,
-                    str(data.get("proxy_url", "") or "").strip(),
+                    proxy_enc,
+                    sched_json,
                     json.dumps(known, ensure_ascii=False),
                     json.dumps(matched, ensure_ascii=False),
                     now,
@@ -924,6 +998,13 @@ class Database:
         dcs = merged.get("datacenters") or []
         if isinstance(dcs, str):
             dcs = [x.strip().lower() for x in dcs.split(",") if x.strip()]
+        if "proxy_url" in patch:
+            proxy_plain = merge_masked_proxy_input(str(patch.get("proxy_url") or ""), existing.get("proxy_url", ""))
+        else:
+            proxy_plain = str(existing.get("proxy_url") or "").strip()
+        proxy_enc = protect_secret(proxy_plain, self.encryption_key)
+        sched_obj = normalize_item_schedule(patch["schedule"] if "schedule" in patch else existing.get("schedule"))
+        sched_json = json.dumps(sched_obj, ensure_ascii=False)
         with self._lock:
             self._conn.execute(
                 """
@@ -931,7 +1012,8 @@ class Database:
                     name = ?, rule_type = ?, account_id = ?, endpoint = ?, subsidiary = ?,
                     keyword_pattern = ?, memory_pattern = ?, storage_pattern = ?,
                     datacenters = ?, max_price = ?, auto_snipe = ?, auto_pay = ?,
-                    dry_run = ?, enabled = ?, proxy_url = ?, known_plan_codes = ?, matched_plan_codes = ?,
+                    dry_run = ?, enabled = ?, proxy_url = ?, schedule_json = ?,
+                    known_plan_codes = ?, matched_plan_codes = ?,
                     last_check_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -950,7 +1032,8 @@ class Database:
                     1 if merged.get("auto_pay") else 0,
                     1 if merged.get("dry_run") else 0,
                     1 if merged.get("enabled", True) else 0,
-                    str(merged.get("proxy_url", "") or "").strip(),
+                    proxy_enc,
+                    sched_json,
                     json.dumps(merged.get("known_plan_codes") or [], ensure_ascii=False),
                     json.dumps(merged.get("matched_plan_codes") or [], ensure_ascii=False),
                     str(merged.get("last_check_at", "")),
@@ -970,7 +1053,7 @@ class Database:
 
     # ---------- VPS Watches ----------
 
-    def _row_to_vps(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _row_to_vps(self, row: sqlite3.Row, mask: bool = False) -> Dict[str, Any]:
         d = dict(row)
         try:
             d["datacenters"] = json.loads(d["datacenters"]) if d["datacenters"] else []
@@ -980,15 +1063,18 @@ class Database:
             d["last_state"] = json.loads(d["last_state"]) if d["last_state"] else {}
         except json.JSONDecodeError:
             d["last_state"] = {}
+        d["schedule"] = normalize_item_schedule(d.get("schedule_json") or "{}")
+        raw_proxy = reveal_secret(str(d.get("proxy_url") or ""), self.encryption_key)
+        d["proxy_url"] = mask_proxy_list_for_ui(raw_proxy) if (mask and raw_proxy) else raw_proxy
         for bf in ("auto_order", "auto_pay", "dry_run", "enabled"):
             d[bf] = bool(d[bf])
         return d
 
-    def list_vps_watches(self) -> List[Dict[str, Any]]:
+    def list_vps_watches(self, mask: bool = False) -> List[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM vps_watches ORDER BY created_at DESC")
-            return [self._row_to_vps(r) for r in cur.fetchall()]
+            return [self._row_to_vps(r, mask=mask) for r in cur.fetchall()]
 
     def create_vps_watch(self, data: Dict[str, Any]) -> Dict[str, Any]:
         now = now_iso()
@@ -996,14 +1082,16 @@ class Database:
         dcs = data.get("datacenters") or []
         if isinstance(dcs, str):
             dcs = [x.strip().upper() for x in dcs.split(",") if x.strip()]
+        sched_json = json.dumps(normalize_item_schedule(data.get("schedule")), ensure_ascii=False)
+        proxy_enc = protect_secret(str(data.get("proxy_url", "") or "").strip(), self.encryption_key)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO vps_watches (
                     id, plan_code, account_id, endpoint, subsidiary, datacenters,
                     auto_order, auto_pay, dry_run, max_orders, ordered_count,
-                    enabled, proxy_url, last_state, last_check_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '{}', '', ?, ?)
+                    enabled, proxy_url, schedule_json, last_state, last_check_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, '{}', '', ?, ?)
                 """,
                 (
                     wid,
@@ -1017,7 +1105,8 @@ class Database:
                     1 if data.get("dry_run", True) else 0,
                     max(1, int(data.get("max_orders") or 1)),
                     1 if data.get("enabled", True) else 0,
-                    str(data.get("proxy_url", "") or "").strip(),
+                    proxy_enc,
+                    sched_json,
                     now,
                     now,
                 ),
@@ -1025,12 +1114,12 @@ class Database:
             self._conn.commit()
         return self.get_vps_watch(wid)  # type: ignore[return-value]
 
-    def get_vps_watch(self, watch_id: str) -> Optional[Dict[str, Any]]:
+    def get_vps_watch(self, watch_id: str, mask: bool = False) -> Optional[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT * FROM vps_watches WHERE id = ?", (watch_id,))
             row = cur.fetchone()
-            return self._row_to_vps(row) if row else None
+            return self._row_to_vps(row, mask=mask) if row else None
 
     def update_vps_watch(self, watch_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         existing = self.get_vps_watch(watch_id)
@@ -1042,13 +1131,20 @@ class Database:
         dcs = merged.get("datacenters") or []
         if isinstance(dcs, str):
             dcs = [x.strip().upper() for x in dcs.split(",") if x.strip()]
+        if "proxy_url" in patch:
+            proxy_plain = merge_masked_proxy_input(str(patch.get("proxy_url") or ""), existing.get("proxy_url", ""))
+        else:
+            proxy_plain = str(existing.get("proxy_url") or "").strip()
+        proxy_enc = protect_secret(proxy_plain, self.encryption_key)
+        sched_obj = normalize_item_schedule(patch["schedule"] if "schedule" in patch else existing.get("schedule"))
+        sched_json = json.dumps(sched_obj, ensure_ascii=False)
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE vps_watches SET
                     plan_code = ?, account_id = ?, endpoint = ?, subsidiary = ?,
                     datacenters = ?, auto_order = ?, auto_pay = ?, dry_run = ?,
-                    max_orders = ?, ordered_count = ?, enabled = ?, proxy_url = ?,
+                    max_orders = ?, ordered_count = ?, enabled = ?, proxy_url = ?, schedule_json = ?,
                     last_state = ?, last_check_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -1064,7 +1160,8 @@ class Database:
                     max(1, int(merged.get("max_orders") or 1)),
                     max(0, int(merged.get("ordered_count") or 0)),
                     1 if merged.get("enabled", True) else 0,
-                    str(merged.get("proxy_url", "") or "").strip(),
+                    proxy_enc,
+                    sched_json,
                     json.dumps(merged.get("last_state") or {}, ensure_ascii=False),
                     str(merged.get("last_check_at", "")),
                     now,
@@ -1078,6 +1175,157 @@ class Database:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("DELETE FROM vps_watches WHERE id = ?", (watch_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ---------- Global Schedule Rules ----------
+
+    def _row_to_schedule_rule(self, row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        try:
+            d["targets"] = json.loads(d.get("targets_json") or '["sniper"]')
+        except json.JSONDecodeError:
+            d["targets"] = ["sniper"]
+        try:
+            d["weekdays"] = normalize_weekdays(json.loads(d.get("weekdays") or "[1,2,3,4,5,6,7]"))
+        except json.JSONDecodeError:
+            d["weekdays"] = [1, 2, 3, 4, 5, 6, 7]
+        d["notify"] = bool(d.get("notify"))
+        d["enabled"] = bool(d.get("enabled"))
+        return d
+
+    def list_schedule_rules(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM schedule_rules ORDER BY created_at DESC")
+            return [self._row_to_schedule_rule(r) for r in cur.fetchall()]
+
+    def get_schedule_rule(self, rule_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT * FROM schedule_rules WHERE id = ?", (rule_id,))
+            row = cur.fetchone()
+            return self._row_to_schedule_rule(row) if row else None
+
+    @staticmethod
+    def _normalize_schedule_targets(raw: Any) -> List[str]:
+        if isinstance(raw, str):
+            items = [x.strip() for x in raw.split(",") if x.strip()]
+        elif isinstance(raw, (list, tuple, set)):
+            items = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            items = []
+        allowed_static = {"sniper", "fast_lane", "radar", "vps", "all_tasks"}
+        out: List[str] = []
+        for t in items:
+            if t in allowed_static or t.startswith("task:"):
+                if t not in out:
+                    out.append(t)
+        return out or ["sniper"]
+
+    def create_schedule_rule(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        now = now_iso()
+        rid = str(uuid.uuid4())[:8]
+        rtype = str(data.get("rule_type") or "window").strip().lower()
+        if rtype not in ("window", "daily_at", "once"):
+            rtype = "window"
+        action = str(data.get("action") or "enable").strip().lower()
+        if action not in ("enable", "disable"):
+            action = "enable"
+        targets = self._normalize_schedule_targets(data.get("targets"))
+        weekdays = normalize_weekdays(data.get("weekdays"))
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO schedule_rules (
+                    id, name, rule_type, targets_json, action, windows, at_time, run_at,
+                    weekdays, start_qps, end_qps, notify, enabled, last_state, last_triggered_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?)
+                """,
+                (
+                    rid,
+                    str(data.get("name") or "定时调度规则").strip() or "定时调度规则",
+                    rtype,
+                    json.dumps(targets, ensure_ascii=False),
+                    action,
+                    str(data.get("windows") or "22:00-02:00").strip(),
+                    str(data.get("at_time") or "22:00").strip(),
+                    str(data.get("run_at") or "").strip(),
+                    json.dumps(weekdays),
+                    max(0.0, float(data.get("start_qps") or 0)),
+                    max(0.0, float(data.get("end_qps") or 0)),
+                    1 if data.get("notify") else 0,
+                    1 if data.get("enabled", True) else 0,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return self.get_schedule_rule(rid)  # type: ignore[return-value]
+
+    def update_schedule_rule(self, rule_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        existing = self.get_schedule_rule(rule_id)
+        if not existing:
+            return None
+        merged = dict(existing)
+        merged.update(patch)
+        now = now_iso()
+        rtype = str(merged.get("rule_type") or "window").strip().lower()
+        if rtype not in ("window", "daily_at", "once"):
+            rtype = "window"
+        action = str(merged.get("action") or "enable").strip().lower()
+        if action not in ("enable", "disable"):
+            action = "enable"
+        targets = self._normalize_schedule_targets(merged.get("targets"))
+        weekdays = normalize_weekdays(merged.get("weekdays"))
+
+        # Reset edge state when definition changes or rule is re-enabled, unless caller explicitly updates last_state
+        last_state = str(merged.get("last_state") or "")
+        if "last_state" not in patch:
+            config_changed = any(
+                k in patch for k in ("rule_type", "targets", "action", "windows", "at_time", "run_at", "weekdays")
+            )
+            re_enabled = ("enabled" in patch and bool(patch["enabled"]) and not existing.get("enabled"))
+            if config_changed or re_enabled:
+                last_state = ""
+
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE schedule_rules SET
+                    name = ?, rule_type = ?, targets_json = ?, action = ?,
+                    windows = ?, at_time = ?, run_at = ?, weekdays = ?,
+                    start_qps = ?, end_qps = ?, notify = ?, enabled = ?,
+                    last_state = ?, last_triggered_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(merged.get("name") or "定时调度规则").strip() or "定时调度规则",
+                    rtype,
+                    json.dumps(targets, ensure_ascii=False),
+                    action,
+                    str(merged.get("windows") or "").strip(),
+                    str(merged.get("at_time") or "22:00").strip(),
+                    str(merged.get("run_at") or "").strip(),
+                    json.dumps(weekdays),
+                    max(0.0, float(merged.get("start_qps") or 0)),
+                    max(0.0, float(merged.get("end_qps") or 0)),
+                    1 if merged.get("notify") else 0,
+                    1 if merged.get("enabled", True) else 0,
+                    last_state,
+                    str(merged.get("last_triggered_at") or ""),
+                    now,
+                    rule_id,
+                ),
+            )
+            self._conn.commit()
+        return self.get_schedule_rule(rule_id)
+
+    def delete_schedule_rule(self, rule_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM schedule_rules WHERE id = ?", (rule_id,))
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -1282,6 +1530,8 @@ class Database:
             active_radars = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM vps_watches WHERE enabled = 1")
             active_vps = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM schedule_rules WHERE enabled = 1")
+            active_schedules = cur.fetchone()[0]
             return {
                 "accounts_count": accounts_count,
                 "tasks_running": task_counts.get("running", 0),
@@ -1293,6 +1543,7 @@ class Database:
                 "orders_failed": failed_orders,
                 "active_radars": active_radars,
                 "active_vps": active_vps,
+                "active_schedules": active_schedules,
             }
 
     def export_config(self, include_secrets: bool = False) -> Dict[str, Any]:
@@ -1303,6 +1554,7 @@ class Database:
         tasks = self.list_tasks()
         radar_rules = self.list_radar_rules()
         vps_watches = self.list_vps_watches()
+        schedule_rules = self.list_schedule_rules()
         if not include_secrets:
             for sk in EXPORT_SECRET_SETTING_KEYS:
                 val = str(settings.get(sk) or "")
@@ -1321,6 +1573,7 @@ class Database:
             "tasks": tasks,
             "radar_rules": radar_rules,
             "vps_watches": vps_watches,
+            "schedule_rules": schedule_rules,
         }
 
     def seed_from_env_or_file(self, seed_file: Optional[Path] = None) -> None:
@@ -1358,25 +1611,44 @@ class Database:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(raw.get("settings"), dict):
-                    self.update_settings(raw["settings"])
+                    clean_settings = {
+                        k: v
+                        for k, v in raw["settings"].items()
+                        if not (isinstance(v, str) and "****" in v)
+                    }
+                    if clean_settings:
+                        self.update_settings(clean_settings)
                 existing_acc_names = {a["name"] for a in self.list_accounts(mask=True)}
                 acc_name_to_id = {a["name"]: a["id"] for a in self.list_accounts(mask=True)}
                 for acc in raw.get("accounts", []):
-                    if acc.get("name") not in existing_acc_names and acc.get("app_key"):
+                    has_masked_cred = any("****" in str(acc.get(f) or "") for f in ("app_key", "app_secret", "consumer_key"))
+                    if acc.get("name") not in existing_acc_names and acc.get("app_key") and not has_masked_cred:
+                        if "****" in str(acc.get("proxy_url") or ""):
+                            acc = {**acc, "proxy_url": ""}
                         created = self.create_account(acc)
                         acc_name_to_id[created["name"]] = created["id"]
                 if not self.list_tasks():
                     for task in raw.get("tasks", []):
                         if not task.get("account_id") and task.get("account_name") in acc_name_to_id:
                             task["account_id"] = acc_name_to_id[task["account_name"]]
+                        if "****" in str(task.get("proxy_url") or ""):
+                            task = {**task, "proxy_url": ""}
                         if task.get("plan_code"):
                             self.create_task(task)
                 for rule in raw.get("radar_rules", []):
+                    if "****" in str(rule.get("proxy_url") or ""):
+                        rule = {**rule, "proxy_url": ""}
                     if rule.get("name"):
                         self.create_radar_rule(rule)
                 for vw in raw.get("vps_watches", []):
+                    if "****" in str(vw.get("proxy_url") or ""):
+                        vw = {**vw, "proxy_url": ""}
                     if vw.get("plan_code"):
                         self.create_vps_watch(vw)
+                if not self.list_schedule_rules():
+                    for sr in raw.get("schedule_rules", []):
+                        if sr.get("name"):
+                            self.create_schedule_rule(sr)
                 self.kv_set(marker_key, True, ttl_seconds=365 * 86400)
                 self.add_log("INFO", f"已从配置文件 {path.name} 导入初始配置", "system")
             except Exception as exc:

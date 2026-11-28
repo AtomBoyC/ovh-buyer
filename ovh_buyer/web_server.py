@@ -20,6 +20,8 @@ from .config import DATACENTERS, DEFAULT_VPS_MODELS, ENDPOINTS, OVH_ORDER_STATUS
 from .database import Database, mask_secret, now_iso
 from .notifier import Notifier
 from .order_engine import OrderEngine
+from .ovh_client import mask_proxy_list_for_ui, merge_masked_proxy_input
+from .scheduler import SUPPORTED_TIMEZONES, describe_global_rule, evaluate_item_schedule, now_in_tz
 from .sniper import SniperEngine
 from .specs import GLOBAL_FX
 
@@ -277,6 +279,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     "datacenters": DATACENTERS,
                     "default_vps_models": DEFAULT_VPS_MODELS,
                     "order_status_labels": OVH_ORDER_STATUS_LABELS,
+                    "supported_timezones": SUPPORTED_TIMEZONES,
                 }
             )
             return
@@ -348,18 +351,52 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path == "/api/tasks":
-            tasks = self.ctx.db.list_tasks()
+            tz_name = str(self.ctx.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            tasks = self.ctx.db.list_tasks(mask=True)
             for t in tasks:
                 t["fast_lane_slots"] = self.ctx.engine.slot_pool.get_task_slots_summary(t["id"])
+                uses_warmup = bool(t.get("fast_lane") and t.get("mode") == "buy" and not t.get("dry_run") and t.get("product_line") != "vps")
+                sched_cfg = dict(t.get("schedule") or {})
+                if not uses_warmup:
+                    sched_cfg["warmup_minutes"] = 0
+                t["schedule_status"] = evaluate_item_schedule(sched_cfg, tz_name)
             self._send_json({"items": tasks})
             return
 
         if path == "/api/radar":
-            self._send_json({"items": self.ctx.db.list_radar_rules()})
+            tz_name = str(self.ctx.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            items = self.ctx.db.list_radar_rules(mask=True)
+            for r in items:
+                sched_cfg = dict(r.get("schedule") or {})
+                sched_cfg["warmup_minutes"] = 0
+                r["schedule_status"] = evaluate_item_schedule(sched_cfg, tz_name)
+            self._send_json({"items": items})
             return
 
         if path == "/api/vps":
-            self._send_json({"items": self.ctx.db.list_vps_watches()})
+            tz_name = str(self.ctx.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            items = self.ctx.db.list_vps_watches(mask=True)
+            for w in items:
+                sched_cfg = dict(w.get("schedule") or {})
+                sched_cfg["warmup_minutes"] = 0
+                w["schedule_status"] = evaluate_item_schedule(sched_cfg, tz_name)
+            self._send_json({"items": items})
+            return
+
+        if path == "/api/schedules":
+            tz_name = str(self.ctx.db.get_setting("schedule_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            rules = self.ctx.db.list_schedule_rules()
+            for r in rules:
+                r.update(describe_global_rule(r, tz_name))
+            now_dt = now_in_tz(tz_name)
+            self._send_json(
+                {
+                    "items": rules,
+                    "timezone": tz_name,
+                    "server_time": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "weekday": now_dt.isoweekday(),
+                }
+            )
             return
 
         if path == "/api/orders":
@@ -376,6 +413,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 val = str(safe.get(sk) or "")
                 safe[f"{sk}_set"] = bool(val)
                 safe[sk] = mask_secret(val) if val else ""
+            for pk in ("http_proxy", "monitor_proxies", "monitor_proxies_pool", "telegram_proxy"):
+                if safe.get(pk):
+                    safe[pk] = mask_proxy_list_for_ui(str(safe[pk]))
             self._send_json(safe)
             return
 
@@ -588,7 +628,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             task = self.ctx.db.create_task(body)
             self.ctx.db.add_log("INFO", f"创建抢购任务: {task['name']} ({task['plan_code']})", "sniper")
-            self._send_json(task, status=201)
+            self._send_json(self.ctx.db.get_task(task["id"], mask=True), status=201)
             return
 
         if path.startswith("/api/tasks/") and path.endswith("/run"):
@@ -601,11 +641,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/radar":
             rule = self.ctx.db.create_radar_rule(body)
             self.ctx.db.add_log("INFO", f"创建黑五雷达规则: {rule['name']}", "radar")
-            self._send_json(rule, status=201)
+            self._send_json(self.ctx.db.get_radar_rule(rule["id"], mask=True), status=201)
             return
 
         if path == "/api/radar/scan":
-            hits = self.ctx.engine.run_radar_tick()
+            hits = self.ctx.engine.run_radar_tick(ignore_schedule=True)
             self._send_json({"ok": True, "hits": hits})
             return
 
@@ -615,7 +655,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             w = self.ctx.db.create_vps_watch(body)
             self.ctx.db.add_log("INFO", f"添加 VPS 监控: {w['plan_code']} ({w['subsidiary']})", "vps")
-            self._send_json(w, status=201)
+            self._send_json(self.ctx.db.get_vps_watch(w["id"], mask=True), status=201)
             return
 
         if path == "/api/vps/check":
@@ -629,8 +669,15 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 )
                 self._send_json({"ok": True, "plan_code": plan_code, "data": data})
             else:
-                cnt = self.ctx.engine.run_vps_tick()
+                cnt = self.ctx.engine.run_vps_tick(ignore_schedule=True)
                 self._send_json({"ok": True, "checked": cnt})
+            return
+
+        if path == "/api/schedules":
+            rule = self.ctx.db.create_schedule_rule(body)
+            self.ctx.db.add_log("INFO", f"创建定时调度规则: {rule['name']}", "schedule")
+            self.ctx.engine.run_schedule_tick()
+            self._send_json(self.ctx.db.get_schedule_rule(rule["id"]), status=201)
             return
 
         if path == "/api/proxy/test":
@@ -693,7 +740,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             if updated["status"] != "running" or not updated.get("fast_lane"):
                 self.ctx.engine.slot_pool.cleanup_task(task_id)
-            self._send_json(updated)
+            self._send_json(self.ctx.db.get_task(task_id, mask=True))
             return
 
         if path.startswith("/api/radar/"):
@@ -702,7 +749,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if not updated:
                 self._send_json({"error": "规则不存在"}, status=404)
                 return
-            self._send_json(updated)
+            self._send_json(self.ctx.db.get_radar_rule(rule_id, mask=True))
             return
 
         if path.startswith("/api/vps/"):
@@ -711,21 +758,38 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if not updated:
                 self._send_json({"error": "监控项不存在"}, status=404)
                 return
-            self._send_json(updated)
+            self._send_json(self.ctx.db.get_vps_watch(watch_id, mask=True))
+            return
+
+        if path.startswith("/api/schedules/"):
+            rule_id = path.split("/")[3]
+            updated = self.ctx.db.update_schedule_rule(rule_id, body)
+            if not updated:
+                self._send_json({"error": "定时规则不存在"}, status=404)
+                return
+            self.ctx.engine.run_schedule_tick()
+            self._send_json(self.ctx.db.get_schedule_rule(rule_id))
             return
 
         if path == "/api/settings":
             patch = dict(body)
             patch.pop("panel_password_hash", None)
-            # Keep existing secret if UI submits masked placeholder
+            # Keep existing secret / proxy password if UI submits masked placeholder
             existing = self.ctx.db.get_settings()
             for sk in SECRET_SETTING_KEYS:
                 if sk in patch and isinstance(patch[sk], str) and "****" in patch[sk]:
                     patch[sk] = existing.get(sk, "")
+            existing_all_proxies = "\n".join(
+                str(existing.get(k) or "") for k in ("monitor_proxies_pool", "monitor_proxies", "http_proxy", "telegram_proxy")
+            )
+            for pk in ("http_proxy", "monitor_proxies", "monitor_proxies_pool", "telegram_proxy"):
+                if pk in patch and isinstance(patch[pk], str):
+                    patch[pk] = merge_masked_proxy_input(patch[pk], existing_all_proxies)
             self.ctx.db.update_settings(patch)
             if patch.get("fast_lane_enabled") is False:
                 self.ctx.engine.slot_pool.cleanup_all()
             self.ctx.engine.on_settings_updated(trigger_probe=True)
+            self.ctx.engine.run_schedule_tick()
             self.ctx.db.add_log("INFO", "系统与通知设置已保存", "settings")
             self._send_json({"ok": True})
             return
@@ -757,6 +821,12 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/vps/"):
             watch_id = path.split("/")[3]
             ok = self.ctx.db.delete_vps_watch(watch_id)
+            self._send_json({"ok": ok}, status=200 if ok else 404)
+            return
+
+        if path.startswith("/api/schedules/"):
+            rule_id = path.split("/")[3]
+            ok = self.ctx.db.delete_schedule_rule(rule_id)
             self._send_json({"ok": ok}, status=200 if ok else 404)
             return
 

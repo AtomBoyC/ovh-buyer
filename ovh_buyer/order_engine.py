@@ -176,8 +176,8 @@ def _price_within_ceiling(prices: Dict[str, Any], max_price: float, price_includ
     return True, check
 
 
-def task_cart_fingerprint(task: Dict[str, Any], options: List[str]) -> str:
-    """Everything that changes WHAT a prebuilt cart would buy; a slot is only reusable on an exact match."""
+def task_cart_fingerprint(task: Dict[str, Any], options: List[str], proxy_url: str = "") -> str:
+    """Everything that changes WHAT or VIA WHICH EXIT IP a prebuilt cart buys; reusable only on exact match."""
     parts = [
         str(task.get("plan_code") or ""),
         str(task.get("account_id") or ""),
@@ -188,6 +188,7 @@ def task_cart_fingerprint(task: Dict[str, Any], options: List[str]) -> str:
         str(task.get("os_code") or ""),
         ",".join(sorted(str(c).strip().lower() for c in (task.get("coupons") or []) if c)),
         "|".join(sorted({str(o).strip().lower() for o in options if o})),
+        str(proxy_url or "").strip(),
     ]
     return "\x1f".join(parts)
 
@@ -880,13 +881,15 @@ class CartSlotPool:
         target_dcs: List[str],
         resolved_options: List[str],
         stop_event: Optional[threading.Event] = None,
+        proxy_url: Optional[str] = None,
     ) -> int:
         """Build or refresh prebuilt carts for up to 6 target datacenters of a Fast Lane task."""
         task_id = task["id"]
         dcs = [normalize_datacenter(d) for d in target_dcs if d][:6]
         if not dcs:
             return 0
-        cfg_fp = task_cart_fingerprint(task, resolved_options)
+        eff_proxy = str(proxy_url if proxy_url is not None else (getattr(client, "proxy_url", "") or "")).strip()
+        cfg_fp = task_cart_fingerprint(task, resolved_options, proxy_url=eff_proxy)
         max_price = float(task.get("max_price") or 0)
         incl_tax = bool(task.get("price_includes_tax"))
         gen = self._generation(task_id)
@@ -1006,13 +1009,14 @@ class CartSlotPool:
         datacenter: str,
         task: Optional[Dict[str, Any]] = None,
         options: Optional[List[str]] = None,
+        proxy_url: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Atomically pop a ready, non-expired, exactly-matching, within-budget slot for 1-call checkout."""
         dc = normalize_datacenter(datacenter)
         now = time.time()
         if task is None:
             return None
-        want_fp = task_cart_fingerprint(task, options or [])
+        want_fp = task_cart_fingerprint(task, options or [], proxy_url=proxy_url)
         max_price = float(task.get("max_price") or 0)
         incl_tax = bool(task.get("price_includes_tax"))
         with self._lock:
@@ -1054,6 +1058,12 @@ class CartSlotPool:
             removed = self._slots.pop(task_id, {})
         for sl in removed.values():
             safe_delete_cart(sl["client"], sl["cart_id"])
+
+    def cleanup_orphans(self, keep_task_ids: set) -> None:
+        with self._lock:
+            stale_ids = [tid for tid in self._slots.keys() if tid not in keep_task_ids]
+        for tid in stale_ids:
+            self.cleanup_task(tid)
 
     def cleanup_all(self) -> None:
         with self._lock:

@@ -8,6 +8,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from .catalog import resolve_addons_for_fqn
+from .ovh_client import proxy_http_request
 
 
 DISK_RANK = {"nvme": 3, "ssd": 2, "sas": 1, "sata": 0, "hdd": 0}
@@ -51,18 +52,12 @@ class FXConverter:
         with self._lock:
             if self._fetched_at > 0 and (now - self._fetched_at < self.ttl_seconds):
                 return dict(self._rates)
-        # Fetch live ECB/Frankfurter rates with base CNY (or EUR -> CNY)
+        # Fetch live ECB/Frankfurter rates with base CNY (supports HTTP/HTTPS/SOCKS5/shorthand proxies)
         try:
             url = "https://api.frankfurter.app/latest?from=CNY&to=EUR,USD,CAD,GBP,PLN,AUD,SGD"
-            req = urllib.request.Request(url, headers={"User-Agent": "ovh-buyer/2.0"})
-            if proxy_url:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-                )
-            else:
-                opener = urllib.request.build_opener()
-            with opener.open(req, timeout=6.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            status, _hdrs, raw_bytes = proxy_http_request("GET", url, proxy_url=proxy_url, timeout=6.0)
+            if 200 <= status < 300:
+                data = json.loads(raw_bytes.decode("utf-8"))
                 rates = data.get("rates") or {}
                 updated = dict(DEFAULT_CNY_RATES)
                 for code, per_cny in rates.items():
@@ -72,6 +67,7 @@ class FXConverter:
                     self._rates = updated
                     self._fetched_at = time.time()
                 return dict(updated)
+            raise OSError(f"HTTP {status}")
         except Exception:
             with self._lock:
                 # Avoid retrying on every request when offline

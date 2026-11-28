@@ -29,6 +29,7 @@ from .config import (
     format_datacenter_label,
 )
 from .database import Database
+from .ovh_client import OVHAPIError, proxy_http_request
 from .specs import GLOBAL_FX
 
 
@@ -47,20 +48,24 @@ def _http_post_json(
     headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req_headers = {"Content-Type": "application/json; charset=utf-8", "User-Agent": "ovh-buyer/2.0"}
+    req_headers = {"Content-Type": "application/json; charset=utf-8", "User-Agent": "ovh-buyer/2.2"}
     if headers:
         req_headers.update(headers)
-    req = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
-    if proxy_url:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-    else:
-        opener = urllib.request.build_opener()
-    with opener.open(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {"ok": 200 <= resp.status < 300, "raw": raw}
+    status, _hdrs, raw_bytes = proxy_http_request(
+        "POST",
+        url,
+        headers=req_headers,
+        body_bytes=body,
+        proxy_url=proxy_url,
+        timeout=timeout,
+    )
+    raw = raw_bytes.decode("utf-8", errors="replace")
+    if status >= 400:
+        raise OVHAPIError(raw or f"HTTP {status}", status_code=status)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": 200 <= status < 300, "raw": raw}
 
 
 def _tg_post_api(
@@ -69,19 +74,27 @@ def _tg_post_api(
     proxy_url: str = "",
     timeout: float = 12.0,
 ) -> Dict[str, Any]:
-    """POST to Telegram Bot API, preserving Telegram's JSON error body on HTTP 4xx/5xx."""
+    """POST to Telegram Bot API (supporting HTTP/HTTPS/SOCKS5/shorthand proxies) and preserve JSON error body."""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req_headers = {"Content-Type": "application/json; charset=utf-8", "User-Agent": "ovh-buyer/2.2"}
+    status, _hdrs, raw_bytes = proxy_http_request(
+        "POST",
+        url,
+        headers=req_headers,
+        body_bytes=body,
+        proxy_url=proxy_url,
+        timeout=timeout,
+    )
+    raw = raw_bytes.decode("utf-8", errors="replace")
     try:
-        return _http_post_json(url, payload, proxy_url=proxy_url, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        raw = ""
-        try:
-            raw = exc.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {"ok": False, "error_code": exc.code, "description": raw or str(exc)}
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    if 200 <= status < 300:
+        return {"ok": True, "raw": raw}
+    return {"ok": False, "error_code": status, "description": raw or f"HTTP {status}"}
 
 
 _TG_PRIVATE_TOPIC_URL_RE = re.compile(r"^(?:https?://)?t\.me/c/(\d+)(?:/(\d+))?(?:/\d+)?/?$", re.IGNORECASE)
@@ -136,17 +149,20 @@ def parse_telegram_target(raw_target: str, default_topic_id: Optional[int] = Non
 
 
 def _http_get_json(url: str, proxy_url: str = "", timeout: float = 35.0) -> Dict[str, Any]:
-    req = urllib.request.Request(url, headers={"User-Agent": "ovh-buyer/2.0"}, method="GET")
-    if proxy_url:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-    else:
-        opener = urllib.request.build_opener()
-    with opener.open(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {"ok": 200 <= resp.status < 300, "raw": raw}
+    status, _hdrs, raw_bytes = proxy_http_request(
+        "GET",
+        url,
+        headers={"User-Agent": "ovh-buyer/2.2"},
+        proxy_url=proxy_url,
+        timeout=timeout,
+    )
+    raw = raw_bytes.decode("utf-8", errors="replace")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        if status >= 400:
+            raise OVHAPIError(raw or f"HTTP {status}", status_code=status)
+        return {"ok": 200 <= status < 300, "raw": raw}
 
 
 def render_telegram_stock_card(
@@ -850,10 +866,11 @@ class Notifier:
     def _dispatch_command(self, cmd: str, args: List[str]) -> Any:
         if cmd in ("/start", "/help"):
             return (
-                "🎯 OVH Sniper v2.1 Bot\n\n"
+                "🎯 OVH Sniper v2.2 Bot\n\n"
                 "可用命令:\n"
                 "/status - 查看引擎、快速通道与统计状态\n"
-                "/tasks - 查看抢购任务列表\n"
+                "/tasks - 查看抢购任务与定时状态\n"
+                "/schedule [on|off <ID>] - 查看或开关全局定时调度规则\n"
                 "/check <planCode> [endpoint] - 实时查询库存\n"
                 "/order <https://.../o/e/...> - 解析 @ovheco 短链并预览/确认下单\n"
                 "/orders - 查看最近订单与交付/中奖状态\n"
