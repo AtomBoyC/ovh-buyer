@@ -478,7 +478,7 @@ input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(
 .hidden { display: none !important; }
 .modal {
   width: 100%; max-width: 560px; max-height: 92vh; overflow-y: auto;
-  padding: var(--s5) var(--s6) 0;
+  padding: 0 var(--s6);
   background: var(--surface);
   border-radius: var(--r-xl);
   box-shadow: var(--shadow-pop);
@@ -486,15 +486,15 @@ input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(
 .modal-sm { max-width: 400px; }
 .modal-lg { max-width: 780px; }
 .modal-header {
-  position: sticky; top: 0; z-index: 2;
+  position: sticky; top: 0; z-index: 5;
   display: flex; align-items: center; justify-content: space-between;
-  margin: calc(-1 * var(--s5)) calc(-1 * var(--s6)) var(--s4);
+  margin: 0 calc(-1 * var(--s6)) var(--s4);
   padding: var(--s4) var(--s6);
   background: var(--surface); border-bottom: 1px solid var(--divider);
 }
 .modal-header h3 { font-size: 16px; font-weight: 600; }
 .modal-footer {
-  position: sticky; bottom: 0;
+  position: sticky; bottom: 0; z-index: 5;
   display: flex; justify-content: flex-end; gap: var(--s2);
   margin: var(--s4) calc(-1 * var(--s6)) 0;
   padding: var(--s3) var(--s6);

@@ -19,9 +19,11 @@
 
 完整英文变更日志见 [CHANGELOG.md](CHANGELOG.md)。
 
-| 深色主题 | 浅色主题 |
+| 深色主题（总览） | 浅色主题（总览） |
 | :---: | :---: |
 | ![OVH Sniper 控制台 · 深色](docs/screenshots/dashboard-dark.png) | ![OVH Sniper 控制台 · 浅色](docs/screenshots/dashboard-light.png) |
+| **双层定时调度中心（`定时调度`）** | **单任务跨零点活跃窗口 & 快速通道预热** |
+| ![OVH Sniper · 定时调度中心](docs/screenshots/schedules.png) | ![OVH Sniper · 任务定时配置弹窗](docs/screenshots/task-modal.png) |
 
 ---
 
@@ -269,7 +271,7 @@ docker compose up -d
 | :--- | :--- | :--- |
 | `OVH_IMAGE` | `ghcr.io/atomboyc/ovh-buyer:latest` | Compose 镜像（可改为 `atomboyc/ovh-buyer:latest` 或 `:2.2.0`） |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | Web 监听端口与地址 |
-| `TZ` | `Asia/Shanghai` | 容器与定时调度默认时区 |
+| `TZ` / `SCHEDULE_TIMEZONE` | `Asia/Shanghai` | 容器与定时调度默认基准时区（如 `Europe/Paris`、`America/New_York`、`UTC`） |
 | `PANEL_PASSWORD` | 空 | 面板登录密码与 `X-API-Key` 密钥（**公网部署务必设置**） |
 | `DATA_ENCRYPTION_KEY` | 空 | 可选，OVH 密钥、代理密码与通知 Token 静态加密密钥 |
 | `OVH_DATA_DIR` | `./data` | SQLite 数据库与目录缓存路径 |

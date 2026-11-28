@@ -19,9 +19,11 @@ An automated server sniper, restock radar, and delivery tracker built for **OVHc
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release history.
 
-| Dark Theme | Light Theme |
+| Dark Theme (Overview) | Light Theme (Overview) |
 | :---: | :---: |
 | ![OVH Sniper Console · Dark](docs/screenshots/dashboard-dark.png) | ![OVH Sniper Console · Light](docs/screenshots/dashboard-light.png) |
+| **Two-Tier Schedule Center (`Schedules`)** | **Item-Level Schedule & Fast Lane Pre-Warmup** |
+| ![OVH Sniper · Schedules](docs/screenshots/schedules.png) | ![OVH Sniper · Task Schedule Modal](docs/screenshots/task-modal.png) |
 
 ---
 
@@ -273,7 +275,7 @@ See [.env.example](.env.example) for a complete template:
 | :--- | :--- | :--- |
 | `OVH_IMAGE` | `ghcr.io/atomboyc/ovh-buyer:latest` | Docker image (`atomboyc/ovh-buyer:latest` or `:2.2.0`) |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | HTTP listen port and bind address |
-| `TZ` | `Asia/Shanghai` | Default container & scheduler timezone |
+| `TZ` / `SCHEDULE_TIMEZONE` | `Asia/Shanghai` | Default container & scheduler timezone (`Europe/Paris`, `America/New_York`, `UTC`, etc.) |
 | `PANEL_PASSWORD` | *(empty)* | Web Console login password & `X-API-Key` secret (**set on public servers!**) |
 | `DATA_ENCRYPTION_KEY` | *(empty)* | Optional at-rest encryption key for OVH secrets, proxy passwords, and webhook tokens |
 | `OVH_DATA_DIR` | `./data` | SQLite database and catalog cache directory |

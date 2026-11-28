@@ -5,11 +5,12 @@
     "radar_poll_interval": 30,
     "schedule_timezone": "Asia/Shanghai",
     "sniper_enabled": true,
+    "fast_lane_enabled": true,
     "radar_enabled": true
   },
   "accounts": [
     {
-      "name": "IE主号",
+      "name": "Main-IE",
       "endpoint": "ovh-eu",
       "subsidiary": "IE",
       "app_key": "REPLACE_APP_KEY",
@@ -20,8 +21,8 @@
   ],
   "tasks": [
     {
-      "name": "黑五 KS-LE-B 演练示例",
-      "account_name": "IE主号",
+      "name": "Black Friday KS-LE-B Dry-Run",
+      "account_name": "Main-IE",
       "product_line": "eco",
       "plan_code": "25skleb01",
       "datacenters": ["gra", "rbx", "sbg", "fra"],
@@ -31,14 +32,23 @@
       "duration": "auto",
       "pricing_mode": "auto",
       "max_orders": 1,
+      "fast_lane": true,
       "auto_pay": false,
       "dry_run": true,
-      "poll_interval": 5
+      "poll_interval": 5,
+      "schedule": {
+        "enabled": true,
+        "mode": "daily_window",
+        "windows": "15:00-18:00, 22:00-02:00",
+        "weekdays": [1, 2, 3, 4, 5, 6, 7],
+        "warmup_minutes": 5,
+        "auto_pause_on_end": true
+      }
     }
   ],
   "radar_rules": [
     {
-      "name": "黑五 Eco 新品上线雷达",
+      "name": "Black Friday Eco New SKU Radar",
       "rule_type": "new_sku",
       "endpoint": "ovh-eu",
       "subsidiary": "IE",
@@ -52,7 +62,7 @@
   ],
   "schedule_rules": [
     {
-      "name": "晚间黄金档自动开启抢购",
+      "name": "Peak Window Guard (21:30-02:00)",
       "rule_type": "window",
       "windows": "21:30-02:00",
       "weekdays": [1, 2, 3, 4, 5, 6, 7],

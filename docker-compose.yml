@@ -1,7 +1,7 @@
 services:
   ovh-sniper:
-    # 预构建多架构镜像 (linux/amd64 + linux/arm64)，免 git clone 直接拉取
-    # 也可在 .env 中设置 OVH_IMAGE=atomboyc/ovh-buyer:latest 改从 Docker Hub 拉取
+    # Prebuilt multi-arch image (linux/amd64 + linux/arm64) — no git clone required
+    # 预构建多架构镜像，也可在 .env 中设置 OVH_IMAGE=atomboyc/ovh-buyer:latest 改从 Docker Hub 拉取
     image: ${OVH_IMAGE:-ghcr.io/atomboyc/ovh-buyer:latest}
     container_name: ovh-sniper
     restart: unless-stopped
@@ -12,6 +12,8 @@ services:
         required: false
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - HOST=0.0.0.0
       - PORT=8888
       - OVH_DATA_DIR=/app/data

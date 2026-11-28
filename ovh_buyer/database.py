@@ -390,6 +390,7 @@ class Database:
             "telegram_topic_id": os.environ.get("TELEGRAM_TOPIC_ID", ""),
             "telegram_admin_ids": os.environ.get("TELEGRAM_ADMIN_IDS", ""),
             "telegram_proxy": os.environ.get("TELEGRAM_PROXY", ""),
+            "schedule_timezone": os.environ.get("SCHEDULE_TIMEZONE") or os.environ.get("TZ") or "",
             "bark_url": os.environ.get("BARK_URL", ""),
             "serverchan_key": os.environ.get("SERVERCHAN_KEY", ""),
             "dingtalk_webhook": os.environ.get("DINGTALK_WEBHOOK", ""),
